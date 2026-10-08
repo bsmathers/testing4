@@ -1,0 +1,821 @@
+=== [gen1ou] SPL W8 Normal Jynx + Counter Chansey ===
+
+MATERIAL BALANCE (Jynx) (F)  
+Ability: No Ability  
+- Lovely Kiss  
+- Blizzard  
+- Psychic  
+- Rest  
+
+DISTIL COLUMNS (Starmie)  
+Ability: No Ability  
+- Surf  
+- Thunderbolt  
+- Thunder Wave  
+- Recover  
+
+ENERGY BALANCE (Alakazam)  
+Ability: No Ability  
+- Psychic  
+- Seismic Toss  
+- Thunder Wave  
+- Recover  
+
+KINETICS (Chansey) (F)  
+Ability: No Ability  
+- Ice Beam  
+- Counter  
+- Thunder Wave  
+- Soft-Boiled  
+
+EQUILIBRIUM (Snorlax)  
+Ability: No Ability  
+- Body Slam  
+- Reflect  
+- Self-Destruct  
+- Rest  
+
+THERMODYNAMICS (Tauros) (M)  
+Ability: No Ability  
+- Body Slam  
+- Hyper Beam  
+- Blizzard  
+- Earthquake  
+
+
+=== [gen1ou] SPL W8 MieCloyZam w. Counter Chansey ===
+
+Welcome to New York (Starmie)  
+Ability: No Ability  
+- Blizzard  
+- Thunderbolt  
+- Thunder Wave  
+- Recover  
+
+Bad Blood (Cloyster)  
+Ability: No Ability  
+- Blizzard  
+- Clamp  
+- Explosion  
+- Rest  
+
+Wildest Dreams (Alakazam)  
+Ability: No Ability  
+- Psychic  
+- Seismic Toss  
+- Thunder Wave  
+- Recover  
+
+Shake It Off (Chansey) (F)  
+Ability: No Ability  
+- Sing  
+- Ice Beam  
+- Counter  
+- Soft-Boiled  
+
+Blank Space (Snorlax)  
+Ability: No Ability  
+- Body Slam  
+- Reflect  
+- Hyper Beam  
+- Rest  
+
+Style (Tauros) (M)  
+Ability: No Ability  
+- Body Slam  
+- Hyper Beam  
+- Blizzard  
+- Earthquake  
+
+
+=== [gen1ou] SPL W8 Modified Nails Team ===
+
+INTERSTELLAR (Starmie)  
+Ability: No Ability  
+EVs: 252 HP / 252 Atk / 252 Def / 252 SpA / 252 SpD / 252 Spe  
+- Blizzard  
+- Psychic  
+- Thunder Wave  
+- Recover  
+
+SPIDER MAN 2 (Exeggutor)  
+Ability: No Ability  
+- Sleep Powder  
+- Psychic  
+- Mega Drain  
+- Explosion  
+
+LA LA LAND (Zapdos)  
+Ability: No Ability  
+- Thunderbolt  
+- Drill Peck  
+- Thunder Wave  
+- Agility  
+
+THE PRINCESS BRIDE (Chansey) (F)  
+Ability: No Ability  
+EVs: 252 HP / 252 Atk / 252 Def / 252 SpA / 252 SpD / 252 Spe  
+- Ice Beam  
+- Thunderbolt  
+- Thunder Wave  
+- Soft-Boiled  
+
+SCREAM (Snorlax)  
+Ability: No Ability  
+- Amnesia  
+- Ice Beam  
+- Reflect  
+- Rest  
+
+DONNIE DARKO (Tauros) (M)  
+Ability: No Ability  
+- Body Slam  
+- Hyper Beam  
+- Blizzard  
+- Earthquake  
+
+
+=== [gen1ou] SPL W8 Slowbro + Rest Exeggutor ===
+
+Basic (Chansey) (F)  
+Ability: none  
+EVs: 252 HP / 252 Atk / 252 Def / 252 SpA / 252 SpD / 252 Spe  
+- Sing  
+- Seismic Toss  
+- Thunder Wave  
+- Soft-Boiled  
+
+Dynamite (Exeggutor)  
+Ability: No Ability  
+- Psychic  
+- Stun Spore  
+- Explosion  
+- Rest  
+
+Don't Kill My Vibe (Slowbro)  
+Ability: No Ability  
+EVs: 252 HP / 252 Atk / 252 Def / 252 SpA / 252 SpD / 252 Spe  
+- Amnesia  
+- Surf  
+- Reflect  
+- Rest  
+
+Sight Of You (Alakazam)  
+Ability: none  
+EVs: 252 HP / 252 Atk / 252 Def / 252 SpA / 252 SpD / 252 Spe  
+- Psychic  
+- Seismic Toss  
+- Thunder Wave  
+- Recover  
+
+Business Dinners (Snorlax)  
+Ability: none  
+- Amnesia  
+- Body Slam  
+- Blizzard  
+- Self-Destruct  
+
+Sucker Punch (Tauros) (M)  
+Ability: none  
+- Body Slam  
+- Hyper Beam  
+- Blizzard  
+- Earthquake  
+
+
+=== [gen1ou] Untitled 191 ===
+
+Alakazam  
+Ability: No Ability  
+- Psychic  
+- Seismic Toss  
+- Thunder Wave  
+- Recover  
+
+Chansey (F)  
+Ability: No Ability  
+- Ice Beam  
+- Thunder Wave  
+- Sing  
+- Soft-Boiled  
+
+Exeggutor  
+Ability: No Ability  
+- Sleep Powder  
+- Stun Spore  
+- Psychic  
+- Explosion  
+
+Starmie  
+Ability: No Ability  
+- Psychic  
+- Thunderbolt  
+- Thunder Wave  
+- Recover  
+
+Snorlax  
+Ability: No Ability  
+- Body Slam  
+- Earthquake  
+- Reflect  
+- Rest  
+
+Tauros (M)  
+Ability: No Ability  
+- Body Slam  
+- Earthquake  
+- Hyper Beam  
+- Blizzard  
+
+
+=== [gen1ou] Untitled 192 ===
+
+Starmie  
+Ability: No Ability  
+- Psychic  
+- Blizzard  
+- Thunder Wave  
+- Recover  
+
+Exeggutor  
+Ability: No Ability  
+- Sleep Powder  
+- Stun Spore  
+- Psychic  
+- Explosion  
+
+Rhydon  
+Ability: No Ability  
+- Earthquake  
+- Body Slam  
+- Rock Slide  
+- Substitute  
+
+Chansey (F)  
+Ability: No Ability  
+- Seismic Toss  
+- Sing  
+- Thunder Wave  
+- Soft-Boiled  
+
+Snorlax  
+Ability: No Ability  
+- Body Slam  
+- Hyper Beam  
+- Reflect  
+- Rest  
+
+Tauros (M)  
+Ability: No Ability  
+- Body Slam  
+- Earthquake  
+- Hyper Beam  
+- Blizzard  
+
+
+=== [gen1ou] Untitled 193 ===
+
+Starmie  
+Ability: No Ability  
+- Psychic  
+- Blizzard  
+- Thunder Wave  
+- Recover  
+
+Exeggutor  
+Ability: No Ability  
+- Sleep Powder  
+- Stun Spore  
+- Psychic  
+- Explosion  
+
+Zapdos  
+Ability: No Ability  
+- Thunderbolt  
+- Drill Peck  
+- Thunder Wave  
+- Agility  
+
+Chansey (F)  
+Ability: No Ability  
+- Ice Beam  
+- Sing  
+- Thunder Wave  
+- Soft-Boiled  
+
+Snorlax  
+Ability: No Ability  
+- Body Slam  
+- Ice Beam  
+- Reflect  
+- Rest  
+
+Tauros (M)  
+Ability: No Ability  
+- Body Slam  
+- Earthquake  
+- Hyper Beam  
+- Blizzard  
+
+
+=== [gen1ou] Untitled 194 ===
+
+Alakazam  
+Ability: No Ability  
+- Psychic  
+- Seismic Toss  
+- Thunder Wave  
+- Recover  
+
+Exeggutor  
+Ability: No Ability  
+- Sleep Powder  
+- Mega Drain  
+- Psychic  
+- Explosion  
+
+Zapdos  
+Ability: No Ability  
+- Thunderbolt  
+- Drill Peck  
+- Thunder Wave  
+- Agility  
+
+Chansey (F)  
+Ability: No Ability  
+- Ice Beam  
+- Thunderbolt  
+- Thunder Wave  
+- Soft-Boiled  
+
+Snorlax  
+Ability: No Ability  
+- Body Slam  
+- Earthquake  
+- Reflect  
+- Rest  
+
+Tauros (M)  
+Ability: No Ability  
+- Body Slam  
+- Earthquake  
+- Hyper Beam  
+- Blizzard  
+
+
+=== [gen1ou] Untitled 195 ===
+
+Jynx (F)  
+Ability: No Ability  
+- Lovely Kiss  
+- Psychic  
+- Blizzard  
+- Rest  
+
+Starmie  
+Ability: No Ability  
+- Psychic  
+- Blizzard  
+- Thunder Wave  
+- Recover  
+
+Rhydon  
+Ability: No Ability  
+- Earthquake  
+- Body Slam  
+- Rock Slide  
+- Substitute  
+
+Chansey (F)  
+Ability: No Ability  
+- Ice Beam  
+- Thunderbolt  
+- Thunder Wave  
+- Soft-Boiled  
+
+Snorlax  
+Ability: No Ability  
+- Body Slam  
+- Hyper Beam  
+- Reflect  
+- Rest  
+
+Tauros (M)  
+Ability: No Ability  
+- Body Slam  
+- Earthquake  
+- Hyper Beam  
+- Blizzard  
+
+
+=== [gen1ou] Untitled 196 ===
+
+Gengar  
+Ability: No Ability  
+- Hypnosis  
+- Thunderbolt  
+- Psychic  
+- Explosion  
+
+Starmie  
+Ability: No Ability  
+- Surf  
+- Thunderbolt  
+- Thunder Wave  
+- Recover  
+
+Alakazam  
+Ability: No Ability  
+- Psychic  
+- Seismic Toss  
+- Thunder Wave  
+- Recover  
+
+Chansey (F)  
+Ability: No Ability  
+- Ice Beam  
+- Sing  
+- Thunder Wave  
+- Soft-Boiled  
+
+Snorlax  
+Ability: No Ability  
+- Body Slam  
+- Reflect  
+- Self-Destruct  
+- Rest  
+
+Tauros (M)  
+Ability: No Ability  
+- Body Slam  
+- Earthquake  
+- Hyper Beam  
+- Blizzard  
+
+
+=== [gen1ou] Untitled 197 ===
+
+Starmie  
+Ability: No Ability  
+- Psychic  
+- Ice Beam  
+- Thunder Wave  
+- Recover  
+
+Cloyster  
+Ability: No Ability  
+- Blizzard  
+- Clamp  
+- Rest  
+- Explosion  
+
+Exeggutor  
+Ability: No Ability  
+- Sleep Powder  
+- Stun Spore  
+- Psychic  
+- Explosion  
+
+Chansey (F)  
+Ability: No Ability  
+- Ice Beam  
+- Sing  
+- Thunder Wave  
+- Soft-Boiled  
+
+Snorlax  
+Ability: No Ability  
+- Body Slam  
+- Earthquake  
+- Reflect  
+- Rest  
+
+Tauros (M)  
+Ability: No Ability  
+- Body Slam  
+- Earthquake  
+- Hyper Beam  
+- Blizzard  
+
+
+=== [gen1ou] Untitled 198 ===
+
+Exeggutor  
+Ability: No Ability  
+- Sleep Powder  
+- Stun Spore  
+- Psychic  
+- Explosion  
+
+Cloyster  
+Ability: No Ability  
+- Blizzard  
+- Clamp  
+- Explosion  
+- Rest  
+
+Zapdos  
+Ability: No Ability  
+- Thunderbolt  
+- Drill Peck  
+- Thunder Wave  
+- Agility  
+
+Chansey (F)  
+Ability: No Ability  
+- Sing  
+- Seismic Toss  
+- Thunder Wave  
+- Soft-Boiled  
+
+Snorlax  
+Ability: No Ability  
+- Body Slam  
+- Earthquake  
+- Hyper Beam  
+- Self-Destruct  
+
+Tauros (M)  
+Ability: No Ability  
+- Body Slam  
+- Earthquake  
+- Hyper Beam  
+- Blizzard  
+
+
+=== [gen1ou] Untitled 199 ===
+
+Jynx (F)  
+Ability: No Ability  
+- Lovely Kiss  
+- Blizzard  
+- Psychic  
+- Rest  
+
+Zapdos  
+Ability: No Ability  
+- Thunderbolt  
+- Drill Peck  
+- Thunder Wave  
+- Agility  
+
+Starmie  
+Ability: No Ability  
+- Surf  
+- Thunderbolt  
+- Recover  
+- Thunder Wave  
+
+Chansey (F)  
+Ability: No Ability  
+- Sing  
+- Ice Beam  
+- Thunder Wave  
+- Soft-Boiled  
+
+Snorlax  
+Ability: No Ability  
+- Body Slam  
+- Earthquake  
+- Reflect  
+- Rest  
+
+Tauros (M)  
+Ability: No Ability  
+- Body Slam  
+- Earthquake  
+- Hyper Beam  
+- Blizzard  
+
+
+=== [gen1ou] Untitled 200 ===
+
+Gengar  
+Ability: No Ability  
+- Hypnosis  
+- Psychic  
+- Night Shade  
+- Explosion  
+
+Exeggutor  
+Ability: No Ability  
+- Sleep Powder  
+- Stun Spore  
+- Psychic  
+- Explosion  
+
+Alakazam  
+Ability: No Ability  
+- Psychic  
+- Seismic Toss  
+- Thunder Wave  
+- Recover  
+
+Cloyster  
+Ability: No Ability  
+- Blizzard  
+- Clamp  
+- Hyper Beam  
+- Explosion  
+
+Snorlax  
+Ability: No Ability  
+- Body Slam  
+- Earthquake  
+- Hyper Beam  
+- Self-Destruct  
+
+Tauros (M)  
+Ability: No Ability  
+- Body Slam  
+- Earthquake  
+- Hyper Beam  
+- Blizzard  
+
+
+=== [gen1ou] Untitled 201 ===
+
+Starmie  
+Ability: No Ability  
+- Psychic  
+- Blizzard  
+- Thunder Wave  
+- Recover  
+
+Gengar  
+Ability: No Ability  
+- Hypnosis  
+- Psychic  
+- Night Shade  
+- Explosion  
+
+Exeggutor  
+Ability: No Ability  
+- Stun Spore  
+- Psychic  
+- Mega Drain  
+- Explosion  
+
+Chansey (F)  
+Ability: No Ability  
+- Ice Beam  
+- Sing  
+- Thunder Wave  
+- Soft-Boiled  
+
+Snorlax  
+Ability: No Ability  
+- Body Slam  
+- Earthquake  
+- Reflect  
+- Rest  
+
+Tauros (M)  
+Ability: No Ability  
+- Body Slam  
+- Earthquake  
+- Hyper Beam  
+- Blizzard  
+
+
+=== [gen1ou] Untitled 202 ===
+
+Gengar  
+Ability: No Ability  
+- Hypnosis  
+- Psychic  
+- Night Shade  
+- Explosion  
+
+Exeggutor  
+Ability: No Ability  
+- Stun Spore  
+- Psychic  
+- Mega Drain  
+- Explosion  
+
+Chansey (F)  
+Ability: No Ability  
+- Seismic Toss  
+- Sing  
+- Thunder Wave  
+- Soft-Boiled  
+
+Snorlax  
+Ability: No Ability  
+- Body Slam  
+- Hyper Beam  
+- Counter  
+- Self-Destruct  
+
+Tauros (M)  
+Ability: No Ability  
+- Body Slam  
+- Earthquake  
+- Hyper Beam  
+- Blizzard  
+
+Zapdos  
+Ability: No Ability  
+- Thunderbolt  
+- Drill Peck  
+- Thunder Wave  
+- Agility  
+
+
+=== [gen1ou] Untitled 203 ===
+
+Jynx (F)  
+Ability: No Ability  
+- Lovely Kiss  
+- Psychic  
+- Blizzard  
+- Rest  
+
+Exeggutor  
+Ability: No Ability  
+- Stun Spore  
+- Psychic  
+- Mega Drain  
+- Explosion  
+
+Chansey (F)  
+Ability: No Ability  
+- Ice Beam  
+- Sing  
+- Counter  
+- Soft-Boiled  
+
+Snorlax  
+Ability: No Ability  
+- Body Slam  
+- Reflect  
+- Self-Destruct  
+- Rest  
+
+Tauros (M)  
+Ability: No Ability  
+- Body Slam  
+- Earthquake  
+- Hyper Beam  
+- Blizzard  
+
+Starmie  
+Ability: No Ability  
+- Blizzard  
+- Thunderbolt  
+- Thunder Wave  
+- Recover  
+
+
+=== [gen1ou] ZamCloy ===
+
+Chansey (F)  
+Ability: none  
+EVs: 252 HP / 252 Def / 252 SpA / 252 SpD / 252 Spe  
+IVs: 2 Atk  
+- Ice Beam  
+- Thunder Wave  
+- Sing  
+- Soft-Boiled  
+
+Starmie  
+Ability: none  
+EVs: 252 HP / 252 Def / 252 SpA / 252 SpD / 252 Spe  
+IVs: 2 Atk  
+- Psychic  
+- Thunderbolt  
+- Thunder Wave  
+- Recover  
+
+Cloyster  
+Ability: none  
+- Blizzard  
+- Clamp  
+- Rest  
+- Explosion  
+
+Snorlax  
+Ability: Immunity  
+- Body Slam  
+- Earthquake  
+- Reflect  
+- Rest  
+
+Tauros  
+Ability: Intimidate  
+- Body Slam  
+- Thunderbolt  
+- Blizzard  
+- Hyper Beam  
+
+Alakazam  
+Ability: none  
+EVs: 252 HP / 252 Def / 252 SpA / 252 SpD / 252 Spe  
+IVs: 2 Atk  
+- Psychic  
+- Seismic Toss  
+- Thunder Wave  
+- Recover  
+
+

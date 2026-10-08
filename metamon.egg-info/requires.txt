@@ -1,0 +1,19 @@
+gymnasium<=0.29.1,>=0.26
+torch>=2.6
+numpy
+gin-config
+wandb
+einops
+tqdm
+lz4
+termcolor
+rich
+huggingface_hub
+datasets
+ratarmountcore
+poke-env @ git+https://github.com/UT-Austin-RPL/poke-env.git
+amago @ git+https://github.com/UT-Austin-RPL/amago@v3.4.0
+
+[analyze]
+fastapi
+uvicorn
