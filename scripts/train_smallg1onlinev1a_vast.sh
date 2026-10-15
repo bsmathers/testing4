@@ -423,6 +423,7 @@ YAML
 
 log "Downloading offline data, usage statistics, hl_05_26 teams, and opponent weights"
 "${PYTHON_BIN}" - <<'PY'
+import os
 from pathlib import Path
 
 from metamon.data.download import (
@@ -440,7 +441,6 @@ for subset in subsets:
 download_teams("gen1ou", "hl_05_26", version="v5", force_download=False)
 
 from metamon.backend.team_prediction.team import TeamSet
-import os
 team_dir = Path(os.environ["EXPERT_DIR"])
 for path in sorted(team_dir.glob("*.gen1ou_team")):
     team = TeamSet.from_showdown_file(str(path), "gen1ou")
