@@ -91,17 +91,16 @@ MIN_GAMES_PER_HOUR=10000 ... bash scripts/train_epoch475_omd.sh
 
 ## Full run
 
-For a fresh Vast.ai instance, use the one-command bootstrap on the pushed
-training branch. It clones or safely fast-forwards the checkout, validates the
-GPU and host resources, installs FlashAttention if the image lacks it, and
-starts the foreground training process:
+For a fresh Vast.ai instance, use the one-command bootstrap. It clones or
+safely fast-forwards the checkout, validates the GPU and host resources,
+installs FlashAttention if the image lacks it, and starts the foreground
+training process:
 
 ```bash
 export GOOD_REPLAYS_DIR=/workspace/good_replays
 export WANDB_API_KEY=...
-git clone --branch codex/epoch475-vast-bootstrap \
-  https://github.com/bsmathers/testing2.git /workspace/testing2
-bash /workspace/testing2/scripts/setup_and_launch_epoch475_omd_vast.sh
+git clone https://github.com/bsmathers/testing4.git /workspace/testing4
+bash /workspace/testing4/scripts/setup_and_launch_epoch475_omd_vast.sh
 ```
 
 Use a CUDA 12.8+ PyTorch development image so `nvcc` is available if

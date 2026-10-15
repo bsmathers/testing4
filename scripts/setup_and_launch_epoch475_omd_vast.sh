@@ -20,9 +20,9 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 warn() { echo "WARNING: $*" >&2; }
 log() { printf '\n[%s] %s\n' "$(date '+%F %T')" "$*"; }
 
-REPO_URL="${REPO_URL:-https://github.com/bsmathers/testing2.git}"
-REPO_REF="${REPO_REF:-codex/epoch475-vast-bootstrap}"
-REPO_DIR="${REPO_DIR:-/workspace/testing2}"
+REPO_URL="${REPO_URL:-https://github.com/bsmathers/testing4.git}"
+REPO_REF="${REPO_REF:-main}"
+REPO_DIR="${REPO_DIR:-/workspace/testing4}"
 PERSIST_ROOT="${PERSIST_ROOT:-/workspace/epoch475-omd}"
 GOOD_REPLAYS_DIR="${GOOD_REPLAYS_DIR:-/workspace/good_replays}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
