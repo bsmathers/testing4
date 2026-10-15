@@ -56,19 +56,17 @@ from metamon.rl.pretrained import (
 # loads the distilled V1B weights explicitly with --base_weights.
 # ---------------------------------------------------------------------------
 
-@pretrained_model("TaurosV1B")
-class TaurosV1B(LocalPretrainedModel):
-    """Local 35M V1B run, primarily for ``discover: true`` opponent pools."""
+class _LocalV1BModel(LocalPretrainedModel):
+    """Shared architecture metadata for evolving and frozen V1B policies."""
 
-    def __init__(self):
+    def __init__(self, run_name: str, default_checkpoint: int):
         save_dir = os.environ.get("METAMON_SAVE_DIR", os.path.abspath("checkpoints"))
-        run_name = os.environ.get("TAUROSV1B_RUN_NAME", "taurosv1b_phase_f")
         super().__init__(
             amago_ckpt_dir=save_dir,
             model_name=run_name,
             model_gin_config="grouped_v2_medium.gin",
             train_gin_config="grouped_v2_large_robust_awr_beta3.gin",
-            default_checkpoint=0,
+            default_checkpoint=default_checkpoint,
             action_space=get_action_space("DefaultActionSpace"),
             observation_space=get_observation_space("GroupedObservationSpace"),
             reward_function=get_reward_function("AggressiveShapedReward"),
@@ -82,10 +80,27 @@ class TaurosV1B(LocalPretrainedModel):
             },
         )
 
+
+@pretrained_model("TaurosV1B")
+class TaurosV1B(_LocalV1BModel):
+    """Local 35M V1B run, primarily for ``discover: true`` opponent pools."""
+
+    def __init__(self):
+        run_name = os.environ.get("TAUROSV1B_RUN_NAME", "taurosv1b_phase_f")
+        super().__init__(run_name=run_name, default_checkpoint=0)
+
     def get_path_to_checkpoint(self, checkpoint: int) -> str:
         if checkpoint == LATEST_CHECKPOINT:
             return os.path.join(self.local_ckpt_dir, "latest", "policy.pt")
         return super().get_path_to_checkpoint(checkpoint)
+
+
+@pretrained_model("Epoch475Frozen")
+class Epoch475Frozen(_LocalV1BModel):
+    """Immutable Epoch475 anchor used to fill unavailable history slots."""
+
+    def __init__(self):
+        super().__init__(run_name="epoch475_frozen", default_checkpoint=475)
 
 
 @gin.configurable

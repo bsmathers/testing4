@@ -18,8 +18,11 @@ because it appeared in the same battle; that would imitate an uncontrolled
 opponent policy.
 
 Online trajectories are split evenly between the public `hl_05_26` teams and
-the local 807-team set. The opponent league contains TaurosV0, Kakuna, the
-immutable Epoch475 snapshot, and recency-weighted checkpoints from the new run.
+the local 807-team set. Half of the opponent row mass is TaurosV0/Kakuna. The
+other half is a fixed six-slot lineage ladder: the current policy, policies from
+1, 4, 16, and 64 learner epochs ago, and the immutable Epoch475 parent. Missing
+history slots early in training are filled by Epoch475, keeping the mixture
+constant. Each learner epoch is 1,000 optimizer updates.
 
 The online FIFO defaults to 30,000 games. With 2,000 new games per learner
 epoch, a game remains eligible for about 15 epochs and is drawn about 3.5 times

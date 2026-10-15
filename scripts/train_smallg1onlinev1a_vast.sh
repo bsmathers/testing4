@@ -278,8 +278,9 @@ PY
 log "Writing the SmallG1OnlineV1a opponent pool and run configuration"
 if [[ "${TRAIN_VARIANT}" == "epoch475_omd" ]]; then
 cat >"${POOL_CONFIG}" <<'YAML'
-# Epoch475 OMD league. Static anchors carry half the row mass; immutable parent
-# plus discovered learner snapshots carry the other half once snapshots exist.
+# Epoch475 OMD league. The six-row lineage slice is always exactly:
+# current, 1 epoch old, 4 epochs old, 16 epochs old, 64 epochs old, original.
+# Before enough history exists, missing offset rows use the immutable original.
 defaults:
   team_set: [hl_05_26, smallg1onlinev1a_expert]
   battle_backend: metamon
@@ -295,13 +296,21 @@ agents:
     model_name: Kakuna
     num_agents: 3
     checkpoints: "range(24, 35, 2)"
-  Epoch475League:
+  Epoch475Original:
+    model_name: Epoch475Frozen
+    checkpoints: [475]
+  Epoch475History:
     model_name: TaurosV1B
     checkpoints:
       discover: true
-      include_latest: true
-      recency_rho: 1.25
-      total_num_agents: 6
+      include_latest: false
+      offsets: [0, 1, 4, 16, 64]
+      update_interval: 1
+      uniform_agents: true
+      num_agents_per_checkpoint: 1
+      fill_missing_model: Epoch475Frozen
+      fill_checkpoints: [475]
+      max_fill_missing: 5
 YAML
 else
 cat >"${POOL_CONFIG}" <<'YAML'
