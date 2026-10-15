@@ -1838,6 +1838,20 @@ class MetamonOnlineExperiment(MetamonAMAGOExperiment):
         if self.verbose:
             self.summary(env_summary=env_summary)
 
+    def read_latest_policy(self) -> None:
+        """Reload rolling weights, including into a stripped collector policy."""
+        if not getattr(self.policy, "_metamon_collection_optimized", False):
+            return super().read_latest_policy()
+        from metamon.env.vectorized.amago_policy import load_collection_policy_state
+
+        ckpt_name = os.path.join(self.ckpt_dir, "latest", "policy.pt")
+        ckpt = amago.utils.retry_load_checkpoint(ckpt_name, map_location=self.DEVICE)
+        if ckpt is None:
+            amago.utils.amago_warning("Latest policy checkpoint was not loaded.")
+            return
+        self.accelerator.print("Loading latest actor-only collection policy....")
+        load_collection_policy_state(self.policy, ckpt)
+
     def _reset_policy_temperature(self) -> None:
         policy_dist = self.policy.actor.policy_dist
         device = next(self.policy.parameters()).device

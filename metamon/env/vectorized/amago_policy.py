@@ -9,12 +9,102 @@ and the opponent stack uses the same class so both policies see identical inputs
 
 from __future__ import annotations
 
+import gc
+import os
+from contextlib import nullcontext
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
 
 from .obs_utils import numpy_obs_to_torch, stack_obs_dicts, unstack_obs_dicts
+
+
+_INFERENCE_CHILDREN = frozenset({"tstep_encoder", "traj_encoder", "actor"})
+
+
+def collector_inference_dtype(device: torch.device) -> torch.dtype:
+    """Resolve the explicitly requested rollout dtype."""
+    requested = os.environ.get("METAMON_COLLECTOR_DTYPE", "").strip().lower()
+    if not requested:
+        requested = "bf16" if device.type == "cuda" else "fp32"
+    choices = {
+        "fp32": torch.float32,
+        "float32": torch.float32,
+        "bf16": torch.bfloat16,
+        "bfloat16": torch.bfloat16,
+        "fp16": torch.float16,
+        "float16": torch.float16,
+    }
+    if requested not in choices:
+        raise ValueError(
+            "METAMON_COLLECTOR_DTYPE must be fp32, bf16, or fp16; "
+            f"got {requested!r}"
+        )
+    dtype = choices[requested]
+    if device.type == "cpu" and dtype == torch.float16:
+        raise ValueError("fp16 collector inference is unsupported on CPU")
+    return dtype
+
+
+def optimize_policy_for_collection(
+    policy: torch.nn.Module, device: torch.device
+) -> torch.nn.Module:
+    """Strip training-only children and cast a policy for action inference."""
+    if getattr(policy, "_metamon_collection_optimized", False):
+        return policy
+    removed = []
+    for name, _child in list(policy.named_children()):
+        if name not in _INFERENCE_CHILDREN:
+            setattr(policy, name, None)
+            removed.append(name)
+    # FlashAttention's causal local window only reads ``left`` prior keys plus
+    # the current key. Retaining the training max sequence beyond left + 1 is
+    # therefore redundant during cached one-step inference. AMAGO's cache rolls
+    # while preserving absolute ``time_idxs``, so this is behavior-preserving.
+    compact_cache = os.environ.get("METAMON_COMPACT_KV_CACHE", "1") == "1"
+    cache_len = None
+    traj_encoder = getattr(policy, "traj_encoder", None)
+    if compact_cache and traj_encoder is not None:
+        left_windows = []
+        for module in traj_encoder.modules():
+            window = getattr(module, "window_size", None)
+            if (
+                isinstance(window, (tuple, list))
+                and len(window) == 2
+                and isinstance(window[0], int)
+                and window[0] >= 0
+            ):
+                left_windows.append(int(window[0]))
+        if left_windows and hasattr(traj_encoder, "max_seq_len"):
+            cache_len = max(left_windows) + 1
+            traj_encoder.max_seq_len = min(
+                int(traj_encoder.max_seq_len), int(cache_len)
+            )
+    dtype = collector_inference_dtype(device)
+    policy.to(device=device, dtype=dtype)
+    policy.eval()
+    policy._metamon_collection_optimized = True
+    policy._metamon_collection_dtype = dtype
+    policy._metamon_removed_children = tuple(removed)
+    policy._metamon_collection_cache_len = cache_len
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return policy
+
+
+def load_collection_policy_state(policy: torch.nn.Module, state: dict) -> None:
+    """Load a full learner checkpoint into an actor-only collection policy."""
+    current = policy.state_dict()
+    selected = {key: value for key, value in state.items() if key in current}
+    missing = sorted(set(current) - set(selected))
+    if missing:
+        raise RuntimeError(
+            "Collection checkpoint is missing actor-path tensors: "
+            + ", ".join(missing[:8])
+        )
+    policy.load_state_dict(selected, strict=True)
 
 
 class AmagoLadderPolicyDriver:
@@ -97,7 +187,13 @@ class AmagoLadderPolicyDriver:
             .unsqueeze(1)
             .unsqueeze(1)
         )
-        with torch.no_grad():
+        dtype = getattr(self.policy, "_metamon_collection_dtype", torch.float32)
+        autocast = (
+            torch.autocast(device_type=self.device.type, dtype=dtype)
+            if dtype != torch.float32 and self.device.type in {"cuda", "cpu"}
+            else nullcontext()
+        )
+        with torch.inference_mode(), autocast:
             act_out, hidden_state = self.policy.get_actions(
                 obs=torch_obs,
                 rl2s=rl2s,
@@ -178,9 +274,16 @@ class AmagoLadderPolicyDriver:
     def reset_all(self) -> None:
         self.step_counts[:] = 0
         self.rl2s[:] = 0.0
-        self.hidden_state = self.policy.traj_encoder.init_hidden_state(
-            self.num_lanes, self.device
-        )
+        # Reuse the preallocated KV cache instead of transiently holding two.
+        hs = self.hidden_state
+        try:
+            hs.seq_lens.zero_()
+            hs.key_cache.data.zero_()
+            hs.val_cache.data.zero_()
+        except (AttributeError, RuntimeError):
+            self.hidden_state = self.policy.traj_encoder.init_hidden_state(
+                self.num_lanes, self.device
+            )
 
 
 def vectorized_ladder_eval(

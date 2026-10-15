@@ -617,6 +617,24 @@ def main() -> None:
         experiment.load_checkpoint_from_path(ckpt_path, is_accelerate_state=False)
         print(f"Loaded initial weights: {ckpt_path}")
 
+    if args.mode == "collect" and os.environ.get(
+        "METAMON_ACTOR_ONLY_COLLECTION", "1"
+    ) == "1":
+        from metamon.env.vectorized.amago_policy import optimize_policy_for_collection
+
+        optimize_policy_for_collection(experiment.policy, experiment.DEVICE)
+        removed = getattr(experiment.policy, "_metamon_removed_children", ())
+        dtype = getattr(experiment.policy, "_metamon_collection_dtype", torch.float32)
+        cache_len = getattr(
+            experiment.policy, "_metamon_collection_cache_len", "unchanged"
+        )
+        print(
+            "Collector policy optimized: "
+            f"dtype={dtype}, kv_cache_len={cache_len}, "
+            f"removed={','.join(removed) or 'none'}",
+            flush=True,
+        )
+
     experiment.learn()
     if args.log:
         wandb.finish()

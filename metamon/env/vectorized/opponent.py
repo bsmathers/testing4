@@ -25,7 +25,7 @@ from typing import List, Optional, TYPE_CHECKING
 import numpy as np
 import torch
 
-from .amago_policy import AmagoLadderPolicyDriver
+from .amago_policy import AmagoLadderPolicyDriver, optimize_policy_for_collection
 
 if TYPE_CHECKING:
     from metamon.env.wrappers import TeamSet
@@ -143,10 +143,9 @@ class ConfigBatchedOpponent(BatchedOpponent):
             action_temperature=spec.temperature,
         )
         action_dim = model.action_space.gym_space.n
-        agent.policy.to(self.device)
-        agent.policy.eval()
+        policy = optimize_policy_for_collection(agent.policy, self.device)
         return AmagoBatchedOpponent(
-            policy=agent.policy,
+            policy=policy,
             device=self.device,
             num_lanes=self.num_lanes,
             action_dim=action_dim,
@@ -182,24 +181,27 @@ class ConfigBatchedOpponent(BatchedOpponent):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+        made_new = False
         if key in self._cache:
             self._cache.move_to_end(key)
         else:
-            self._cache[key] = self._make_bundle(spec)
-            # LRU-evict the oldest opponents and reclaim their GPU memory.
-            evicted = False
-            while len(self._cache) > self._cache_size:
+            # Make room before loading so two full policies and KV caches never
+            # coexist merely because the league changed opponents.
+            while len(self._cache) >= self._cache_size:
                 _, old_bundle = self._cache.popitem(last=False)
+                if old_bundle is self._bundle:
+                    self._bundle = None
                 self._free_bundle(old_bundle)
                 del old_bundle
-                evicted = True
-            if evicted:
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+            gc.collect()
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+            self._cache[key] = self._make_bundle(spec)
+            made_new = True
         self._bundle = self._cache[key]
         self._active_key = key
-        self._bundle.reset_all()
+        if not made_new:
+            self._bundle.reset_all()
         return spec
 
     def _require_bundle(self) -> AmagoBatchedOpponent:
