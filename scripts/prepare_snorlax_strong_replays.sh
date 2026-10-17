@@ -15,6 +15,16 @@ STRONG_REPLAYS_SHA256="${STRONG_REPLAYS_SHA256:-b43668b1a4342b2e27125ee5d52fb3ec
 STRONG_REPLAYS_URL="${STRONG_REPLAYS_URL:-https://huggingface.co/datasets/bsmathers/scraped_replays_parsed/resolve/${STRONG_REPLAYS_REVISION}/gen1ou.zip?download=true}"
 STRONG_REPLAYS_ARCHIVE="${STRONG_REPLAYS_ARCHIVE:-${GOOD_REPLAYS_DIR%/}.gen1ou.zip}"
 
+if [[ -d "${GOOD_REPLAYS_DIR}/gen1ou" ]]; then
+  sidecar_count="$(find "${GOOD_REPLAYS_DIR}/gen1ou" -maxdepth 1 -type f \
+    \( -name '._*.json' -o -name '._*.json.lz4' \) | wc -l | tr -d ' ')"
+  if (( sidecar_count > 0 )); then
+    log "Removing ${sidecar_count} macOS archive sidecars from strong-model trajectories"
+    find "${GOOD_REPLAYS_DIR}/gen1ou" -maxdepth 1 -type f \
+      \( -name '._*.json' -o -name '._*.json.lz4' \) -delete
+  fi
+fi
+
 if [[ -d "${GOOD_REPLAYS_DIR}/gen1ou" ]] \
     && find "${GOOD_REPLAYS_DIR}/gen1ou" -maxdepth 1 -type f \
       \( -name '*.json' -o -name '*.json.lz4' \) -print -quit | grep -q .; then
@@ -79,6 +89,8 @@ try:
             if member.is_dir() or member_path.is_absolute() or ".." in member_path.parts:
                 if member_path.is_absolute() or ".." in member_path.parts:
                     raise SystemExit(f"Unsafe archive member: {member.filename!r}")
+                continue
+            if "__MACOSX" in member_path.parts or member_path.name.startswith("._"):
                 continue
             if not member_path.name.endswith((".json", ".json.lz4")):
                 continue
