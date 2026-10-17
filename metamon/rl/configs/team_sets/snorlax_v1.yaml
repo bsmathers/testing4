@@ -1,0 +1,5 @@
+# Half strong-human teams and half the 807-team top-level replay set.
+team_set:
+  weighted:
+    hl_05_26: 1
+    snorlax_v1_expert: 1

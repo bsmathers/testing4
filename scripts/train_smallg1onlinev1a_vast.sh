@@ -57,10 +57,20 @@ BOOTSTRAP_DIR="${PERSIST_ROOT}/bootstrap"
 LOG_DIR="${PERSIST_ROOT}/logs"
 RAW_WEIGHTS="${BOOTSTRAP_DIR}/policy_epoch_475.pt"
 ONLINE_WEIGHTS="${BOOTSTRAP_DIR}/policy_epoch_475_online.pt"
-RUN_CONFIG="${CONFIG_DIR}/smallg1onlinev1a.yaml"
-POOL_CONFIG="${CONFIG_DIR}/hl_gen1ou_smallg1onlinev1a.yaml"
-VAL_POOL_CONFIG="metamon/rl/configs/opponent_pools/taurosv1a_val.yaml"
-EXPERT_DIR="${CACHE_DIR}/teams/smallg1onlinev1a_expert/gen1ou"
+if [[ "${TRAIN_VARIANT}" == "snorlax_v1" ]]; then
+  RUN_CONFIG="metamon/rl/configs/online_runs/snorlax_v1.yaml"
+  POOL_CONFIG="metamon/rl/configs/opponent_pools/snorlax_v1.yaml"
+  VAL_POOL_CONFIG="metamon/rl/configs/opponent_pools/snorlax_v1_val.yaml"
+  EXPERT_SET_NAME=snorlax_v1_expert
+  ONLINE_WEIGHT="${ONLINE_WEIGHT:-0.50}"
+else
+  RUN_CONFIG="${CONFIG_DIR}/smallg1onlinev1a.yaml"
+  POOL_CONFIG="${CONFIG_DIR}/hl_gen1ou_smallg1onlinev1a.yaml"
+  VAL_POOL_CONFIG="metamon/rl/configs/opponent_pools/taurosv1a_val.yaml"
+  EXPERT_SET_NAME=smallg1onlinev1a_expert
+  ONLINE_WEIGHT="${ONLINE_WEIGHT:-0.40}"
+fi
+EXPERT_DIR="${CACHE_DIR}/teams/${EXPERT_SET_NAME}/gen1ou"
 
 [[ -f "${REPO_DIR}/pyproject.toml" ]] || die "REPO_DIR is not testing4: ${REPO_DIR}"
 mkdir -p "${CACHE_DIR}" "${SAVE_DIR}" "${BUFFER_DIR}/gen1ou" \
@@ -70,8 +80,8 @@ export METAMON_CACHE_DIR="${CACHE_DIR}"
 export METAMON_SAVE_DIR="${SAVE_DIR}"
 export METAMON_BATTLE_HOST="${REPO_DIR}/metamon/env/vectorized/battle_host_engine.js"
 export METAMON_PKMN_ENGINE="${REPO_DIR}/metamon/env/vectorized/pkmn-showdown.node"
-if [[ "${TRAIN_VARIANT}" == "epoch475_ataraxos" ]]; then
-  export TAUROSV1B_RUN_NAME="${RUN_NAME}"
+if [[ "${TRAIN_VARIANT}" == "snorlax_v1" ]]; then
+  export SNORLAX_RUN_NAME="${RUN_NAME}"
   # L2-SP anchors are reconstructed from this immutable policy on learner
   # resume rather than duplicated into every checkpoint.
   export ATARAXOS_L2SP_ANCHOR_PATH="${ONLINE_WEIGHTS}"
@@ -279,64 +289,17 @@ with (target / "index.csv").open("w", encoding="utf-8") as f:
 print(f"Wrote {len(names)} entries to {target}; duplicate content was preserved")
 PY
 
-log "Writing the SmallG1OnlineV1a opponent pool and run configuration"
-if [[ "${TRAIN_VARIANT}" == "epoch475_ataraxos" ]]; then
-cat >"${POOL_CONFIG}" <<'YAML'
-# Epoch475 Ataraxos league. The six-row lineage slice is always exactly:
-# current, 1 epoch old, 4 epochs old, 16 epochs old, 64 epochs old, original.
-# Before enough history exists, missing offset rows use the immutable original.
-defaults:
-  team_set: [hl_05_26, smallg1onlinev1a_expert]
-  battle_backend: metamon
-  checkpoints: [null]
-  temperatures: [0.75, 1.0, 1.25, 1.5]
-  num_agents: 1
-agents:
-  TaurosV0:
-    model_name: TaurosV0
-    num_agents: 3
-    checkpoints: "range(50, 63, 2)"
-  Kakuna:
-    model_name: Kakuna
-    num_agents: 3
-    checkpoints: "range(24, 35, 2)"
-  Epoch475Original:
-    model_name: Epoch475Frozen
-    checkpoints: [475]
-  Epoch475History:
-    model_name: Epoch475Ataraxos
-    checkpoints:
-      discover: true
-      include_latest: false
-      offsets: [0, 1, 4, 16, 64]
-      update_interval: 1
-      uniform_agents: true
-      num_agents_per_checkpoint: 1
-      fill_missing_model: Epoch475Frozen
-      fill_checkpoints: [475]
-      max_fill_missing: 5
-YAML
-  VAL_POOL_CONFIG="${CONFIG_DIR}/epoch475_ataraxos_val.yaml"
-  cat >"${VAL_POOL_CONFIG}" <<'YAML'
-# Frozen validation anchors, sampled uniformly at temperature 1.0.
-defaults:
-  team_set: [hl_05_26, smallg1onlinev1a_expert]
-  battle_backend: metamon
-  checkpoints: [null]
-  temperatures: [1.0]
-  num_agents: 1
-agents:
-  TaurosV0:
-    model_name: TaurosV0
-    checkpoints: [62]
-  Kakuna:
-    model_name: Kakuna
-    checkpoints: [34]
-  Epoch475:
-    model_name: Epoch475Frozen
-    checkpoints: [475]
-YAML
+if [[ "${TRAIN_VARIANT}" == "snorlax_v1" ]]; then
+  log "Using committed SnorlaxV1 run, dataset, team, and opponent configs"
+  for config_path in \
+    "${RUN_CONFIG}" "${POOL_CONFIG}" "${VAL_POOL_CONFIG}" \
+    metamon/rl/configs/datasets/snorlax_v1.yaml \
+    metamon/rl/configs/team_sets/snorlax_v1.yaml \
+    metamon/rl/configs/training/snorlax_v1.gin; do
+    [[ -f "${config_path}" ]] || die "Missing SnorlaxV1 config: ${config_path}"
+  done
 else
+log "Writing the legacy SmallG1OnlineV1a opponent pool and run configuration"
 cat >"${POOL_CONFIG}" <<'YAML'
 # SmallG1OnlineV1.5 roster, with SmallG1OnlineV0 replaced by epoch 475.
 defaults:
@@ -376,74 +339,49 @@ agents:
 YAML
 fi
 
-DATASET_CONFIG_VALUE="online_selfplay.yaml"
-TRAIN_TEAM_SET_VALUE="smallg1onlinev1a_expert"
-VAL_TEAM_SET_VALUE="smallg1onlinev1a_expert"
-ONLINE_WEIGHT_VALUE="0.4"
-INITIAL_ONLINE_WEIGHT_VALUE="0.0"
-ONLINE_ANNEAL_END_VALUE=20
-CKPT_INTERVAL_VALUE=10
-FULL_STATE_INTERVAL_VALUE=10
-if [[ "${TRAIN_VARIANT}" == "epoch475_ataraxos" ]]; then
+if [[ "${TRAIN_VARIANT}" == "snorlax_v1" ]]; then
   GOOD_REPLAYS_DIR="${GOOD_REPLAYS_DIR:-}"
-  [[ -n "${GOOD_REPLAYS_DIR}" ]] || die "GOOD_REPLAYS_DIR is required for epoch475_ataraxos"
+  export GOOD_REPLAYS_DIR
+  [[ -n "${GOOD_REPLAYS_DIR}" ]] || die "GOOD_REPLAYS_DIR is required for snorlax_v1"
   [[ -d "${GOOD_REPLAYS_DIR}/gen1ou" ]] \
     || die "GOOD_REPLAYS_DIR must contain gen1ou/: ${GOOD_REPLAYS_DIR}"
-  OMD_DATASET_CONFIG="${CONFIG_DIR}/epoch475_ataraxos_offline.yaml"
-  OMD_TEAM_CONFIG="${CONFIG_DIR}/epoch475_ataraxos_teams.yaml"
-  cat >"${OMD_DATASET_CONFIG}" <<YAML
-# Within the offline pool: 40% pac-tauros, 30% pac-exploratory,
-# 20% curated strong bots, and 10% human replays. At the 50% online cap these
-# are respectively 20%, 15%, 10%, and 5% of the complete training mixture.
-replay_weight: 0.10
-self_play:
-  pac-tauros: 0.40
-  pac-exploratory: 0.30
-custom_replays:
-  - dir: ${GOOD_REPLAYS_DIR}
-    weight: 0.20
-formats: [gen1ou]
-YAML
-  cat >"${OMD_TEAM_CONFIG}" <<'YAML'
-team_set:
-  weighted:
-    hl_05_26: 1
-    smallg1onlinev1a_expert: 1
-YAML
-  DATASET_CONFIG_VALUE="${OMD_DATASET_CONFIG}"
-  TRAIN_TEAM_SET_VALUE="${OMD_TEAM_CONFIG}"
-  VAL_TEAM_SET_VALUE="${OMD_TEAM_CONFIG}"
-  ONLINE_WEIGHT_VALUE="${ONLINE_WEIGHT:-0.50}"
-  INITIAL_ONLINE_WEIGHT_VALUE=0.0
-  ONLINE_ANNEAL_END_VALUE=100
-  [[ "${GRAD_ACCUM}" == "1" ]] || die "epoch475_ataraxos requires GRAD_ACCUM=1"
-  [[ "${BATCH_SIZE_PER_GPU}" == "14" ]] || die "epoch475_ataraxos requires batch size 14"
-  [[ "${DLOADER_WORKERS}" == "0" ]] || die "epoch475_ataraxos requires DLOADER_WORKERS=0 for deterministic ramp sampling"
-fi
-if [[ "${ALTERNATE_COLLECT_LEARN}" == "1" ]]; then
-  CKPT_INTERVAL_VALUE=1
-  FULL_STATE_INTERVAL_VALUE=1
-fi
-
-cat >"${RUN_CONFIG}" <<YAML
+  [[ "${ONLINE_WEIGHT}" == "0.50" ]] || die "snorlax_v1 requires ONLINE_WEIGHT=0.50"
+  [[ "${ONLINE_FIFO_SIZE}" == "5000" ]] || die "snorlax_v1 requires a 5000-game FIFO"
+  [[ "${GRAD_ACCUM}" == "1" ]] || die "snorlax_v1 requires GRAD_ACCUM=1"
+  [[ "${BATCH_SIZE_PER_GPU}" == "14" ]] || die "snorlax_v1 requires batch size 14"
+  [[ "${DLOADER_WORKERS}" == "0" ]] || die "snorlax_v1 requires DLOADER_WORKERS=0 for deterministic sampling"
+else
+  DATASET_CONFIG_VALUE="online_selfplay.yaml"
+  TRAIN_TEAM_SET_VALUE="smallg1onlinev1a_expert"
+  VAL_TEAM_SET_VALUE="smallg1onlinev1a_expert"
+  ONLINE_WEIGHT_VALUE="0.4"
+  INITIAL_ONLINE_WEIGHT_VALUE="0.0"
+  ONLINE_ANNEAL_END_VALUE=20
+  CKPT_INTERVAL_VALUE=10
+  FULL_STATE_INTERVAL_VALUE=10
+  if [[ "${ALTERNATE_COLLECT_LEARN}" == "1" ]]; then
+    CKPT_INTERVAL_VALUE=1
+    FULL_STATE_INTERVAL_VALUE=1
+  fi
+  cat >"${RUN_CONFIG}" <<YAML
 run_name: ${RUN_NAME}
 base_model: TaurosV1A
 battle_format: gen1ou
 dataset_config: ${DATASET_CONFIG_VALUE}
-train_gin_config: $([[ "${TRAIN_VARIANT}" == "epoch475_ataraxos" ]] && echo epoch475_ataraxos.gin || echo grouped_v2_large_isfilter.gin)
+train_gin_config: grouped_v2_large_isfilter.gin
 train_pool: ${POOL_CONFIG}
 train_team_set: ${TRAIN_TEAM_SET_VALUE}
 val_pool: ${VAL_POOL_CONFIG}
 val_team_set: ${VAL_TEAM_SET_VALUE}
 dset_max_size: ${ONLINE_FIFO_SIZE}
-dset_min_size: $([[ "${TRAIN_VARIANT}" == "epoch475_ataraxos" ]] && echo 4999 || echo 5000)
+dset_min_size: 5000
 initial_online_weight: ${INITIAL_ONLINE_WEIGHT_VALUE}
 online_weight: ${ONLINE_WEIGHT_VALUE}
 online_anneal_start_epoch: 0
 online_anneal_end_epoch: ${ONLINE_ANNEAL_END_VALUE}
-learning_rate: $([[ "${TRAIN_VARIANT}" == "epoch475_ataraxos" ]] && echo 1.0e-4 || echo 8.0e-5)
-lr_warmup_epochs: $([[ "${TRAIN_VARIANT}" == "epoch475_ataraxos" ]] && echo 0 || echo 20)
-seq_floor_warmup_epochs: $([[ "${TRAIN_VARIANT}" == "epoch475_ataraxos" ]] && echo 0 || echo 20)
+learning_rate: 8.0e-5
+lr_warmup_epochs: 20
+seq_floor_warmup_epochs: 20
 batch_size_per_gpu: ${BATCH_SIZE_PER_GPU}
 grad_accum: ${GRAD_ACCUM}
 epochs: ${TOTAL_LEARNER_EPOCHS}
@@ -455,12 +393,13 @@ lanes: ${LANES}
 n_workers: ${COLLECTOR_WORKERS}
 train_timesteps_per_epoch: 500
 temp_low: 1.0
-temp_high: $([[ "${TRAIN_VARIANT}" == "epoch475_ataraxos" ]] && echo 1.0 || echo 2.0)
+temp_high: 2.0
 reward_function: AggressiveShapedReward
 val_timesteps: 1000
 val_interval: 10
 dloader_workers: ${DLOADER_WORKERS}
 YAML
+fi
 
 log "Downloading offline data, usage statistics, hl_05_26 teams, and opponent weights"
 "${PYTHON_BIN}" - <<'PY'
@@ -476,7 +415,7 @@ from metamon.data.download import (
 
 download_usage_stats(gen=1, version="v5", force_download=False)
 download_parsed_replays("gen1ou", version="v6", force_download=False)
-subsets = ("pac-tauros", "pac-exploratory") if os.environ.get("TRAIN_VARIANT") == "epoch475_ataraxos" else ("pac-base", "pac-exploratory", "pac-tauros")
+subsets = ("pac-tauros", "pac-exploratory") if os.environ.get("TRAIN_VARIANT") == "snorlax_v1" else ("pac-base", "pac-exploratory", "pac-tauros")
 for subset in subsets:
     download_self_play_data(subset, "gen1ou", version="main", force_download=False, extract=False)
 download_teams("gen1ou", "hl_05_26", version="v5", force_download=False)
@@ -499,7 +438,7 @@ public = {
     "Superkazam": range(38, 51, 2),
     "Kadabra3": range(10, 21, 2),
 }
-if os.environ.get("TRAIN_VARIANT") == "epoch475_ataraxos":
+if os.environ.get("TRAIN_VARIANT") == "snorlax_v1":
     public = {"TaurosV0": public["TaurosV0"], "Kakuna": public["Kakuna"]}
 for model_name, epochs in public.items():
     model = get_pretrained_model(model_name)
@@ -515,7 +454,7 @@ LATEST="${SAVE_DIR}/${RUN_NAME}/ckpts/latest/policy.pt"
 mkdir -p "$(dirname "${FROZEN}")" "$(dirname "${LATEST}")"
 cp -f "${ONLINE_WEIGHTS}" "${FROZEN}"
 [[ -s "${LATEST}" ]] || cp "${ONLINE_WEIGHTS}" "${LATEST}"
-if [[ "${TRAIN_VARIANT}" == "epoch475_ataraxos" ]]; then
+if [[ "${TRAIN_VARIANT}" == "snorlax_v1" ]]; then
   mkdir -p "${SAVE_DIR}/${RUN_NAME}/ckpts/policy_weights"
   BASE_SNAPSHOT="${SAVE_DIR}/${RUN_NAME}/ckpts/policy_weights/policy_epoch_0.pt"
   [[ -s "${BASE_SNAPSHOT}" ]] || cp "${ONLINE_WEIGHTS}" "${BASE_SNAPSHOT}"
@@ -580,6 +519,7 @@ start_collectors() {
     seed=$((seed_base + i))
     "${collector_prefix[@]}" "${PYTHON_BIN}" -m "${RUNNER_MODULE}" \
       --run_config "${RUN_CONFIG}" --mode collect \
+      --run_name "${RUN_NAME}" --lanes "${LANES}" --n_workers "${COLLECTOR_WORKERS}" \
       --save_dir "${SAVE_DIR}" --buffer_dir "${BUFFER_DIR}" \
       --base_weights "${LATEST}" --epochs 1000000 --seed "${seed}" \
       --mixed_precision "${collector_mp}" \
@@ -634,8 +574,8 @@ else
   log "FIFO already contains ${current} files; skipping prefill"
 fi
 
-if [[ "${TRAIN_VARIANT}" == "epoch475_ataraxos" ]]; then
-  log "Validating exact behavior metadata in the 5,000-game FIFO"
+if [[ "${TRAIN_VARIANT}" == "snorlax_v1" ]]; then
+  log "Validating exact behavior metadata in the SnorlaxV1 FIFO"
   BUFFER_DIR="${BUFFER_DIR}" "${PYTHON_BIN}" - <<'PY'
 import json
 import os
@@ -645,8 +585,8 @@ import lz4.frame
 
 root = Path(os.environ["BUFFER_DIR"]) / "gen1ou"
 files = sorted(list(root.glob("*.json")) + list(root.glob("*.json.lz4")))
-if len(files) != 5000:
-    raise SystemExit(f"Ataraxos FIFO must contain exactly 5000 games; found {len(files)}")
+if len(files) < 5000:
+    raise SystemExit(f"SnorlaxV1 FIFO requires at least 5000 games; found {len(files)}")
 required = {"behavior_log_probs", "behavior_values", "behavior_legal_masks"}
 for path in files:
     if path.name.endswith(".lz4"):
@@ -657,7 +597,7 @@ for path in files:
             payload = json.load(f)
     missing = required.difference(payload)
     if missing:
-        raise SystemExit(f"{path.name} predates Ataraxos metadata; use a fresh PERSIST_ROOT")
+        raise SystemExit(f"{path.name} predates SnorlaxV1 metadata; use a fresh PERSIST_ROOT")
 print(f"Validated behavior metadata in {len(files)} FIFO games")
 PY
 fi
@@ -699,6 +639,7 @@ if [[ "${ALTERNATE_COLLECT_LEARN}" == "1" ]]; then
     set +e
     "${PYTHON_BIN}" -m "${RUNNER_MODULE}" \
       --run_config "${RUN_CONFIG}" --mode learn \
+      --run_name "${RUN_NAME}" --lanes "${LANES}" --n_workers "${COLLECTOR_WORKERS}" \
       --save_dir "${SAVE_DIR}" --buffer_dir "${BUFFER_DIR}" --log \
       --epochs "${learner_limit}" --ckpt_interval 1 --full_state_ckpt_interval 1 \
       "${cycle_resume[@]}" \
@@ -723,10 +664,11 @@ fi
 
 start_collectors 1000 train
 
-log "Launching SmallG1OnlineV1a learner with W&B run ${WANDB_PROJECT}/${WANDB_RUN_ID}"
+log "Launching ${RUN_NAME} learner with W&B run ${WANDB_PROJECT}/${WANDB_RUN_ID}"
 set +e
 "${PYTHON_BIN}" -m "${RUNNER_MODULE}" \
   --run_config "${RUN_CONFIG}" --mode learn \
+  --run_name "${RUN_NAME}" --lanes "${LANES}" --n_workers "${COLLECTOR_WORKERS}" \
   --save_dir "${SAVE_DIR}" --buffer_dir "${BUFFER_DIR}" --log \
   "${LEARNER_RESUME_ARGS[@]}" \
   2>&1 | tee -a "${LOG_DIR}/learner.log"
@@ -736,4 +678,4 @@ cleanup_collectors
 trap - EXIT INT TERM
 
 (( learner_status == 0 )) || die "Learner exited with status ${learner_status}; inspect ${LOG_DIR}/learner.log"
-log "SmallG1OnlineV1a training completed"
+log "${RUN_NAME} training completed"

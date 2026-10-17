@@ -1,0 +1,40 @@
+# SnorlaxV1: an Ataraxos-inspired, schedule-free continuation of Epoch475.
+run_name: snorlax_v1
+base_model: TaurosV1A
+battle_format: gen1ou
+
+dataset_config: snorlax_v1.yaml
+train_gin_config: snorlax_v1.gin
+train_pool: metamon/rl/configs/opponent_pools/snorlax_v1.yaml
+train_team_set: metamon/rl/configs/team_sets/snorlax_v1.yaml
+val_pool: metamon/rl/configs/opponent_pools/snorlax_v1_val.yaml
+val_team_set: metamon/rl/configs/team_sets/snorlax_v1.yaml
+
+dset_max_size: 5000
+dset_min_size: 4999
+initial_online_weight: 0.0
+online_weight: 0.50
+online_anneal_start_epoch: 0
+online_anneal_end_epoch: 100
+
+learning_rate: 1.0e-4
+lr_warmup_epochs: 0
+seq_floor_warmup_epochs: 0
+batch_size_per_gpu: 14
+grad_accum: 1
+epochs: 1000000000
+steps_per_epoch: 1000
+ckpt_interval: 1
+full_state_ckpt_interval: 1
+mixed_precision: "no"
+dloader_workers: 0
+
+lanes: 96
+n_workers: 8
+train_timesteps_per_epoch: 500
+temp_low: 1.0
+temp_high: 1.0
+reward_function: AggressiveShapedReward
+
+val_timesteps: 1000
+val_interval: 10

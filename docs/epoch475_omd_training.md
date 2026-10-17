@@ -1,4 +1,10 @@
-# Epoch475 Ataraxos training
+# Historical Epoch475 training name
+
+This experiment is now named **SnorlaxV1**. The current recipe and launch
+instructions are in `docs/snorlax_v1_training.md`; historical launch filenames
+remain as compatibility entry points.
+
+## Archived description
 
 The OMD experiment has been retired. The compatibility launcher
 `scripts/train_epoch475_omd.sh` now delegates to the corrected Ataraxos run.
@@ -65,8 +71,8 @@ git clone https://github.com/bsmathers/testing4.git /workspace/testing4
 bash /workspace/testing4/scripts/setup_and_launch_epoch475_omd_vast.sh
 ```
 
-The setup script remains under its historical filename for compatibility, but
-launches `scripts/train_epoch475_ataraxos.sh`. It runs in the foreground and
+The historical setup script remains for compatibility, but now launches
+`scripts/train_snorlax_v1.sh`. It runs in the foreground and
 alternates collection with learning. Re-running the same command resumes from
 the latest complete epoch-boundary checkpoint.
 

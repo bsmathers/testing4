@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Bootstrap and launch the Epoch475 Ataraxos experiment on Vast.ai.
+# Compatibility-named bootstrap for the SnorlaxV1 experiment on Vast.ai.
 #
 # Recommended instance:
 #   - 1x RTX 5090 (32 GiB)
@@ -23,7 +23,7 @@ log() { printf '\n[%s] %s\n' "$(date '+%F %T')" "$*"; }
 REPO_URL="${REPO_URL:-https://github.com/bsmathers/testing4.git}"
 REPO_REF="${REPO_REF:-main}"
 REPO_DIR="${REPO_DIR:-/workspace/testing4}"
-PERSIST_ROOT="${PERSIST_ROOT:-/workspace/epoch475-ataraxos}"
+PERSIST_ROOT="${PERSIST_ROOT:-/workspace/snorlax-v1}"
 GOOD_REPLAYS_DIR="${GOOD_REPLAYS_DIR:-/workspace/good_replays}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 UPDATE_REPO="${UPDATE_REPO:-1}"
@@ -89,7 +89,7 @@ else
   die "REPO_DIR exists but is not a Git checkout: ${REPO_DIR}"
 fi
 
-[[ -f "${REPO_DIR}/scripts/train_epoch475_ataraxos.sh" ]] \
+[[ -f "${REPO_DIR}/scripts/train_snorlax_v1.sh" ]] \
   || die "Training launcher is missing from ${REPO_DIR}"
 [[ -d "${GOOD_REPLAYS_DIR}/gen1ou" ]] \
   || die "GOOD_REPLAYS_DIR must contain gen1ou/: ${GOOD_REPLAYS_DIR}"
@@ -138,4 +138,4 @@ export TOTAL_LEARNER_EPOCHS="${TOTAL_LEARNER_EPOCHS:-1000000000}"
 export ONLINE_FIFO_SIZE=5000
 
 cd "${REPO_DIR}"
-bash scripts/train_epoch475_ataraxos.sh 2>&1 | tee -a "${run_log}"
+bash scripts/train_snorlax_v1.sh 2>&1 | tee -a "${run_log}"

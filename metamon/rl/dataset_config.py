@@ -107,7 +107,18 @@ def load_dataset_config(path: str) -> DatasetConfig:
 
     custom_replays = None
     if "custom_replays" in raw and raw["custom_replays"]:
-        custom_replays = [CustomReplaySource(**cr) for cr in raw["custom_replays"]]
+        custom_replays = []
+        for source in raw["custom_replays"]:
+            source = dict(source)
+            source["dir"] = os.path.expanduser(
+                os.path.expandvars(str(source["dir"]))
+            )
+            if "$" in source["dir"]:
+                raise ValueError(
+                    "Unresolved environment variable in custom replay path: "
+                    f"{source['dir']}"
+                )
+            custom_replays.append(CustomReplaySource(**source))
 
     return DatasetConfig(
         replay_weight=raw.get("replay_weight", 0.05),

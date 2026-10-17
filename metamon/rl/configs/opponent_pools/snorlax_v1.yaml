@@ -1,0 +1,34 @@
+# SnorlaxV1 league. The lineage slice is current, -1, -4, -16, and -64,
+# plus the immutable Epoch475 policy. Missing early checkpoints are filled by
+# Epoch475 so this slice always contributes exactly six rows.
+defaults:
+  team_set: [hl_05_26, snorlax_v1_expert]
+  battle_backend: metamon
+  checkpoints: [null]
+  temperatures: [0.75, 1.0, 1.25, 1.5]
+  num_agents: 1
+
+agents:
+  TaurosV0:
+    model_name: TaurosV0
+    num_agents: 3
+    checkpoints: "range(50, 63, 2)"
+  Kakuna:
+    model_name: Kakuna
+    num_agents: 3
+    checkpoints: "range(24, 35, 2)"
+  Epoch475Original:
+    model_name: Epoch475Frozen
+    checkpoints: [475]
+  SnorlaxHistory:
+    model_name: SnorlaxV1
+    checkpoints:
+      discover: true
+      include_latest: false
+      offsets: [0, 1, 4, 16, 64]
+      update_interval: 1
+      uniform_agents: true
+      num_agents_per_checkpoint: 1
+      fill_missing_model: Epoch475Frozen
+      fill_checkpoints: [475]
+      max_fill_missing: 5

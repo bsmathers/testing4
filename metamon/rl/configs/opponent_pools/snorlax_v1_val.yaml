@@ -1,0 +1,18 @@
+# Frozen validation anchors, sampled uniformly at temperature 1.0.
+defaults:
+  team_set: [hl_05_26, snorlax_v1_expert]
+  battle_backend: metamon
+  checkpoints: [null]
+  temperatures: [1.0]
+  num_agents: 1
+
+agents:
+  TaurosV0:
+    model_name: TaurosV0
+    checkpoints: [62]
+  Kakuna:
+    model_name: Kakuna
+    checkpoints: [34]
+  Epoch475:
+    model_name: Epoch475Frozen
+    checkpoints: [475]

@@ -82,6 +82,20 @@ class AtaraxosAgent(MultiTaskAgent):
         self.register_buffer(
             "_ataraxos_online_mass", torch.zeros((), dtype=torch.float32)
         )
+        # The inherited shaped-reward critics remain in the state dict only so
+        # Epoch475 checkpoints stay loadable. They are absent from this loss and
+        # must not allocate gradients or participate in distributed reduction.
+        trainable_modules = (
+            self.tstep_encoder,
+            self.traj_encoder,
+            self.actor,
+            self.ataraxos_value,
+        )
+        for parameter in self.parameters():
+            parameter.requires_grad_(False)
+        for module in trainable_modules:
+            for parameter in module.parameters():
+                parameter.requires_grad_(True)
 
     @property
     def trainable_params(self):

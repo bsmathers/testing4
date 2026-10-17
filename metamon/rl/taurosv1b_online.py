@@ -100,16 +100,16 @@ class TaurosV1B(_LocalV1BModel):
         return super().get_path_to_checkpoint(checkpoint)
 
 
-@pretrained_model("Epoch475Ataraxos")
-class Epoch475Ataraxos(_LocalV1BModel):
-    """Evolving Ataraxos policy used by its own self-play lineage."""
+@pretrained_model("SnorlaxV1")
+class SnorlaxV1(_LocalV1BModel):
+    """Evolving SnorlaxV1 policy used by its own self-play lineage."""
 
     def __init__(self):
-        run_name = os.environ.get("TAUROSV1B_RUN_NAME", "epoch475_ataraxos")
+        run_name = os.environ.get("SNORLAX_RUN_NAME", "snorlax_v1")
         super().__init__(
             run_name=run_name,
             default_checkpoint=0,
-            train_gin_config="epoch475_ataraxos.gin",
+            train_gin_config="snorlax_v1.gin",
         )
 
     def get_path_to_checkpoint(self, checkpoint: int) -> str:
