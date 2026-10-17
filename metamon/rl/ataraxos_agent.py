@@ -196,7 +196,14 @@ class AtaraxosAgent(MultiTaskAgent):
         )
         actions = dist.sample() if sample else torch.argmax(dist.probs, dim=-1, keepdim=True)
         actions = actions[..., -1, :]
-        probs = dist.probs[..., -1, :]
+        # Collector inference defaults to BF16.  Logging BF16 probabilities in
+        # BF16 log-space introduces enough rounding error that reconstructing
+        # them can miss unit mass by >0.2%, even for a healthy masked softmax.
+        # ``Categorical.sample`` is effectively proportional to these stored
+        # probabilities, so FP32 renormalization records its exact effective
+        # behavior distribution without changing the sampled action.
+        probs = dist.probs[..., -1, :].float()
+        probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-30)
         log_probs = torch.where(
             probs > 0, probs.clamp_min(1e-30).log(), torch.full_like(probs, -70.0)
         )

@@ -114,6 +114,9 @@ cd "${REPO_DIR}"
 [[ "${TOTAL_LEARNER_EPOCHS}" =~ ^[1-9][0-9]*$ ]] || die "TOTAL_LEARNER_EPOCHS must be positive"
 [[ "${COLLECTOR_DTYPE}" =~ ^(fp32|bf16|fp16)$ ]] || die "COLLECTOR_DTYPE must be fp32, bf16, or fp16"
 [[ "${ONLINE_FIFO_SIZE}" =~ ^[1-9][0-9]*$ ]] || die "ONLINE_FIFO_SIZE must be positive"
+if [[ "${COLLECTOR_DEVICE}" == "cpu" && "${COLLECTOR_DTYPE}" != "fp32" ]]; then
+  die "CPU collection requires COLLECTOR_DTYPE=fp32"
+fi
 (( LANES % COLLECTOR_WORKERS == 0 )) \
   || die "LANES (${LANES}) must be divisible by COLLECTOR_WORKERS (${COLLECTOR_WORKERS})"
 

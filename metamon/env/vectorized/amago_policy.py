@@ -44,8 +44,11 @@ def collector_inference_dtype(device: torch.device) -> torch.dtype:
             f"got {requested!r}"
         )
     dtype = choices[requested]
-    if device.type == "cpu" and dtype == torch.float16:
-        raise ValueError("fp16 collector inference is unsupported on CPU")
+    if device.type == "cpu" and dtype != torch.float32:
+        raise ValueError(
+            "CPU collector inference requires fp32 because AMAGO's non-Flash "
+            "KV cache is fp32"
+        )
     return dtype
 
 

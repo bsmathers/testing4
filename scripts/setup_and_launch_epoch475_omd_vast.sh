@@ -128,7 +128,14 @@ log "Launching commit ${commit}; progress will also be written to ${run_log}"
 export REPO_DIR PERSIST_ROOT GOOD_REPLAYS_DIR PYTHON_BIN
 export COLLECTOR_PROCESSES="${COLLECTOR_PROCESSES:-1}"
 export COLLECTOR_DEVICE="${COLLECTOR_DEVICE:-gpu}"
-export COLLECTOR_DTYPE="${COLLECTOR_DTYPE:-bf16}"
+if [[ -z "${COLLECTOR_DTYPE:-}" ]]; then
+  if [[ "${COLLECTOR_DEVICE}" == "cpu" ]]; then
+    COLLECTOR_DTYPE=fp32
+  else
+    COLLECTOR_DTYPE=bf16
+  fi
+fi
+export COLLECTOR_DTYPE
 export LANES="${LANES:-96}"
 export COLLECTOR_WORKERS="${COLLECTOR_WORKERS:-8}"
 export DLOADER_WORKERS=0
