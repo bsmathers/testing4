@@ -100,9 +100,26 @@ def load_collection_policy_state(policy: torch.nn.Module, state: dict) -> None:
     """Load a full learner checkpoint into an actor-only collection policy."""
     current = policy.state_dict()
     selected = {key: value for key, value in state.items() if key in current}
+    ataraxos_keys = {
+        "ataraxos_value.weight",
+        "ataraxos_value.bias",
+        "_ataraxos_step",
+        "_ataraxos_online_mass",
+    }
+    # Epoch475 predates every Ataraxos field.  That complete absence is the
+    # expected bootstrap case; a checkpoint containing only some of the fields
+    # is corrupt/incompatible and must not leave stale collector state behind.
+    present_ataraxos = ataraxos_keys.intersection(state)
+    if present_ataraxos and present_ataraxos != ataraxos_keys:
+        missing_ataraxos = sorted(ataraxos_keys - present_ataraxos)
+        raise RuntimeError(
+            "Collection checkpoint has incomplete Ataraxos state: "
+            + ", ".join(missing_ataraxos)
+        )
+    legacy_bootstrap = not present_ataraxos
     missing = sorted(
         key for key in set(current) - set(selected)
-        if not key.startswith("ataraxos_value.") and key != "_ataraxos_step"
+        if not (legacy_bootstrap and key in ataraxos_keys)
     )
     if missing:
         raise RuntimeError(

@@ -107,6 +107,13 @@ class AtaraxosAgent(MultiTaskAgent):
             self.ataraxos_value.parameters(),
         )
 
+    def soft_sync_targets(self):
+        # This objective never reads the inherited target actor/critics. AMAGO
+        # invokes this hook on every optimizer update, and copying those frozen
+        # networks would consume bandwidth without changing any Snorlax loss or
+        # inference output.
+        return None
+
     def load_state_dict(self, state_dict, strict=True, **kwargs):
         # Old Epoch475 checkpoints predate the outcome-value head.  A zero head is
         # an unbiased baseline and is learned immediately from game outcomes.

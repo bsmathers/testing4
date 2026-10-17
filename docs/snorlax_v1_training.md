@@ -56,4 +56,6 @@ bash /workspace/testing4/scripts/setup_and_launch_snorlax_v1_vast.sh
 ```
 
 The launcher runs in the foreground and resumes only from complete
-epoch-boundary model/optimizer states. Use a fresh `PERSIST_ROOT` for SnorlaxV1.
+epoch-boundary model/optimizer states. Policy and optimizer-state checkpoints
+are published atomically; an orphan policy from an interrupted save is removed
+before resumed collection. Use a fresh `PERSIST_ROOT` for SnorlaxV1.

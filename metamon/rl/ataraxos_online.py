@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+
 import amago
 import lz4.frame
 import numpy as np
@@ -124,10 +127,16 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
                     with open(filename, "r", encoding="utf-8") as f:
                         payload = json.load(f)
                 v = np.asarray(payload["behavior_values"], dtype=np.float32)
-                if v.size == 0:
-                    continue
+                states = payload["states"]
+                actions = payload["actions"]
+                if v.ndim != 1 or v.size == 0:
+                    raise ValueError("behavior_values must be a non-empty vector")
+                if not np.isfinite(v).all():
+                    raise ValueError("behavior_values contain non-finite entries")
+                if len(states) != v.size + 1 or len(actions) != len(states):
+                    raise ValueError("behavior metadata is not trajectory-aligned")
                 state_values = np.concatenate([v, np.zeros(1, dtype=np.float32)])
-                final = payload["states"][-1]
+                final = states[-1]
                 outcome = 1.0 if final.get("battle_won") else (-1.0 if final.get("battle_lost") else 0.0)
                 rewards = np.zeros(v.size, dtype=np.float32)
                 rewards[-1] = outcome
@@ -140,8 +149,16 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
                     carry = float(delta[t]) + 0.5 * (1.0 - float(done[t])) * carry
                     adv[t] = carry
                 values.extend(np.abs(adv).tolist())
-            except (OSError, KeyError, ValueError, json.JSONDecodeError):
-                continue
+            except (
+                OSError,
+                KeyError,
+                ValueError,
+                TypeError,
+                json.JSONDecodeError,
+            ) as exc:
+                raise RuntimeError(
+                    f"invalid online FIFO replay: {filename}: {exc}"
+                ) from exc
         if not values:
             raise RuntimeError("could not compute Ataraxos advantage threshold from FIFO")
         return max(float(np.quantile(np.asarray(values), 0.75)), 0.01)
@@ -301,8 +318,39 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
     def save_checkpoint(self) -> None:
         # Raw policy checkpoints and full-state model weights must contain x;
         # optimizer state retains z and reconstructs y when training resumes.
+        # Both artifacts are published atomically: the launcher treats a visible
+        # epoch directory as complete, so a preemption during save must leave
+        # only a .tmp path that resume discovery ignores.
         self.optimizer.eval()
-        return super().save_checkpoint()
+        policy_dir = os.path.join(self.ckpt_dir, "policy_weights")
+        policy_path = os.path.join(policy_dir, f"policy_epoch_{self.epoch}.pt")
+        policy_tmp = policy_path + ".tmp"
+        if self.accelerator.is_main_process:
+            torch.save(self.policy.state_dict(), policy_tmp)
+            os.replace(policy_tmp, policy_path)
+
+        interval = self.full_state_ckpt_interval
+        if interval is None or interval <= 0 or self.epoch % interval:
+            return
+
+        state_root = os.path.join(self.ckpt_dir, "training_states")
+        state_name = f"{self.run_name}_epoch_{self.epoch}"
+        state_path = os.path.join(state_root, state_name)
+        state_tmp = state_path + ".tmp"
+        self.accelerator.wait_for_everyone()
+        if self.accelerator.is_main_process:
+            if os.path.isdir(state_tmp):
+                shutil.rmtree(state_tmp)
+            elif os.path.exists(state_tmp):
+                os.remove(state_tmp)
+        self.accelerator.wait_for_everyone()
+        self.accelerator.save_state(state_tmp, safe_serialization=True)
+        self.accelerator.wait_for_everyone()
+        if self.accelerator.is_main_process:
+            if os.path.exists(state_path):
+                shutil.rmtree(state_path)
+            os.replace(state_tmp, state_path)
+        self.accelerator.wait_for_everyone()
 
     def write_latest_policy(self) -> None:
         # Collectors and league opponents always consume the averaged policy.

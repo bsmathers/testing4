@@ -474,6 +474,18 @@ LEARNER_RESUME_ARGS=()
 if [[ -n "${RESUME_EPOCH}" ]]; then
   RESUME_POLICY="${POLICY_ROOT}/policy_epoch_${RESUME_EPOCH}.pt"
   [[ -s "${RESUME_POLICY}" ]] || die "Full state epoch ${RESUME_EPOCH} has no matching policy"
+  # A preemption can occur after the atomic policy write but before the atomic
+  # optimizer-state directory is published. Such a policy is not a completed
+  # epoch and must not enter the discovered opponent lineage on resume.
+  while IFS= read -r policy_path; do
+    policy_name="$(basename "${policy_path}")"
+    policy_epoch="${policy_name#policy_epoch_}"
+    policy_epoch="${policy_epoch%.pt}"
+    if [[ "${policy_epoch}" =~ ^[0-9]+$ ]] && (( policy_epoch > RESUME_EPOCH )); then
+      log "Removing incomplete future policy epoch ${policy_epoch}"
+      rm -f -- "${policy_path}"
+    fi
+  done < <(find "${POLICY_ROOT}" -maxdepth 1 -type f -name 'policy_epoch_*.pt' -print)
   # Keep collection and learning on the same exact full-state epoch.
   cp -f "${RESUME_POLICY}" "${LATEST}"
   LEARNER_RESUME_ARGS=(--resume_training_state --resume_epoch "${RESUME_EPOCH}")
@@ -483,9 +495,15 @@ else
       ! -name 'policy_epoch_0.pt' -print -quit 2>/dev/null | grep -q .; then
     die "Policy checkpoints exist but no full training state exists; refusing an optimizer-reset resume"
   fi
+  if [[ "${TRAIN_VARIANT}" == "snorlax_v1" ]]; then
+    # policy_epoch_0 starts as the lineage bootstrap and is overwritten by the
+    # completed first learner epoch. If epoch 0 was interrupted after its policy
+    # write, no complete state exists and the bootstrap must be restored.
+    cp -f "${ONLINE_WEIGHTS}" "${POLICY_ROOT}/policy_epoch_0.pt"
+  fi
   cp -f "${ONLINE_WEIGHTS}" "${LATEST}"
   LEARNER_RESUME_ARGS=(--base_weights "${ONLINE_WEIGHTS}")
-  log "Starting V1a epoch 0 from cleaned epoch-475 weights"
+  log "Starting ${RUN_NAME} epoch 0 from cleaned epoch-475 weights"
 fi
 
 COLLECTOR_PIDS=()
@@ -558,13 +576,13 @@ if (( current < PREFILL_FILES )); then
   prefill_added=$((current - prefill_start_count))
   if (( prefill_elapsed > 0 && prefill_added > 0 )); then
     games_per_hour=$((prefill_added * 3600 / prefill_elapsed))
-    estimated_hours="$(awk -v rate="${games_per_hour}" 'BEGIN { if (rate > 0) printf "%.1f", 250000 / rate; else print "unknown" }')"
+    estimated_cycle_minutes="$(awk -v rate="${games_per_hour}" -v games="${GAMES_PER_LEARNER_EPOCH}" 'BEGIN { if (rate > 0) printf "%.1f", games * 60 / rate; else print "unknown" }')"
     {
-      echo "Epoch475 collection calibration"
+      echo "${RUN_NAME} collection calibration"
       echo "Games collected: ${prefill_added}"
       echo "Elapsed seconds: ${prefill_elapsed}"
       echo "Games per hour: ${games_per_hour}"
-      echo "Estimated hours for 250000 games: ${estimated_hours}"
+      echo "Estimated minutes per ${GAMES_PER_LEARNER_EPOCH}-game collect phase: ${estimated_cycle_minutes}"
     } | tee "${LOG_DIR}/throughput-calibration.txt"
     if (( ${MIN_GAMES_PER_HOUR:-0} > 0 && games_per_hour < MIN_GAMES_PER_HOUR )); then
       die "Collection throughput ${games_per_hour}/hour is below MIN_GAMES_PER_HOUR=${MIN_GAMES_PER_HOUR}"
