@@ -502,7 +502,12 @@ class MetamonDataset(Dataset):
         # Online Ataraxos rollouts persist the exact behavior distribution and
         # behavior-time scalar value.  Keep these aligned with states so random
         # sequence slicing also retains the bootstrap value at the right edge.
-        if "behavior_log_probs" in data or "behavior_values" in data:
+        behavior_fields = {
+            "behavior_log_probs",
+            "behavior_values",
+            "behavior_legal_masks",
+        }
+        if behavior_fields.intersection(data):
             from metamon.rl import ataraxos_keys as atx_keys
 
             behavior_log_probs = data.get("behavior_log_probs")
@@ -517,16 +522,42 @@ class MetamonDataset(Dataset):
             if len(behavior_legal) != len(states) - 1:
                 raise ValueError("Ataraxos behavior_legal_masks are not action-aligned")
             num_actions = self.action_space.gym_space.n
-            if any(len(row) != num_actions for row in behavior_log_probs):
+            logp = np.asarray(behavior_log_probs, dtype=np.float32)
+            values = np.asarray(behavior_values, dtype=np.float32)
+            legal = np.asarray(behavior_legal, dtype=bool)
+            if logp.shape != (len(states) - 1, num_actions):
                 raise ValueError("Ataraxos behavior distribution has wrong action dimension")
-            nested_obs[atx_keys.BEHAVIOR_LOG_PROBS] = list(behavior_log_probs) + [
+            if values.shape != (len(states) - 1,):
+                raise ValueError("Ataraxos behavior values have wrong shape")
+            if legal.shape != logp.shape:
+                raise ValueError("Ataraxos behavior legal masks have wrong shape")
+            if not np.isfinite(logp).all() or not np.isfinite(values).all():
+                raise ValueError("Ataraxos behavior metadata contains non-finite values")
+            if np.any(np.abs(values) > 1.0001):
+                raise ValueError("Ataraxos behavior values fall outside [-1, 1]")
+            probs = np.exp(logp)
+            if not np.allclose(probs.sum(-1), 1.0, atol=2e-3, rtol=0.0):
+                raise ValueError("Ataraxos behavior probabilities do not sum to one")
+            if np.any(probs[~legal] > 1e-8):
+                raise ValueError("Ataraxos behavior policy assigns mass to an illegal action")
+            chosen = np.asarray(data["actions"][:-1])
+            if (
+                chosen.shape != (len(states) - 1,)
+                or not np.issubdtype(chosen.dtype, np.integer)
+                or np.any(chosen < 0)
+                or np.any(chosen >= num_actions)
+            ):
+                raise ValueError("Ataraxos replay actions are invalid")
+            if not legal[np.arange(len(chosen)), chosen].all():
+                raise ValueError("Ataraxos replay contains an illegal recorded action")
+            nested_obs[atx_keys.BEHAVIOR_LOG_PROBS] = logp.tolist() + [
                 [0.0] * num_actions
             ]
             nested_obs[atx_keys.BEHAVIOR_VALUE] = [
-                [float(v)] for v in behavior_values
+                [float(v)] for v in values
             ] + [[0.0]]
             nested_obs[atx_keys.BEHAVIOR_VALID] = [[True]] * (len(states) - 1) + [[False]]
-            nested_obs[atx_keys.BEHAVIOR_LEGAL] = list(behavior_legal) + [
+            nested_obs[atx_keys.BEHAVIOR_LEGAL] = legal.tolist() + [
                 [False] * num_actions
             ]
 

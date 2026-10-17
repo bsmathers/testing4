@@ -119,13 +119,23 @@ class AtaraxosAgent(MultiTaskAgent):
         # an unbiased baseline and is learned immediately from game outcomes.
         state_dict = dict(state_dict)
         current = self.state_dict()
-        for name in (
+        ataraxos_names = {
             "ataraxos_value.weight",
             "ataraxos_value.bias",
             "_ataraxos_step",
             "_ataraxos_online_mass",
-        ):
-            state_dict.setdefault(name, current[name])
+        }
+        present = ataraxos_names.intersection(state_dict)
+        if present and present != ataraxos_names:
+            raise RuntimeError(
+                "Checkpoint has incomplete Ataraxos state: "
+                + ", ".join(sorted(ataraxos_names - present))
+            )
+        # Complete absence is the one supported legacy case: the immutable
+        # Epoch475 bootstrap predates the entire Ataraxos extension.
+        if not present:
+            for name in ataraxos_names:
+                state_dict[name] = current[name]
         return super().load_state_dict(state_dict, strict=strict, **kwargs)
 
     @staticmethod

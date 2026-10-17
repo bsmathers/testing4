@@ -129,12 +129,41 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
                 v = np.asarray(payload["behavior_values"], dtype=np.float32)
                 states = payload["states"]
                 actions = payload["actions"]
+                logp = np.asarray(
+                    payload["behavior_log_probs"], dtype=np.float32
+                )
+                legal = np.asarray(
+                    payload["behavior_legal_masks"], dtype=bool
+                )
                 if v.ndim != 1 or v.size == 0:
                     raise ValueError("behavior_values must be a non-empty vector")
                 if not np.isfinite(v).all():
                     raise ValueError("behavior_values contain non-finite entries")
+                if np.any(np.abs(v) > 1.0001):
+                    raise ValueError("behavior_values fall outside [-1, 1]")
                 if len(states) != v.size + 1 or len(actions) != len(states):
                     raise ValueError("behavior metadata is not trajectory-aligned")
+                if logp.ndim != 2 or logp.shape[0] != v.size:
+                    raise ValueError("behavior_log_probs are not trajectory-aligned")
+                if legal.shape != logp.shape:
+                    raise ValueError("behavior_legal_masks have the wrong shape")
+                if not np.isfinite(logp).all():
+                    raise ValueError("behavior_log_probs contain non-finite entries")
+                probs = np.exp(logp)
+                if not np.allclose(probs.sum(-1), 1.0, atol=2e-3, rtol=0.0):
+                    raise ValueError("behavior probabilities do not sum to one")
+                if np.any(probs[~legal] > 1e-8):
+                    raise ValueError("behavior policy assigns mass to an illegal action")
+                chosen = np.asarray(actions[:-1])
+                if (
+                    chosen.ndim != 1
+                    or not np.issubdtype(chosen.dtype, np.integer)
+                    or np.any(chosen < 0)
+                    or np.any(chosen >= logp.shape[1])
+                ):
+                    raise ValueError("recorded online actions are invalid")
+                if not legal[np.arange(v.size), chosen].all():
+                    raise ValueError("recorded online action is illegal")
                 state_values = np.concatenate([v, np.zeros(1, dtype=np.float32)])
                 final = states[-1]
                 outcome = 1.0 if final.get("battle_won") else (-1.0 if final.get("battle_lost") else 0.0)
