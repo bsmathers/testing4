@@ -32,6 +32,9 @@ It is a one-shot remote training run, not a short local experiment.
   checkpoints, validation, collection, and league play use the averaged model.
 - Apply a weak L2-SP anchor to the Epoch475 encoder and actor, decaying to zero
   over 100,000 updates.
+- Retain every 50th numbered policy/full-state checkpoint and the ten most
+  recent checkpoints of each type. The rolling latest policy and immutable
+  Epoch475 anchor are retained separately.
 
 The online replay schema stores the exact post-mask behavior log probabilities,
 legal-action mask, and behavior-time scalar value for every action. A persistent

@@ -69,7 +69,7 @@ disk_free_gib="$(df -Pk /workspace | awk 'NR==2 {print int($4 / 1024 / 1024)}')"
 log "Host: ${cpu_count} logical CPUs; ${ram_mib} MiB RAM; ${disk_free_gib} GiB free in /workspace"
 (( cpu_count >= 16 )) || warn "Fewer than 16 CPU cores may bottleneck the 96-lane collector"
 (( ram_mib >= 60000 )) || warn "Less than 64 GiB RAM may constrain replay loading and compilation"
-(( disk_free_gib >= 250 )) || warn "Less than 250 GiB free; checkpoints are retained every learner epoch"
+(( disk_free_gib >= 250 )) || warn "Less than 250 GiB free; verify replay and retained-checkpoint growth during training"
 
 if [[ ! -e "${REPO_DIR}" ]]; then
   log "Cloning ${REPO_URL} at ${REPO_REF}"

@@ -207,6 +207,87 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
     _SF_BETA = 0.8
     _SF_R = 99.0
     _SF_INNER_MOMENTUM = 0.9
+    _CHECKPOINT_MILESTONE_INTERVAL = 50
+    _CHECKPOINT_RECENT_COUNT = 10
+
+    @classmethod
+    def _prune_numbered_checkpoints(
+        cls,
+        root: str,
+        *,
+        prefix: str,
+        suffix: str,
+        directories: bool,
+    ) -> int:
+        """Keep every 50th checkpoint and the ten most recent checkpoints."""
+        try:
+            names = os.listdir(root)
+        except FileNotFoundError:
+            return 0
+
+        entries = []
+        for name in names:
+            if not name.startswith(prefix) or not name.endswith(suffix):
+                continue
+            epoch_text = name[len(prefix) : len(name) - len(suffix) if suffix else None]
+            if not epoch_text.isdigit():
+                continue
+            path = os.path.join(root, name)
+            if directories != os.path.isdir(path):
+                continue
+            entries.append((int(epoch_text), path))
+
+        recent = {
+            epoch
+            for epoch, _ in sorted(entries, key=lambda item: item[0])[
+                -cls._CHECKPOINT_RECENT_COUNT :
+            ]
+        }
+        keep = recent | {
+            epoch
+            for epoch, _ in entries
+            if epoch % cls._CHECKPOINT_MILESTONE_INTERVAL == 0
+        }
+        removed = 0
+        for epoch, path in entries:
+            if epoch in keep:
+                continue
+            try:
+                if directories:
+                    shutil.rmtree(path)
+                else:
+                    os.remove(path)
+                removed += 1
+            except OSError as exc:
+                # Retention is housekeeping, not a reason to lose a long run.
+                # Surface the failure and retry it after the next checkpoint.
+                print(
+                    f"  [Ataraxos] warning: could not remove old checkpoint "
+                    f"{path}: {exc}",
+                    flush=True,
+                )
+        return removed
+
+    def _prune_checkpoints(self) -> None:
+        policy_removed = self._prune_numbered_checkpoints(
+            os.path.join(self.ckpt_dir, "policy_weights"),
+            prefix="policy_epoch_",
+            suffix=".pt",
+            directories=False,
+        )
+        state_removed = self._prune_numbered_checkpoints(
+            os.path.join(self.ckpt_dir, "training_states"),
+            prefix=f"{self.run_name}_epoch_",
+            suffix="",
+            directories=True,
+        )
+        if policy_removed or state_removed:
+            print(
+                "  [Ataraxos] checkpoint retention removed "
+                f"{policy_removed} policy and {state_removed} training-state "
+                "checkpoint(s)",
+                flush=True,
+            )
 
     def init_optimizer(self, policy):
         groups = [
@@ -379,6 +460,7 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             if os.path.exists(state_path):
                 shutil.rmtree(state_path)
             os.replace(state_tmp, state_path)
+            self._prune_checkpoints()
         self.accelerator.wait_for_everyone()
 
     def write_latest_policy(self) -> None:
