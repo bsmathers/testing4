@@ -11,6 +11,7 @@ from amago.loading import RLDataset
 
 from metamon.rl import ataraxos_keys as keys
 from metamon.rl import taurosv1b_online as v1b
+from metamon.rl.recent_schedule_free import RecentScheduleFreeAdamW
 
 
 class TaggedDataset(RLDataset):
@@ -147,7 +148,7 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
 
 
 class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
-    """Experiment with exact behavior metadata and conservative grouped LRs."""
+    """Ataraxos with grouped LRs and responsive Schedule-Free averaging."""
 
     _GROUP_LRS = {
         "backbone": 1.0e-5,
@@ -157,6 +158,9 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
     _LR_HOLD_STEPS = 100_000
     _LR_DECAY_STEPS = 400_000
     _LR_FLOOR_SCALE = 0.1
+    _SF_BETA = 0.8
+    _SF_R = 99.0
+    _SF_INNER_MOMENTUM = 0.9
 
     def init_optimizer(self, policy):
         groups = [
@@ -185,7 +189,17 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         trainable = list(policy.trainable_params)
         if len(grouped) != len(grouped_ids) or grouped_ids != {id(p) for p in trainable}:
             raise RuntimeError("Ataraxos optimizer groups do not match trainable parameters")
-        return torch.optim.AdamW(groups, weight_decay=self.l2_coeff)
+        return RecentScheduleFreeAdamW(
+            groups,
+            lr=self.learning_rate,
+            beta=self._SF_BETA,
+            inner_momentum=self._SF_INNER_MOMENTUM,
+            r=self._SF_R,
+            # Averaging is layered on the existing LR schedule rather than
+            # changing its weights when that schedule begins to decay.
+            weight_lr_power=0.0,
+            weight_decay=self.l2_coeff,
+        )
 
     def _lr_scale(self, step: int) -> float:
         if step <= self._LR_HOLD_STEPS:
@@ -198,6 +212,7 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
     def interact(self, envs, timesteps, hidden_state=None, render=False, save_on_done=False, episodes=None, sample=True):
         # This is the stock AMAGO loop with one deliberate addition before
         # env.step: attach the exact behavior distribution/value to the battle.
+        self.optimizer.eval()
         policy = self.policy
         policy.eval()
         amago.utils.call_async_env(envs, "reset_stats")
@@ -251,6 +266,7 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         return hidden_state, (return_history, special_history)
 
     def train_step(self, batch, log_step: bool):
+        self.optimizer.train()
         step = max(int(self.grad_update_counter), 0)
         scale = self._lr_scale(step)
         for group in self.optimizer.param_groups:
@@ -268,7 +284,30 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                 for group in self.optimizer.param_groups
                 if group["ataraxos_name"] == "actor"
             )
+            metrics["ScheduleFree/Beta"] = self._SF_BETA
+            metrics["ScheduleFree/R"] = self._SF_R
+            metrics["ScheduleFree/Constant Drift Retention"] = (
+                self._SF_R + 1.0
+            ) / (self._SF_R + 2.0)
+            metrics["ScheduleFree/Query Drift Retention"] = 1.0 - (
+                self._SF_BETA / (self._SF_R + 2.0)
+            )
+            for group in self.optimizer.param_groups:
+                metrics[
+                    f"ScheduleFree/Average Coef/{group['ataraxos_name']}"
+                ] = group["sf_ckp1"]
         return metrics
+
+    def save_checkpoint(self) -> None:
+        # Raw policy checkpoints and full-state model weights must contain x;
+        # optimizer state retains z and reconstructs y when training resumes.
+        self.optimizer.eval()
+        return super().save_checkpoint()
+
+    def write_latest_policy(self) -> None:
+        # Collectors and league opponents always consume the averaged policy.
+        self.optimizer.eval()
+        return super().write_latest_policy()
 
 
 def main():

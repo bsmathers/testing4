@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [[ -n "${PERSIST_ROOT:-}" ]]; then
   marker="${PERSIST_ROOT}/ATARAXOS_EXPERIMENT"
-  expected_marker='Epoch475 Ataraxos experiment; replay schema v2; shaped RL2 history'
+  expected_marker='Epoch475 Ataraxos experiment; replay schema v2; schedule-free r99 beta0.8'
   if [[ -d "${PERSIST_ROOT}/online_buffer/gen1ou" ]] \
       && find "${PERSIST_ROOT}/online_buffer/gen1ou" -type f \
         \( -name '*.json' -o -name '*.json.lz4' \) -print -quit | grep -q . \
@@ -29,9 +29,9 @@ fi
 export TRAIN_VARIANT=epoch475_ataraxos
 export RUNNER_MODULE=metamon.rl.ataraxos_online
 export RUN_NAME="${RUN_NAME:-epoch475_ataraxos}"
-export WANDB_RUN_ID="${WANDB_RUN_ID:-epoch475-ataraxos-v1}"
-export WANDB_NAME="${WANDB_NAME:-epoch475-ataraxos}"
-export WANDB_TAGS="${WANDB_TAGS:-epoch475,ataraxos,gen1ou,807-teams,league}"
+export WANDB_RUN_ID="${WANDB_RUN_ID:-epoch475-ataraxos-sf-v1}"
+export WANDB_NAME="${WANDB_NAME:-epoch475-ataraxos-schedule-free}"
+export WANDB_TAGS="${WANDB_TAGS:-epoch475,ataraxos,schedule-free,gen1ou,807-teams,league}"
 
 export ONLINE_WEIGHT=0.50
 export GRAD_ACCUM=1

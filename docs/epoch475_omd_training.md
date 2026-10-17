@@ -24,6 +24,16 @@ The OMD experiment has been retired. The compatibility launcher
 - Use separate AdamW rates for the pretrained backbone (1e-5), actor (2e-5),
   and fresh scalar value head (1e-4). Hold them through the 100-epoch online
   ramp, then linearly decay over 400 epochs to 10% floors.
+- Apply recent-weighted Schedule-Free averaging on top of those unchanged
+  rates. The fast iterate retains AdamW momentum 0.9; the x/y interpolation is
+  beta=0.8 and polynomial averaging uses r=99. Under constant-gradient drift,
+  the deployed average retains 100/101 (99.01%) of the fast iterate's speed,
+  while the gradient-query point retains 99.21%, so averaging does not act as
+  a materially smaller learning rate. Its mean lag is t/101 updates: roughly
+  one learner epoch at update 100k and five at update 500k. Validation,
+  collectors, and raw checkpoints always use the averaged x iterate.
+  The high r is an intentional non-stationary-RL modification, not the paper's
+  long-horizon r=0/r=1 default.
 - Apply a weak L2-SP anchor to Epoch475's encoder/actor parameters and linearly
   remove it over the first 100,000 updates. The uniform-policy magnet decays by
   cumulative online trajectory mass rather than offline learner updates.
@@ -60,6 +70,6 @@ launches `scripts/train_epoch475_ataraxos.sh`. It runs in the foreground and
 alternates collection with learning. Re-running the same command resumes from
 the latest complete epoch-boundary checkpoint.
 
-Use a fresh `PERSIST_ROOT` when moving from the abandoned OMD run or the earlier
-binary-reward Ataraxos draft. Those replays either lack behavior-policy metadata
-or were collected with an incompatible RL2 reward history.
+Use a fresh `PERSIST_ROOT` when moving from the abandoned OMD run, an earlier
+binary-reward Ataraxos draft, or the pre-Schedule-Free optimizer. Those runs
+either contain incompatible replay history or optimizer/checkpoint state.
