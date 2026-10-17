@@ -438,7 +438,15 @@ def build_dataset(
             )
             name = f"Self-Play ({entry.identifier})"
             datasets.append(
-                MetamonAMAGODataset(dset_name=name, parsed_replay_dset=sp_dset)
+                MetamonAMAGODataset(
+                    dset_name=name,
+                    parsed_replay_dset=sp_dset,
+                    # Exploratory policies are useful value data, but their
+                    # deliberately noisy actions are weak imitation targets.
+                    offline_actor_weight=(
+                        0.25 if entry.identifier == "pac-exploratory" else 1.0
+                    ),
+                )
             )
             final_weights.append(entry.weight)
             is_new_flags.append(entry.is_new)

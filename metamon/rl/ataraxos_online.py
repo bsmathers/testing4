@@ -147,7 +147,53 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
 
 
 class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
-    """Experiment that records exact behavior metadata and uses power LR."""
+    """Experiment with exact behavior metadata and conservative grouped LRs."""
+
+    _GROUP_LRS = {
+        "backbone": 1.0e-5,
+        "actor": 2.0e-5,
+        "value": 1.0e-4,
+    }
+    _LR_HOLD_STEPS = 100_000
+    _LR_DECAY_STEPS = 400_000
+    _LR_FLOOR_SCALE = 0.1
+
+    def init_optimizer(self, policy):
+        groups = [
+            {
+                "params": list(policy.tstep_encoder.parameters())
+                + list(policy.traj_encoder.parameters()),
+                "lr": self._GROUP_LRS["backbone"],
+                "ataraxos_name": "backbone",
+                "ataraxos_base_lr": self._GROUP_LRS["backbone"],
+            },
+            {
+                "params": list(policy.actor.parameters()),
+                "lr": self._GROUP_LRS["actor"],
+                "ataraxos_name": "actor",
+                "ataraxos_base_lr": self._GROUP_LRS["actor"],
+            },
+            {
+                "params": list(policy.ataraxos_value.parameters()),
+                "lr": self._GROUP_LRS["value"],
+                "ataraxos_name": "value",
+                "ataraxos_base_lr": self._GROUP_LRS["value"],
+            },
+        ]
+        grouped = [p for group in groups for p in group["params"]]
+        grouped_ids = {id(p) for p in grouped}
+        trainable = list(policy.trainable_params)
+        if len(grouped) != len(grouped_ids) or grouped_ids != {id(p) for p in trainable}:
+            raise RuntimeError("Ataraxos optimizer groups do not match trainable parameters")
+        return torch.optim.AdamW(groups, weight_decay=self.l2_coeff)
+
+    def _lr_scale(self, step: int) -> float:
+        if step <= self._LR_HOLD_STEPS:
+            return 1.0
+        progress = min(
+            (step - self._LR_HOLD_STEPS) / float(self._LR_DECAY_STEPS), 1.0
+        )
+        return 1.0 - progress * (1.0 - self._LR_FLOOR_SCALE)
 
     def interact(self, envs, timesteps, hidden_state=None, render=False, save_on_done=False, episodes=None, sample=True):
         # This is the stock AMAGO loop with one deliberate addition before
@@ -206,14 +252,22 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
 
     def train_step(self, batch, log_step: bool):
         step = max(int(self.grad_update_counter), 0)
-        lr = min(max(0.5 / ((step + 1) ** 1.1), 5e-6), 1e-4)
+        scale = self._lr_scale(step)
         for group in self.optimizer.param_groups:
-            group["lr"] = lr
+            group["lr"] = group["ataraxos_base_lr"] * scale
         metrics = super().train_step(batch, log_step)
         if log_step:
-            # The stock logger reads the dormant scheduler, while this recipe
-            # intentionally applies its power schedule directly each update.
-            metrics["Learning Rate"] = lr
+            # The stock logger reads the dormant constant scheduler. Record all
+            # three manually managed parameter-group rates explicitly.
+            for group in self.optimizer.param_groups:
+                metrics[
+                    f"Learning Rate/{group['ataraxos_name']}"
+                ] = group["lr"]
+            metrics["Learning Rate"] = next(
+                group["lr"]
+                for group in self.optimizer.param_groups
+                if group["ataraxos_name"] == "actor"
+            )
         return metrics
 
 

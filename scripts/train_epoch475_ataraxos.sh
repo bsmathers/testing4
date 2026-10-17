@@ -8,6 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [[ -n "${PERSIST_ROOT:-}" ]]; then
   marker="${PERSIST_ROOT}/ATARAXOS_EXPERIMENT"
+  expected_marker='Epoch475 Ataraxos experiment; replay schema v2; shaped RL2 history'
   if [[ -d "${PERSIST_ROOT}/online_buffer/gen1ou" ]] \
       && find "${PERSIST_ROOT}/online_buffer/gen1ou" -type f \
         \( -name '*.json' -o -name '*.json.lz4' \) -print -quit | grep -q . \
@@ -16,8 +17,12 @@ if [[ -n "${PERSIST_ROOT:-}" ]]; then
     exit 2
   fi
   mkdir -p "${PERSIST_ROOT}"
+  if [[ -f "${marker}" ]] && [[ "$(<"${marker}")" != "${expected_marker}" ]]; then
+    echo "ERROR: PERSIST_ROOT belongs to an incompatible Ataraxos schema; use a fresh PERSIST_ROOT" >&2
+    exit 2
+  fi
   if [[ ! -f "${marker}" ]]; then
-    printf '%s\n' 'Epoch475 Ataraxos experiment; replay schema v1' >"${marker}"
+    printf '%s\n' "${expected_marker}" >"${marker}"
   fi
 fi
 

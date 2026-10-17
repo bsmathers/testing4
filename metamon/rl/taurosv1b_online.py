@@ -514,6 +514,7 @@ def main() -> None:
             if action.dest in cfg:
                 action.required = False
     args = parser.parse_args()
+    os.environ["METAMON_RUN_MODE"] = args.mode
 
     # E/F rely on the periodic TaurosV0 monitor as a training health check.
     # Install it explicitly here rather than relying only on the gin import side

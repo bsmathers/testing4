@@ -572,9 +572,15 @@ class MetamonDataset(Dataset):
                 [row[0] for row in nested_obs[atx_keys.BEHAVIOR_VALUE]],
                 dtype=np.float32,
             )
-            scaled_rewards = rewards / 100.0
+            # The policy's RL2 stream still receives the configured shaped
+            # rewards (Epoch475 was trained with that history).  Ataraxos PPO
+            # and its fresh scalar value head instead optimize the zero-sum
+            # game outcome, so their traces must not reuse those shaped
+            # rewards.  Only the final transition receives +/-1 (or 0 draw).
+            zero_sum_rewards = np.zeros_like(rewards, dtype=np.float32)
+            zero_sum_rewards[-1] = outcome
             delta = (
-                scaled_rewards
+                zero_sum_rewards
                 + (1.0 - dones.astype(np.float32)) * behavior_v[1:]
                 - behavior_v[:-1]
             )

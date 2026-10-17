@@ -1507,6 +1507,8 @@ class MetamonAMAGODataset(RLDataset):
         refresh_files_every_epoch: Whether to find newly written replay files at the end of each epoch.
             This imitates the behavior of the main AMAGO disk replay buffer. Would be necessary for
             online RL. Defaults to False.
+        offline_actor_weight: Per-trajectory multiplier for offline action
+            imitation. Outcome/value supervision is deliberately unaffected.
     """
 
     def __init__(
@@ -1514,10 +1516,12 @@ class MetamonAMAGODataset(RLDataset):
         parsed_replay_dset: ParsedReplayDataset,
         dset_name: Optional[str] = None,
         refresh_files_every_epoch: bool = False,
+        offline_actor_weight: float = 1.0,
     ):
         super().__init__(dset_name=dset_name)
         self.parsed_replay_dset = parsed_replay_dset
         self.refresh_files_every_epoch = refresh_files_every_epoch
+        self.offline_actor_weight = float(offline_actor_weight)
 
     @property
     def save_new_trajs_to(self):
@@ -1562,6 +1566,13 @@ class MetamonAMAGODataset(RLDataset):
         missing_acts = torch.tensor(action_infos["missing"] + [True]).unsqueeze(-1)
         obs_torch["missing_action_mask"] = missing_acts
         obs_torch["illegal_actions"] = illegal_actions
+        from metamon.rl import ataraxos_keys as atx_keys
+
+        obs_torch[atx_keys.OFFLINE_ACTOR_WEIGHT] = torch.full(
+            (len(action_infos["chosen"]) + 1, 1),
+            self.offline_actor_weight,
+            dtype=torch.float32,
+        )
         if "_ataraxos_behavior_legal" in obs_torch:
             obs_torch["illegal_actions"] = ~obs_torch[
                 "_ataraxos_behavior_legal"

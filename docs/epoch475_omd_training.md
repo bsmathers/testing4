@@ -13,15 +13,29 @@ The OMD experiment has been retired. The compatibility launcher
   low-discrepancy sampling avoids noisy source counts early in the ramp.
 - Online loss: clipped PPO, reverse KL to the exact behavior policy, reverse KL
   to uniform over legal actions, and filtered scalar value loss.
+- Preserve Epoch475's aggressive-shaped reward history as an RL2 input while
+  computing PPO advantages and scalar-value targets from terminal zero-sum
+  outcomes only.
 - Retain the top quartile by absolute GAE, with a 0.01 floor. The threshold is
   recomputed from the complete FIFO before learning.
 - Offline loss: observed-action cross entropy plus outcome-value regression.
+  Pac-exploratory action imitation is weighted by 0.25 while its value target
+  keeps full weight.
+- Use separate AdamW rates for the pretrained backbone (1e-5), actor (2e-5),
+  and fresh scalar value head (1e-4). Hold them through the 100-epoch online
+  ramp, then linearly decay over 400 epochs to 10% floors.
+- Apply a weak L2-SP anchor to Epoch475's encoder/actor parameters and linearly
+  remove it over the first 100,000 updates. The uniform-policy magnet decays by
+  cumulative online trajectory mass rather than offline learner updates.
 - The trainee collects at temperature 1.0. Opponent temperatures remain part of
   the opponent population.
 
 Online replay files contain full post-mask behavior log probabilities, the exact
 legal mask, and the behavior-time scalar value for every action. The launcher
 refuses an old FIFO that lacks these fields.
+
+Built-in validation samples TaurosV0, Kakuna, and the frozen Epoch475 baseline
+across both the strong-human and 807-team sets.
 
 Within the offline pool, sampling is 40% pac-tauros, 30% pac-exploratory, 20%
 curated strong-model trajectories, and 10% human replays. At the 50% online
@@ -46,5 +60,6 @@ launches `scripts/train_epoch475_ataraxos.sh`. It runs in the foreground and
 alternates collection with learning. Re-running the same command resumes from
 the latest complete epoch-boundary checkpoint.
 
-Use a fresh `PERSIST_ROOT` when moving from the abandoned OMD run because those
-replays do not contain behavior-policy metadata.
+Use a fresh `PERSIST_ROOT` when moving from the abandoned OMD run or the earlier
+binary-reward Ataraxos draft. Those replays either lack behavior-policy metadata
+or were collected with an incompatible RL2 reward history.

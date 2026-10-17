@@ -8,6 +8,7 @@ the Epoch475 checkpoint.
 from __future__ import annotations
 
 import itertools
+import os
 import gin
 import torch
 import torch.nn as nn
@@ -50,6 +51,8 @@ class AtaraxosAgent(MultiTaskAgent):
         magnet_decay: float = 0.3,
         magnet_floor: float = 0.001,
         magnet_ceil: float = 0.1,
+        l2sp_coef: float = 1e-4,
+        l2sp_decay_steps: int = 100_000,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -72,7 +75,13 @@ class AtaraxosAgent(MultiTaskAgent):
         self.magnet_decay = float(magnet_decay)
         self.magnet_floor = float(magnet_floor)
         self.magnet_ceil = float(magnet_ceil)
+        self.l2sp_coef = float(l2sp_coef)
+        self.l2sp_decay_steps = int(l2sp_decay_steps)
+        self._l2sp_anchor: dict[str, torch.Tensor] | None = None
         self.register_buffer("_ataraxos_step", torch.zeros((), dtype=torch.long))
+        self.register_buffer(
+            "_ataraxos_online_mass", torch.zeros((), dtype=torch.float32)
+        )
 
     @property
     def trainable_params(self):
@@ -89,9 +98,62 @@ class AtaraxosAgent(MultiTaskAgent):
         # an unbiased baseline and is learned immediately from game outcomes.
         state_dict = dict(state_dict)
         current = self.state_dict()
-        for name in ("ataraxos_value.weight", "ataraxos_value.bias", "_ataraxos_step"):
+        for name in (
+            "ataraxos_value.weight",
+            "ataraxos_value.bias",
+            "_ataraxos_step",
+            "_ataraxos_online_mass",
+        ):
             state_dict.setdefault(name, current[name])
         return super().load_state_dict(state_dict, strict=strict, **kwargs)
+
+    @staticmethod
+    def _is_l2sp_parameter(name: str) -> bool:
+        return name.startswith(("tstep_encoder.", "traj_encoder.", "actor."))
+
+    def _capture_l2sp_anchor(self, state_dict=None) -> None:
+        """Keep the immutable Epoch475 policy anchor out of saved checkpoints."""
+        anchor = {}
+        missing = []
+        for name, parameter in self.named_parameters():
+            if not self._is_l2sp_parameter(name):
+                continue
+            source = parameter.detach() if state_dict is None else state_dict.get(name)
+            if source is None:
+                missing.append(name)
+                continue
+            anchor[name] = source.detach().to(
+                device=parameter.device, dtype=parameter.dtype
+            ).clone()
+        if missing:
+            raise RuntimeError(
+                "Epoch475 L2-SP anchor is missing policy parameters: "
+                + ", ".join(missing[:5])
+            )
+        self._l2sp_anchor = anchor
+
+    def on_checkpoint_loaded(self, is_resume: bool = False):
+        # Collectors never evaluate the training loss and should not spend GPU
+        # memory on a second frozen copy of the policy parameters.
+        if os.environ.get("METAMON_RUN_MODE") != "learn" or self.l2sp_coef <= 0.0:
+            self._l2sp_anchor = None
+            return
+        if not is_resume:
+            self._capture_l2sp_anchor()
+            return
+        anchor_path = os.environ.get("ATARAXOS_L2SP_ANCHOR_PATH")
+        if not anchor_path or not os.path.isfile(anchor_path):
+            raise RuntimeError(
+                "Full-state Ataraxos resume requires ATARAXOS_L2SP_ANCHOR_PATH"
+            )
+        try:
+            state = torch.load(anchor_path, map_location="cpu", weights_only=True)
+        except TypeError:
+            # ``weights_only`` predates some of the PyTorch builds used by the
+            # remote images.  This is a trusted checkpoint created locally by
+            # the setup script, so the legacy loader is an acceptable fallback.
+            state = torch.load(anchor_path, map_location="cpu")
+        self._capture_l2sp_anchor(state)
 
     def get_actions_with_metadata(self, obs, rl2s, time_idxs, hidden_state=None, sample=True):
         """Sample actions and return the exact behavior distribution/value."""
@@ -122,6 +184,7 @@ class AtaraxosAgent(MultiTaskAgent):
             keys.SOURCE, keys.BEHAVIOR_LOG_PROBS, keys.BEHAVIOR_VALUE,
             keys.BEHAVIOR_VALID, keys.BEHAVIOR_LEGAL, keys.ADVANTAGE,
             keys.VALUE_TARGET, keys.OUTCOME, keys.ADV_THRESHOLD,
+            keys.OFFLINE_ACTOR_WEIGHT,
         )
         missing = [k for k in required if k not in batch.obs]
         if missing:
@@ -200,14 +263,20 @@ class AtaraxosAgent(MultiTaskAgent):
             ~batch.obs["missing_action_mask"][:, :T].bool()
         )
         offline_lp = cur_lp
-        offline_ce = -_masked_mean(offline_lp, offline_actions)
+        offline_actor_weight = batch.obs[keys.OFFLINE_ACTOR_WEIGHT][
+            :, :T
+        ].float()
+        offline_ce = -_masked_mean(
+            offline_actor_weight * offline_lp, offline_actions
+        )
         outcome = batch.obs[keys.OUTCOME][:, :T].float()
         offline_value = _masked_mean(
             (values[:, :T] - outcome).square(), offline_states
         )
 
         step = int(self._ataraxos_step.item())
-        temperature = self.magnet_coef / ((step + 1) ** self.magnet_decay)
+        online_mass = float(self._ataraxos_online_mass.item())
+        temperature = self.magnet_coef / ((online_mass + 1.0) ** self.magnet_decay)
         temperature = min(max(temperature, self.magnet_floor), self.magnet_ceil)
         online_loss = (
             ppo + self.behavior_kl_coef * behavior_kl
@@ -225,7 +294,23 @@ class AtaraxosAgent(MultiTaskAgent):
             batch_online_fraction * online_loss
             + (1.0 - batch_online_fraction) * offline_loss
         )
+        l2sp_scale = (
+            max(1.0 - step / float(self.l2sp_decay_steps), 0.0)
+            if self.l2sp_decay_steps > 0
+            else 0.0
+        )
+        l2sp_penalty = torch.zeros((), device=loss.device)
+        if l2sp_scale > 0.0 and self.l2sp_coef > 0.0:
+            if self._l2sp_anchor is None:
+                raise RuntimeError("Ataraxos learner has no Epoch475 L2-SP anchor")
+            for name, parameter in self.named_parameters():
+                if self._is_l2sp_parameter(name):
+                    l2sp_penalty = l2sp_penalty + 0.5 * (
+                        parameter - self._l2sp_anchor[name]
+                    ).square().sum()
+            loss = loss + self.l2sp_coef * l2sp_scale * l2sp_penalty
         self._ataraxos_step.add_(1)
+        self._ataraxos_online_mass.add_(batch_online_fraction.detach())
 
         if log_step:
             self.update_info = {
@@ -237,7 +322,13 @@ class AtaraxosAgent(MultiTaskAgent):
                 "Ataraxos/Value Loss": online_value.detach(),
                 "Ataraxos/Offline CE": offline_ce.detach(),
                 "Ataraxos/Magnet Coef": float(temperature),
+                "Ataraxos/Online Mass": float(online_mass),
                 "Ataraxos/Batch Online Fraction": batch_online_fraction.detach(),
+                "Ataraxos/Offline Actor Weight": _masked_mean(
+                    offline_actor_weight, offline_states
+                ).detach(),
+                "Ataraxos/L2SP Penalty": l2sp_penalty.detach(),
+                "Ataraxos/L2SP Coef": float(self.l2sp_coef * l2sp_scale),
                 "Ataraxos/Clip Fraction": _masked_mean(((ratio - 1).abs() > self.clip_range).float(), selected).detach(),
                 "Ataraxos/Selected Fraction": selected.float().sum() / online.float().sum().clamp(min=1),
                 "Ataraxos/Ratio Mean": _masked_mean(ratio, selected).detach(),

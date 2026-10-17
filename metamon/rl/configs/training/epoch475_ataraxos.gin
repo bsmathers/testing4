@@ -28,3 +28,5 @@ ataraxos_agent.AtaraxosAgent.magnet_coef = 0.05
 ataraxos_agent.AtaraxosAgent.magnet_decay = 0.3
 ataraxos_agent.AtaraxosAgent.magnet_floor = 0.001
 ataraxos_agent.AtaraxosAgent.magnet_ceil = 0.1
+ataraxos_agent.AtaraxosAgent.l2sp_coef = 1e-4
+ataraxos_agent.AtaraxosAgent.l2sp_decay_steps = 100000

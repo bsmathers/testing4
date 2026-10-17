@@ -59,6 +59,7 @@ RAW_WEIGHTS="${BOOTSTRAP_DIR}/policy_epoch_475.pt"
 ONLINE_WEIGHTS="${BOOTSTRAP_DIR}/policy_epoch_475_online.pt"
 RUN_CONFIG="${CONFIG_DIR}/smallg1onlinev1a.yaml"
 POOL_CONFIG="${CONFIG_DIR}/hl_gen1ou_smallg1onlinev1a.yaml"
+VAL_POOL_CONFIG="metamon/rl/configs/opponent_pools/taurosv1a_val.yaml"
 EXPERT_DIR="${CACHE_DIR}/teams/smallg1onlinev1a_expert/gen1ou"
 
 [[ -f "${REPO_DIR}/pyproject.toml" ]] || die "REPO_DIR is not testing4: ${REPO_DIR}"
@@ -71,6 +72,9 @@ export METAMON_BATTLE_HOST="${REPO_DIR}/metamon/env/vectorized/battle_host_engin
 export METAMON_PKMN_ENGINE="${REPO_DIR}/metamon/env/vectorized/pkmn-showdown.node"
 if [[ "${TRAIN_VARIANT}" == "epoch475_ataraxos" ]]; then
   export TAUROSV1B_RUN_NAME="${RUN_NAME}"
+  # L2-SP anchors are reconstructed from this immutable policy on learner
+  # resume rather than duplicated into every checkpoint.
+  export ATARAXOS_L2SP_ANCHOR_PATH="${ONLINE_WEIGHTS}"
 else
   export TAUROSV1B_RUN_NAME="epoch475_frozen"
 fi
@@ -312,6 +316,26 @@ agents:
       fill_checkpoints: [475]
       max_fill_missing: 5
 YAML
+  VAL_POOL_CONFIG="${CONFIG_DIR}/epoch475_ataraxos_val.yaml"
+  cat >"${VAL_POOL_CONFIG}" <<'YAML'
+# Frozen validation anchors, sampled uniformly at temperature 1.0.
+defaults:
+  team_set: [hl_05_26, smallg1onlinev1a_expert]
+  battle_backend: metamon
+  checkpoints: [null]
+  temperatures: [1.0]
+  num_agents: 1
+agents:
+  TaurosV0:
+    model_name: TaurosV0
+    checkpoints: [62]
+  Kakuna:
+    model_name: Kakuna
+    checkpoints: [34]
+  Epoch475:
+    model_name: Epoch475Frozen
+    checkpoints: [475]
+YAML
 else
 cat >"${POOL_CONFIG}" <<'YAML'
 # SmallG1OnlineV1.5 roster, with SmallG1OnlineV0 replaced by epoch 475.
@@ -354,6 +378,7 @@ fi
 
 DATASET_CONFIG_VALUE="online_selfplay.yaml"
 TRAIN_TEAM_SET_VALUE="smallg1onlinev1a_expert"
+VAL_TEAM_SET_VALUE="smallg1onlinev1a_expert"
 ONLINE_WEIGHT_VALUE="0.4"
 INITIAL_ONLINE_WEIGHT_VALUE="0.0"
 ONLINE_ANNEAL_END_VALUE=20
@@ -387,6 +412,7 @@ team_set:
 YAML
   DATASET_CONFIG_VALUE="${OMD_DATASET_CONFIG}"
   TRAIN_TEAM_SET_VALUE="${OMD_TEAM_CONFIG}"
+  VAL_TEAM_SET_VALUE="${OMD_TEAM_CONFIG}"
   ONLINE_WEIGHT_VALUE="${ONLINE_WEIGHT:-0.50}"
   INITIAL_ONLINE_WEIGHT_VALUE=0.0
   ONLINE_ANNEAL_END_VALUE=100
@@ -407,8 +433,8 @@ dataset_config: ${DATASET_CONFIG_VALUE}
 train_gin_config: $([[ "${TRAIN_VARIANT}" == "epoch475_ataraxos" ]] && echo epoch475_ataraxos.gin || echo grouped_v2_large_isfilter.gin)
 train_pool: ${POOL_CONFIG}
 train_team_set: ${TRAIN_TEAM_SET_VALUE}
-val_pool: metamon/rl/configs/opponent_pools/taurosv1a_val.yaml
-val_team_set: smallg1onlinev1a_expert
+val_pool: ${VAL_POOL_CONFIG}
+val_team_set: ${VAL_TEAM_SET_VALUE}
 dset_max_size: ${ONLINE_FIFO_SIZE}
 dset_min_size: $([[ "${TRAIN_VARIANT}" == "epoch475_ataraxos" ]] && echo 4999 || echo 5000)
 initial_online_weight: ${INITIAL_ONLINE_WEIGHT_VALUE}
@@ -430,7 +456,7 @@ n_workers: ${COLLECTOR_WORKERS}
 train_timesteps_per_epoch: 500
 temp_low: 1.0
 temp_high: $([[ "${TRAIN_VARIANT}" == "epoch475_ataraxos" ]] && echo 1.0 || echo 2.0)
-reward_function: $([[ "${TRAIN_VARIANT}" == "epoch475_ataraxos" ]] && echo BinaryReward || echo AggressiveShapedReward)
+reward_function: AggressiveShapedReward
 val_timesteps: 1000
 val_interval: 10
 dloader_workers: ${DLOADER_WORKERS}
