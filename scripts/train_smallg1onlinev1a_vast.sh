@@ -367,13 +367,16 @@ if [[ "${TRAIN_VARIANT}" == "epoch475_ataraxos" ]]; then
   OMD_DATASET_CONFIG="${CONFIG_DIR}/epoch475_ataraxos_offline.yaml"
   OMD_TEAM_CONFIG="${CONFIG_DIR}/epoch475_ataraxos_teams.yaml"
   cat >"${OMD_DATASET_CONFIG}" <<YAML
-# Within the offline half: 40% pac-tauros, 30% human, 30% curated strong bots.
-replay_weight: 0.30
+# Within the offline pool: 40% pac-tauros, 30% pac-exploratory,
+# 20% curated strong bots, and 10% human replays. At the 50% online cap these
+# are respectively 20%, 15%, 10%, and 5% of the complete training mixture.
+replay_weight: 0.10
 self_play:
   pac-tauros: 0.40
+  pac-exploratory: 0.30
 custom_replays:
   - dir: ${GOOD_REPLAYS_DIR}
-    weight: 0.30
+    weight: 0.20
 formats: [gen1ou]
 YAML
   cat >"${OMD_TEAM_CONFIG}" <<'YAML'
@@ -385,11 +388,11 @@ YAML
   DATASET_CONFIG_VALUE="${OMD_DATASET_CONFIG}"
   TRAIN_TEAM_SET_VALUE="${OMD_TEAM_CONFIG}"
   ONLINE_WEIGHT_VALUE="${ONLINE_WEIGHT:-0.50}"
-  INITIAL_ONLINE_WEIGHT_VALUE="${ONLINE_WEIGHT_VALUE}"
-  ONLINE_ANNEAL_END_VALUE=0
+  INITIAL_ONLINE_WEIGHT_VALUE=0.0
+  ONLINE_ANNEAL_END_VALUE=100
   [[ "${GRAD_ACCUM}" == "1" ]] || die "epoch475_ataraxos requires GRAD_ACCUM=1"
   [[ "${BATCH_SIZE_PER_GPU}" == "14" ]] || die "epoch475_ataraxos requires batch size 14"
-  [[ "${DLOADER_WORKERS}" == "0" ]] || die "epoch475_ataraxos requires DLOADER_WORKERS=0 for exact 7/7 batches"
+  [[ "${DLOADER_WORKERS}" == "0" ]] || die "epoch475_ataraxos requires DLOADER_WORKERS=0 for deterministic ramp sampling"
 fi
 if [[ "${ALTERNATE_COLLECT_LEARN}" == "1" ]]; then
   CKPT_INTERVAL_VALUE=1
@@ -447,7 +450,7 @@ from metamon.data.download import (
 
 download_usage_stats(gen=1, version="v5", force_download=False)
 download_parsed_replays("gen1ou", version="v6", force_download=False)
-subsets = ("pac-tauros",) if os.environ.get("TRAIN_VARIANT") == "epoch475_ataraxos" else ("pac-base", "pac-exploratory", "pac-tauros")
+subsets = ("pac-tauros", "pac-exploratory") if os.environ.get("TRAIN_VARIANT") == "epoch475_ataraxos" else ("pac-base", "pac-exploratory", "pac-tauros")
 for subset in subsets:
     download_self_play_data(subset, "gen1ou", version="main", force_download=False, extract=False)
 download_teams("gen1ou", "hl_05_26", version="v5", force_download=False)

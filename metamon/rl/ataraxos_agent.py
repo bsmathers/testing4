@@ -177,8 +177,6 @@ class AtaraxosAgent(MultiTaskAgent):
 
         threshold = batch.obs[keys.ADV_THRESHOLD][:, :T].float()
         selected = online & (advantages.abs() >= threshold)
-        if not selected.any():
-            raise RuntimeError("Ataraxos online batch has no transition above advantage threshold")
 
         ratio = torch.exp((cur_lp - old_lp).clamp(-20.0, 20.0))
         unclipped = advantages * ratio
@@ -219,7 +217,14 @@ class AtaraxosAgent(MultiTaskAgent):
             self.offline_policy_coef * offline_ce
             + self.offline_value_coef * offline_value
         )
-        loss = 0.5 * online_loss + 0.5 * offline_loss
+        # Weight by the actual trajectory composition of this batch.  This is
+        # essential during the 0 -> 50% ramp: a batch containing one online
+        # trajectory must not receive the same online weight as a 7/7 batch.
+        batch_online_fraction = source[:, 0, 0].float().mean()
+        loss = (
+            batch_online_fraction * online_loss
+            + (1.0 - batch_online_fraction) * offline_loss
+        )
         self._ataraxos_step.add_(1)
 
         if log_step:
@@ -232,6 +237,7 @@ class AtaraxosAgent(MultiTaskAgent):
                 "Ataraxos/Value Loss": online_value.detach(),
                 "Ataraxos/Offline CE": offline_ce.detach(),
                 "Ataraxos/Magnet Coef": float(temperature),
+                "Ataraxos/Batch Online Fraction": batch_online_fraction.detach(),
                 "Ataraxos/Clip Fraction": _masked_mean(((ratio - 1).abs() > self.clip_range).float(), selected).detach(),
                 "Ataraxos/Selected Fraction": selected.float().sum() / online.float().sum().clamp(min=1),
                 "Ataraxos/Ratio Mean": _masked_mean(ratio, selected).detach(),

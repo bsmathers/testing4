@@ -8,8 +8,9 @@ The OMD experiment has been retired. The compatibility launcher
 - Start from Epoch475's actor and representation.
 - Add a fresh scalar value head trained on zero-sum win/loss outcomes.
 - Keep exactly 5,000 online games; collect 2,000 new games between learner epochs.
-- Run 1,000 optimizer updates per learner epoch with batch size 14: exactly seven
-  online and seven offline trajectories.
+- Run 1,000 optimizer updates per learner epoch with batch size 14. Online
+  sampling ramps linearly from 0% at epoch 0 to 50% at epoch 100; deterministic
+  low-discrepancy sampling avoids noisy source counts early in the ramp.
 - Online loss: clipped PPO, reverse KL to the exact behavior policy, reverse KL
   to uniform over legal actions, and filtered scalar value loss.
 - Retain the top quartile by absolute GAE, with a 0.01 floor. The threshold is
@@ -22,8 +23,11 @@ Online replay files contain full post-mask behavior log probabilities, the exact
 legal mask, and the behavior-time scalar value for every action. The launcher
 refuses an old FIFO that lacks these fields.
 
-The offline half is sampled as 40% pac-tauros, 30% human replays, and 30%
-curated strong-model trajectories. Online teams are split evenly between the
+Within the offline pool, sampling is 40% pac-tauros, 30% pac-exploratory, 20%
+curated strong-model trajectories, and 10% human replays. At the 50% online
+cap, these are 20%, 15%, 10%, and 5% of all trajectories. Before the cap, the
+same 40/30/20/10 proportions are renormalized over the larger offline share.
+Online teams are split evenly between the
 strong human set and the 807-team set. Opponents are split evenly between
 TaurosV0/Kakuna and the six-slot Epoch475 lineage population: current, -1, -4,
 -16, -64, and the original checkpoint.

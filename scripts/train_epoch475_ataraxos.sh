@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 # Full Epoch475 Ataraxos run: 5k-game FIFO, 2k fresh games per learner epoch,
-# and exactly 7 online + 7 offline trajectories per optimizer update.
+# and a linear 0% -> 50% online trajectory ramp over the first 100 epochs.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

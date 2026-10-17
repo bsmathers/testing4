@@ -70,30 +70,43 @@ class TaggedDataset(RLDataset):
 
 
 class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
-    """Exactly seven online and seven offline trajectories per batch."""
+    """Low-discrepancy sampling for the configured online-weight ramp."""
 
     def __init__(self, *, fifo, offline, **kwargs):
         self.adv_threshold = 0.01
+        self.current_online_weight = 0.0
         self._sample_idx = 0
         tagged_fifo = TaggedDataset(fifo, online=True, owner=self)
         tagged_offline = TaggedDataset(offline, online=False, owner=self)
         super().__init__(fifo=tagged_fifo, offline=tagged_offline, **kwargs)
 
     def sample_random_trajectory(self):
-        # The launcher enforces batch_size=14 and dloader_workers=0.
-        dataset = self.fifo if self._sample_idx % 14 < 7 else self.offline
+        # Deterministic low-discrepancy allocation avoids Bernoulli noise when
+        # the first ramp epochs contain only a handful of online trajectories.
+        # At the 0.5 cap this alternates sources and yields exactly 7/7 in every
+        # batch of 14.
+        before = int(self._sample_idx * self.current_online_weight + 1e-9)
+        after = int((self._sample_idx + 1) * self.current_online_weight + 1e-9)
+        dataset = self.fifo if after > before else self.offline
         self._sample_idx += 1
         if not self.fifo.ready_for_training:
             raise RuntimeError("Ataraxos learner started before the 5,000-game FIFO was ready")
+        self._sampling_metrics[dataset.dset_name] += 1
         return dataset.sample_random_trajectory()
 
     def update_dset_weights(self, epoch: int):
-        self.check_configured()
-        self._available_datasets = [(self.fifo, 0.5), (self.offline, 0.5)]
-        if self.fifo.ready_for_training:
+        super().update_dset_weights(epoch)
+        self.current_online_weight = next(
+            weight for dataset, weight in self._available_datasets
+            if dataset is self.fifo
+        )
+        self._sample_idx = 0
+        if self.fifo.ready_for_training and self.current_online_weight > 0.0:
             self.adv_threshold = self._compute_advantage_threshold()
         print(
-            f"  [Ataraxos] epoch={epoch} online=0.5000 offline=0.5000 "
+            f"  [Ataraxos] epoch={epoch} "
+            f"online={self.current_online_weight:.4f} "
+            f"offline={1.0 - self.current_online_weight:.4f} "
             f"adv_threshold={self.adv_threshold:.6f}", flush=True
         )
 
