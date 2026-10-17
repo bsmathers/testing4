@@ -53,10 +53,10 @@ refuses an old FIFO that lacks these fields.
 Built-in validation samples TaurosV0, Kakuna, and the frozen Epoch475 baseline
 across both the strong-human and 807-team sets.
 
-Within the offline pool, sampling is 40% pac-tauros, 30% pac-exploratory, 20%
+Within the offline pool, sampling is 40% pac-tauros, 25% pac-exploratory, 25%
 curated strong-model trajectories, and 10% human replays. At the 50% online
-cap, these are 20%, 15%, 10%, and 5% of all trajectories. Before the cap, the
-same 40/30/20/10 proportions are renormalized over the larger offline share.
+cap, these are 20%, 12.5%, 12.5%, and 5% of all trajectories. Before the cap,
+the same 40/25/25/10 proportions are renormalized over the larger offline share.
 Online teams are split evenly between the
 strong human set and the 807-team set. Opponents are split evenly between
 TaurosV0/Kakuna and the six-slot Epoch475 lineage population: current, -1, -4,
@@ -65,7 +65,6 @@ TaurosV0/Kakuna and the six-slot Epoch475 lineage population: current, -1, -4,
 ## Launch
 
 ```bash
-export GOOD_REPLAYS_DIR=/workspace/good_replays
 export WANDB_API_KEY=...
 git clone https://github.com/bsmathers/testing4.git /workspace/testing4
 bash /workspace/testing4/scripts/setup_and_launch_epoch475_omd_vast.sh

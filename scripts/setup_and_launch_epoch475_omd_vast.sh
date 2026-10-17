@@ -9,8 +9,8 @@ set -Eeuo pipefail
 #   - 500+ GiB persistent NVMe mounted at /workspace
 #   - a CUDA 12.8+ PyTorch development image (nvcc included)
 #
-# Required user data:
-#   GOOD_REPLAYS_DIR/gen1ou/*.json[.lz4]
+# Strong-model data is downloaded from the pinned public Hugging Face dataset
+# when GOOD_REPLAYS_DIR/gen1ou is not already populated.
 #
 # This script deliberately runs in the foreground. Re-run it after an
 # interruption; the training launcher resumes from complete epoch-boundary
@@ -91,8 +91,10 @@ fi
 
 [[ -f "${REPO_DIR}/scripts/train_snorlax_v1.sh" ]] \
   || die "Training launcher is missing from ${REPO_DIR}"
+export GOOD_REPLAYS_DIR PYTHON_BIN
+bash "${REPO_DIR}/scripts/prepare_snorlax_strong_replays.sh"
 [[ -d "${GOOD_REPLAYS_DIR}/gen1ou" ]] \
-  || die "GOOD_REPLAYS_DIR must contain gen1ou/: ${GOOD_REPLAYS_DIR}"
+  || die "Strong-model replay preparation did not create ${GOOD_REPLAYS_DIR}/gen1ou"
 
 log "Checking the CUDA PyTorch runtime"
 "${PYTHON_BIN}" - <<'PY'

@@ -50,11 +50,11 @@ export ALTERNATE_COLLECT_LEARN=1
 export GAMES_PER_LEARNER_EPOCH="${GAMES_PER_LEARNER_EPOCH:-2000}"
 export TOTAL_LEARNER_EPOCHS="${TOTAL_LEARNER_EPOCHS:-1000000000}"
 export ONLINE_FIFO_SIZE=5000
+export VALIDATION_INTERVAL=10
+export VALIDATION_TIMESTEPS=1000
 export METAMON_ACTOR_ONLY_COLLECTION=1
 
-[[ -n "${GOOD_REPLAYS_DIR:-}" ]] || {
-  echo "ERROR: GOOD_REPLAYS_DIR must point to a corpus root containing gen1ou/" >&2
-  exit 2
-}
+export GOOD_REPLAYS_DIR="${GOOD_REPLAYS_DIR:-/workspace/good_replays}"
+bash "${SCRIPT_DIR}/prepare_snorlax_strong_replays.sh"
 
 exec bash "${SCRIPT_DIR}/train_smallg1onlinev1a_vast.sh"

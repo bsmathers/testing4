@@ -1,11 +1,11 @@
-# SnorlaxV1 offline pool. At the 50% online cap these become 20%, 15%, 10%,
-# and 5% of the complete learner mixture respectively.
+# SnorlaxV1 offline pool. At the 50% online cap these become 20%, 12.5%,
+# 12.5%, and 5% of the complete learner mixture respectively.
 replay_weight: 0.10
 self_play:
   pac-tauros: 0.40
-  pac-exploratory: 0.30
+  pac-exploratory: 0.25
 custom_replays:
   - dir: ${GOOD_REPLAYS_DIR}
-    weight: 0.20
+    weight: 0.25
 formats:
   - gen1ou

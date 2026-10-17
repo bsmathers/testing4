@@ -494,6 +494,17 @@ def add_cli(parser: ArgumentParser) -> ArgumentParser:
         help="Optional nonzero starting LR for a linear warmup to --learning_rate. "
         "If omitted, use AMAGO's ordinary zero-to-peak warmup.",
     )
+    parser.add_argument(
+        "--validation_once",
+        action="store_true",
+        help="Run one validation pass and exit (requires --mode validate).",
+    )
+    parser.add_argument(
+        "--validation_epoch",
+        type=int,
+        default=None,
+        help="Epoch value attached to a --validation_once metrics record.",
+    )
     return parser
 
 
@@ -546,6 +557,14 @@ def main() -> None:
         raise ValueError("--from_scratch cannot be combined with continuation/base weights")
     if args.resume_training_state and (args.prev_run_dir is not None or args.base_weights is not None):
         raise ValueError("full-state resume cannot be combined with --prev_run_dir/--base_weights")
+    if args.validation_once and args.mode != "validate":
+        raise ValueError("--validation_once requires --mode validate")
+    if args.validation_epoch is not None and not args.validation_once:
+        raise ValueError("--validation_epoch requires --validation_once")
+    if args.validation_epoch is not None and args.validation_epoch < 0:
+        raise ValueError("--validation_epoch must be non-negative")
+    if args.validation_once and args.val_timesteps <= 0:
+        raise ValueError("--validation_once requires positive --val_timesteps")
 
     metamon.print_banner()
     os.environ.setdefault("METAMON_SAVE_DIR", os.path.abspath(args.save_dir))
@@ -696,6 +715,18 @@ def main() -> None:
             f"removed={','.join(removed) or 'none'}",
             flush=True,
         )
+
+    if args.validation_once:
+        if args.validation_epoch is not None:
+            experiment.epoch = args.validation_epoch
+        policy_step = getattr(experiment.policy, "_ataraxos_step", None)
+        if policy_step is not None:
+            experiment.grad_update_counter = int(policy_step.item())
+        experiment.policy_aclr.eval()
+        experiment.evaluate_val()
+        if args.log:
+            wandb.finish()
+        return
 
     experiment.learn()
     if args.log:

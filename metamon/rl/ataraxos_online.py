@@ -208,7 +208,10 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
     _SF_R = 99.0
     _SF_INNER_MOMENTUM = 0.9
     _CHECKPOINT_MILESTONE_INTERVAL = 50
-    _CHECKPOINT_RECENT_COUNT = 10
+    _CHECKPOINT_MILESTONE_COUNT = 10
+    # Keep the current epoch plus the previous 64 so every configured lineage
+    # offset (through -64) resolves to its exact policy checkpoint.
+    _CHECKPOINT_RECENT_COUNT = 65
 
     @classmethod
     def _prune_numbered_checkpoints(
@@ -219,7 +222,7 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         suffix: str,
         directories: bool,
     ) -> int:
-        """Keep every 50th checkpoint and the ten most recent checkpoints."""
+        """Keep ten 50-epoch milestones and current plus previous 64."""
         try:
             names = os.listdir(root)
         except FileNotFoundError:
@@ -243,11 +246,12 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                 -cls._CHECKPOINT_RECENT_COUNT :
             ]
         }
-        keep = recent | {
+        milestones = sorted(
             epoch
             for epoch, _ in entries
             if epoch % cls._CHECKPOINT_MILESTONE_INTERVAL == 0
-        }
+        )[-cls._CHECKPOINT_MILESTONE_COUNT :]
+        keep = recent | set(milestones)
         removed = 0
         for epoch, path in entries:
             if epoch in keep:
@@ -336,6 +340,40 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         )
         return 1.0 - progress * (1.0 - self._LR_FLOOR_SCALE)
 
+    def _optimizer_update_step(self) -> int:
+        """Read the update count persisted in every optimizer parameter group."""
+        steps = set()
+        for group in self.optimizer.param_groups:
+            if "k" not in group:
+                raise RuntimeError("Ataraxos optimizer group is missing update count k")
+            steps.add(int(group["k"]))
+        if len(steps) != 1:
+            raise RuntimeError(
+                "Ataraxos optimizer parameter groups disagree on update count: "
+                f"{sorted(steps)}"
+            )
+        return steps.pop()
+
+    def load_checkpoint(self, epoch: int, resume_training_state: bool = True) -> None:
+        result = super().load_checkpoint(
+            epoch, resume_training_state=resume_training_state
+        )
+        if resume_training_state:
+            optimizer_step = self._optimizer_update_step()
+            policy_step = int(self.policy._ataraxos_step.item())
+            if int(getattr(self, "batches_per_update", 1)) == 1:
+                if policy_step != optimizer_step:
+                    raise RuntimeError(
+                        "Ataraxos resume step mismatch: policy has "
+                        f"{policy_step}, optimizer has {optimizer_step}"
+                    )
+            self.grad_update_counter = optimizer_step
+            print(
+                f"  [Ataraxos] restored {optimizer_step} optimizer updates",
+                flush=True,
+            )
+        return result
+
     def interact(self, envs, timesteps, hidden_state=None, render=False, save_on_done=False, episodes=None, sample=True):
         # This is the stock AMAGO loop with one deliberate addition before
         # env.step: attach the exact behavior distribution/value to the battle.
@@ -394,11 +432,20 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
 
     def train_step(self, batch, log_step: bool):
         self.optimizer.train()
-        step = max(int(self.grad_update_counter), 0)
+        # ``grad_update_counter`` is process-local in AMAGO. The optimizer's
+        # group counter is checkpointed and therefore remains authoritative
+        # across the one-process-per-epoch alternating launcher.
+        step = self._optimizer_update_step()
         scale = self._lr_scale(step)
         for group in self.optimizer.param_groups:
             group["lr"] = group["ataraxos_base_lr"] * scale
         metrics = super().train_step(batch, log_step)
+        # AMAGO still advances its registered constant scheduler after the
+        # optimizer update. It does not affect the update above, but it resets
+        # the visible group LRs to their initial values. Reinstall the managed
+        # values so logs and serialized optimizer metadata reflect this step.
+        for group in self.optimizer.param_groups:
+            group["lr"] = group["ataraxos_base_lr"] * scale
         if log_step:
             # The stock logger reads the dormant constant scheduler. Record all
             # three manually managed parameter-group rates explicitly.

@@ -18,8 +18,8 @@ It is a one-shot remote training run, not a short local experiment.
 - Use observed-action cross entropy and outcome-value regression offline.
   Pac-exploratory action labels receive weight 0.25; their value labels retain
   full weight.
-- At the 50% online cap, total sampling is 20% pac-tauros, 15%
-  pac-exploratory, 10% curated strong-model games, 5% human games, and 50%
+- At the 50% online cap, total sampling is 20% pac-tauros, 12.5%
+  pac-exploratory, 12.5% curated strong-model games, 5% human games, and 50%
   online self-play.
 - Online teams are split evenly between `hl_05_26` and the 807-team expert set.
 - The opponent league has six TaurosV0/Kakuna rows and six lineage rows:
@@ -32,9 +32,15 @@ It is a one-shot remote training run, not a short local experiment.
   checkpoints, validation, collection, and league play use the averaged model.
 - Apply a weak L2-SP anchor to the Epoch475 encoder and actor, decaying to zero
   over 100,000 updates.
-- Retain every 50th numbered policy/full-state checkpoint and the ten most
-  recent checkpoints of each type. The rolling latest policy and immutable
-  Epoch475 anchor are retained separately.
+- Retain the ten newest 50-epoch milestone policy/full-state checkpoints plus
+  the current epoch and previous 64 epochs of each type. This keeps every
+  configured lineage offset exact while bounding storage. The rolling latest
+  policy and immutable Epoch475 anchor are retained separately.
+- Recover the LR/update counter from optimizer state on every full-state
+  resume. The alternating launcher starts a fresh learner process each epoch,
+  so AMAGO's process-local counter is not a reliable schedule clock.
+- After collectors stop, run a one-shot 1,000-step validation at epoch 0 and
+  every tenth completed epoch; a validation failure stops the launcher.
 
 The online replay schema stores the exact post-mask behavior log probabilities,
 legal-action mask, and behavior-time scalar value for every action. A persistent
@@ -52,11 +58,17 @@ root from an older experiment is rejected rather than mixed into this run.
 ## Launch
 
 ```bash
-export GOOD_REPLAYS_DIR=/workspace/good_replays
 export WANDB_API_KEY=...
 git clone https://github.com/bsmathers/testing4.git /workspace/testing4
 bash /workspace/testing4/scripts/setup_and_launch_snorlax_v1_vast.sh
 ```
+
+The launcher downloads the pinned `gen1ou.zip` from
+`bsmathers/scraped_replays_parsed` and safely extracts it under
+`GOOD_REPLAYS_DIR` (default `/workspace/good_replays`). An already-populated
+trajectory directory is reused. The archive URL, revision, checksum, and local
+paths can be overridden with the corresponding `STRONG_REPLAYS_*` and
+`GOOD_REPLAYS_DIR` environment variables.
 
 The launcher runs in the foreground and resumes only from complete
 epoch-boundary model/optimizer states. Policy and optimizer-state checkpoints

@@ -41,6 +41,8 @@ GAMES_PER_LEARNER_EPOCH="${GAMES_PER_LEARNER_EPOCH:-2000}"
 TOTAL_LEARNER_EPOCHS="${TOTAL_LEARNER_EPOCHS:-401}"
 COLLECTOR_DTYPE="${COLLECTOR_DTYPE:-}"
 ONLINE_FIFO_SIZE="${ONLINE_FIFO_SIZE:-300000}"
+VALIDATION_INTERVAL="${VALIDATION_INTERVAL:-0}"
+VALIDATION_TIMESTEPS="${VALIDATION_TIMESTEPS:-1000}"
 if [[ -z "${COLLECTOR_DTYPE}" ]]; then
   if [[ "${COLLECTOR_DEVICE}" == "gpu" ]]; then
     COLLECTOR_DTYPE=bf16
@@ -114,6 +116,8 @@ cd "${REPO_DIR}"
 [[ "${TOTAL_LEARNER_EPOCHS}" =~ ^[1-9][0-9]*$ ]] || die "TOTAL_LEARNER_EPOCHS must be positive"
 [[ "${COLLECTOR_DTYPE}" =~ ^(fp32|bf16|fp16)$ ]] || die "COLLECTOR_DTYPE must be fp32, bf16, or fp16"
 [[ "${ONLINE_FIFO_SIZE}" =~ ^[1-9][0-9]*$ ]] || die "ONLINE_FIFO_SIZE must be positive"
+[[ "${VALIDATION_INTERVAL}" =~ ^[0-9]+$ ]] || die "VALIDATION_INTERVAL must be non-negative"
+[[ "${VALIDATION_TIMESTEPS}" =~ ^[1-9][0-9]*$ ]] || die "VALIDATION_TIMESTEPS must be positive"
 if [[ "${COLLECTOR_DEVICE}" == "cpu" && "${COLLECTOR_DTYPE}" != "fp32" ]]; then
   die "CPU collection requires COLLECTOR_DTYPE=fp32"
 fi
@@ -353,6 +357,46 @@ if [[ "${TRAIN_VARIANT}" == "snorlax_v1" ]]; then
   [[ "${GRAD_ACCUM}" == "1" ]] || die "snorlax_v1 requires GRAD_ACCUM=1"
   [[ "${BATCH_SIZE_PER_GPU}" == "14" ]] || die "snorlax_v1 requires batch size 14"
   [[ "${DLOADER_WORKERS}" == "0" ]] || die "snorlax_v1 requires DLOADER_WORKERS=0 for deterministic sampling"
+  "${PYTHON_BIN}" - <<'PY'
+import json
+import os
+from pathlib import Path
+
+import lz4.frame
+
+root = Path(os.environ["GOOD_REPLAYS_DIR"]) / "gen1ou"
+files = sorted(list(root.glob("*.json")) + list(root.glob("*.json.lz4")))
+if not files:
+    raise SystemExit(
+        f"GOOD_REPLAYS_DIR/gen1ou contains no parsed .json or .json.lz4 trajectories: {root}"
+    )
+
+# A bounded structural probe catches the common and expensive mistake of
+# supplying raw Showdown logs (or a corrupt archive) while keeping startup fast
+# for a large curated corpus. The learner performs full validation as files are
+# sampled.
+for path in files[:32]:
+    try:
+        if path.name.endswith(".lz4"):
+            with lz4.frame.open(path, "rb") as f:
+                payload = json.loads(f.read().decode("utf-8"))
+        else:
+            with path.open("r", encoding="utf-8") as f:
+                payload = json.load(f)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Unreadable curated trajectory {path}: {exc}") from exc
+    states = payload.get("states")
+    actions = payload.get("actions")
+    if not isinstance(states, list) or not isinstance(actions, list):
+        raise SystemExit(
+            f"{path} is not a parsed Metamon trajectory (missing states/actions lists)"
+        )
+    if len(states) < 2 or len(actions) != len(states):
+        raise SystemExit(
+            f"Malformed curated trajectory {path}: states={len(states)}, actions={len(actions)}"
+        )
+print(f"Found {len(files)} curated trajectories; structurally checked {min(len(files), 32)}")
+PY
 else
   DATASET_CONFIG_VALUE="online_selfplay.yaml"
   TRAIN_TEAM_SET_VALUE="smallg1onlinev1a_expert"
@@ -553,10 +597,21 @@ fifo_count() {
   find "${BUFFER_DIR}/gen1ou" -type f \( -name '*.json' -o -name '*.json.lz4' \) | wc -l
 }
 
-new_fifo_count() {
-  local marker="$1"
+snapshot_fifo_names() {
+  local output="$1"
   find "${BUFFER_DIR}/gen1ou" -type f \
-    \( -name '*.json' -o -name '*.json.lz4' \) -newer "${marker}" | wc -l
+    \( -name '*.json' -o -name '*.json.lz4' \) -print | LC_ALL=C sort >"${output}"
+}
+
+new_fifo_count() {
+  local baseline="$1" current_names
+  current_names="${baseline}.current"
+  snapshot_fifo_names "${current_names}"
+  # Replay filenames contain a random battle id and are never reused. Counting
+  # the set difference is reliable even on filesystems with coarse mtimes and
+  # while the fixed-size FIFO replaces older files.
+  comm -13 "${baseline}" "${current_names}" | wc -l
+  rm -f -- "${current_names}"
 }
 
 current="$(fifo_count)"
@@ -603,6 +658,7 @@ import os
 from pathlib import Path
 
 import lz4.frame
+import numpy as np
 
 root = Path(os.environ["BUFFER_DIR"]) / "gen1ou"
 files = sorted(list(root.glob("*.json")) + list(root.glob("*.json.lz4")))
@@ -619,6 +675,37 @@ for path in files:
     missing = required.difference(payload)
     if missing:
         raise SystemExit(f"{path.name} predates SnorlaxV1 metadata; use a fresh PERSIST_ROOT")
+    states = payload.get("states")
+    actions = payload.get("actions")
+    logp = np.asarray(payload["behavior_log_probs"], dtype=np.float32)
+    values = np.asarray(payload["behavior_values"], dtype=np.float32)
+    legal = np.asarray(payload["behavior_legal_masks"], dtype=bool)
+    if not isinstance(states, list) or not isinstance(actions, list) or len(states) < 2:
+        raise SystemExit(f"{path.name} has malformed states/actions")
+    steps = len(states) - 1
+    if len(actions) != len(states) or logp.ndim != 2 or logp.shape[0] != steps:
+        raise SystemExit(f"{path.name} has trajectory-misaligned behavior metadata")
+    if values.shape != (steps,) or legal.shape != logp.shape:
+        raise SystemExit(f"{path.name} has invalid behavior value/legal-mask shapes")
+    if not np.isfinite(logp).all() or not np.isfinite(values).all():
+        raise SystemExit(f"{path.name} has non-finite behavior metadata")
+    if np.any(np.abs(values) > 1.0001):
+        raise SystemExit(f"{path.name} has behavior values outside [-1, 1]")
+    probs = np.exp(logp)
+    if not np.allclose(probs.sum(-1), 1.0, atol=2e-3, rtol=0.0):
+        raise SystemExit(f"{path.name} has an unnormalized behavior policy")
+    if np.any(probs[~legal] > 1e-8):
+        raise SystemExit(f"{path.name} assigns behavior mass to illegal actions")
+    chosen = np.asarray(actions[:-1])
+    if (
+        chosen.shape != (steps,)
+        or not np.issubdtype(chosen.dtype, np.integer)
+        or np.any(chosen < 0)
+        or np.any(chosen >= logp.shape[1])
+    ):
+        raise SystemExit(f"{path.name} has invalid recorded actions")
+    if not legal[np.arange(steps), chosen].all():
+        raise SystemExit(f"{path.name} records an action marked illegal")
 print(f"Validated behavior metadata in {len(files)} FIFO games")
 PY
 fi
@@ -632,8 +719,8 @@ if [[ "${ALTERNATE_COLLECT_LEARN}" == "1" ]]; then
   completed_epoch="${RESUME_EPOCH:--1}"
   next_epoch=$((completed_epoch + 1))
   while (( next_epoch < TOTAL_LEARNER_EPOCHS )); do
-    marker="${LOG_DIR}/.cycle-${next_epoch}-collection-start"
-    touch "${marker}"
+    baseline="${LOG_DIR}/.cycle-${next_epoch}-fifo-baseline.txt"
+    snapshot_fifo_names "${baseline}"
     phase="epoch-${next_epoch}"
     log "Collect phase for learner epoch ${next_epoch}: target ${GAMES_PER_LEARNER_EPOCH} fresh games"
     start_collectors $((1000 + next_epoch * COLLECTOR_PROCESSES)) "${phase}"
@@ -644,11 +731,11 @@ if [[ "${ALTERNATE_COLLECT_LEARN}" == "1" ]]; then
         kill -0 "${pid}" 2>/dev/null \
           || die "A ${phase} collector exited; inspect ${LOG_DIR}/collector-${phase}-*.log"
       done
-      fresh="$(new_fifo_count "${marker}")"
+      fresh="$(new_fifo_count "${baseline}")"
       echo "Cycle ${next_epoch} collection: ${fresh}/${GAMES_PER_LEARNER_EPOCH} fresh games"
     done
     cleanup_collectors
-    rm -f -- "${marker}"
+    rm -f -- "${baseline}" "${baseline}.current"
 
     learner_limit=$((next_epoch + 1))
     if (( completed_epoch >= 0 )); then
@@ -676,6 +763,22 @@ if [[ "${ALTERNATE_COLLECT_LEARN}" == "1" ]]; then
     [[ -d "${completed_state}" ]] || die "Missing completed state ${completed_state}"
     [[ -s "${completed_policy}" ]] || die "Missing completed policy ${completed_policy}"
     cp -f "${completed_policy}" "${LATEST}"
+    if (( VALIDATION_INTERVAL > 0 && completed_epoch % VALIDATION_INTERVAL == 0 )); then
+      log "Validation phase for completed epoch ${completed_epoch}: ${VALIDATION_TIMESTEPS} steps"
+      set +e
+      "${PYTHON_BIN}" -m "${RUNNER_MODULE}" \
+        --run_config "${RUN_CONFIG}" --mode validate --validation_once \
+        --validation_epoch "${completed_epoch}" \
+        --run_name "${RUN_NAME}" --lanes "${LANES}" --n_workers "${COLLECTOR_WORKERS}" \
+        --save_dir "${SAVE_DIR}" --buffer_dir "${BUFFER_DIR}" --log \
+        --base_weights "${completed_policy}" \
+        --val_timesteps "${VALIDATION_TIMESTEPS}" --val_interval 1 \
+        2>&1 | tee -a "${LOG_DIR}/validation.log"
+      validation_status="${PIPESTATUS[0]}"
+      set -e
+      (( validation_status == 0 )) \
+        || die "Validation for epoch ${completed_epoch} exited with status ${validation_status}"
+    fi
     next_epoch=$((completed_epoch + 1))
   done
   trap - EXIT INT TERM
