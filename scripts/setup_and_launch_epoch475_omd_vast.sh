@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Bootstrap and launch Epoch475 OMD on a fresh Vast.ai instance.
+# Bootstrap and launch the Epoch475 Ataraxos experiment on Vast.ai.
 #
 # Recommended instance:
 #   - 1x RTX 5090 (32 GiB)
@@ -23,7 +23,7 @@ log() { printf '\n[%s] %s\n' "$(date '+%F %T')" "$*"; }
 REPO_URL="${REPO_URL:-https://github.com/bsmathers/testing4.git}"
 REPO_REF="${REPO_REF:-main}"
 REPO_DIR="${REPO_DIR:-/workspace/testing4}"
-PERSIST_ROOT="${PERSIST_ROOT:-/workspace/epoch475-omd}"
+PERSIST_ROOT="${PERSIST_ROOT:-/workspace/epoch475-ataraxos}"
 GOOD_REPLAYS_DIR="${GOOD_REPLAYS_DIR:-/workspace/good_replays}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 UPDATE_REPO="${UPDATE_REPO:-1}"
@@ -89,7 +89,7 @@ else
   die "REPO_DIR exists but is not a Git checkout: ${REPO_DIR}"
 fi
 
-[[ -f "${REPO_DIR}/scripts/train_epoch475_omd.sh" ]] \
+[[ -f "${REPO_DIR}/scripts/train_epoch475_ataraxos.sh" ]] \
   || die "Training launcher is missing from ${REPO_DIR}"
 [[ -d "${GOOD_REPLAYS_DIR}/gen1ou" ]] \
   || die "GOOD_REPLAYS_DIR must contain gen1ou/: ${GOOD_REPLAYS_DIR}"
@@ -131,11 +131,11 @@ export COLLECTOR_DEVICE="${COLLECTOR_DEVICE:-gpu}"
 export COLLECTOR_DTYPE="${COLLECTOR_DTYPE:-bf16}"
 export LANES="${LANES:-96}"
 export COLLECTOR_WORKERS="${COLLECTOR_WORKERS:-8}"
-export DLOADER_WORKERS="${DLOADER_WORKERS:-8}"
+export DLOADER_WORKERS=0
 export BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-14}"
 export GAMES_PER_LEARNER_EPOCH="${GAMES_PER_LEARNER_EPOCH:-2000}"
-export TOTAL_LEARNER_EPOCHS="${TOTAL_LEARNER_EPOCHS:-401}"
-export ONLINE_FIFO_SIZE="${ONLINE_FIFO_SIZE:-30000}"
+export TOTAL_LEARNER_EPOCHS="${TOTAL_LEARNER_EPOCHS:-1000000000}"
+export ONLINE_FIFO_SIZE=5000
 
 cd "${REPO_DIR}"
-bash scripts/train_epoch475_omd.sh 2>&1 | tee -a "${run_log}"
+bash scripts/train_epoch475_ataraxos.sh 2>&1 | tee -a "${run_log}"

@@ -59,13 +59,18 @@ from metamon.rl.pretrained import (
 class _LocalV1BModel(LocalPretrainedModel):
     """Shared architecture metadata for evolving and frozen V1B policies."""
 
-    def __init__(self, run_name: str, default_checkpoint: int):
+    def __init__(
+        self,
+        run_name: str,
+        default_checkpoint: int,
+        train_gin_config: str = "grouped_v2_large_robust_awr_beta3.gin",
+    ):
         save_dir = os.environ.get("METAMON_SAVE_DIR", os.path.abspath("checkpoints"))
         super().__init__(
             amago_ckpt_dir=save_dir,
             model_name=run_name,
             model_gin_config="grouped_v2_medium.gin",
-            train_gin_config="grouped_v2_large_robust_awr_beta3.gin",
+            train_gin_config=train_gin_config,
             default_checkpoint=default_checkpoint,
             action_space=get_action_space("DefaultActionSpace"),
             observation_space=get_observation_space("GroupedObservationSpace"),
@@ -93,6 +98,47 @@ class TaurosV1B(_LocalV1BModel):
         if checkpoint == LATEST_CHECKPOINT:
             return os.path.join(self.local_ckpt_dir, "latest", "policy.pt")
         return super().get_path_to_checkpoint(checkpoint)
+
+
+@pretrained_model("Epoch475Ataraxos")
+class Epoch475Ataraxos(_LocalV1BModel):
+    """Evolving Ataraxos policy used by its own self-play lineage."""
+
+    def __init__(self):
+        run_name = os.environ.get("TAUROSV1B_RUN_NAME", "epoch475_ataraxos")
+        super().__init__(
+            run_name=run_name,
+            default_checkpoint=0,
+            train_gin_config="epoch475_ataraxos.gin",
+        )
+
+    def get_path_to_checkpoint(self, checkpoint: int) -> str:
+        if checkpoint == LATEST_CHECKPOINT:
+            return os.path.join(self.local_ckpt_dir, "latest", "policy.pt")
+        return super().get_path_to_checkpoint(checkpoint)
+
+    def initialize_agent(
+        self,
+        checkpoint: Optional[int] = None,
+        log: bool = False,
+        action_temperature: float = 1.0,
+    ):
+        # LocalPretrainedModel reserves checkpoint 0 to mean random
+        # initialization.  Here policy_epoch_0.pt is a real immutable snapshot,
+        # so explicitly load it after constructing the correctly shaped agent.
+        requested = self.default_checkpoint if checkpoint is None else checkpoint
+        experiment = super().initialize_agent(
+            checkpoint=requested,
+            log=log,
+            action_temperature=action_temperature,
+        )
+        if requested == 0:
+            path = self.get_path_to_checkpoint(0)
+            if not os.path.exists(path):
+                raise FileNotFoundError(path)
+            state = torch.load(path, map_location="cpu")
+            experiment.policy.load_state_dict(state, strict=True)
+        return experiment
 
 
 @pretrained_model("Epoch475Frozen")

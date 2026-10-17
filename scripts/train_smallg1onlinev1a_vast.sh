@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Launch SmallG1OnlineV1a on a single Vast.ai GPU instance.
 #
 # Expected layout:
-#   REPO_DIR/                         testing2 checkout
+#   REPO_DIR/                         testing4 checkout
 #   REPO_DIR/policy/                  3 epoch-475 shards + checksum
 #   REPO_DIR/teams_replay/good_teams  807 .txt/.gen1ou_team files
 #
@@ -61,7 +61,7 @@ RUN_CONFIG="${CONFIG_DIR}/smallg1onlinev1a.yaml"
 POOL_CONFIG="${CONFIG_DIR}/hl_gen1ou_smallg1onlinev1a.yaml"
 EXPERT_DIR="${CACHE_DIR}/teams/smallg1onlinev1a_expert/gen1ou"
 
-[[ -f "${REPO_DIR}/pyproject.toml" ]] || die "REPO_DIR is not testing2: ${REPO_DIR}"
+[[ -f "${REPO_DIR}/pyproject.toml" ]] || die "REPO_DIR is not testing4: ${REPO_DIR}"
 mkdir -p "${CACHE_DIR}" "${SAVE_DIR}" "${BUFFER_DIR}/gen1ou" \
   "${CONFIG_DIR}" "${BOOTSTRAP_DIR}" "${LOG_DIR}"
 
@@ -69,7 +69,7 @@ export METAMON_CACHE_DIR="${CACHE_DIR}"
 export METAMON_SAVE_DIR="${SAVE_DIR}"
 export METAMON_BATTLE_HOST="${REPO_DIR}/metamon/env/vectorized/battle_host_engine.js"
 export METAMON_PKMN_ENGINE="${REPO_DIR}/metamon/env/vectorized/pkmn-showdown.node"
-if [[ "${TRAIN_VARIANT}" == "epoch475_omd" ]]; then
+if [[ "${TRAIN_VARIANT}" == "epoch475_ataraxos" ]]; then
   export TAUROSV1B_RUN_NAME="${RUN_NAME}"
 else
   export TAUROSV1B_RUN_NAME="epoch475_frozen"
@@ -276,9 +276,9 @@ print(f"Wrote {len(names)} entries to {target}; duplicate content was preserved"
 PY
 
 log "Writing the SmallG1OnlineV1a opponent pool and run configuration"
-if [[ "${TRAIN_VARIANT}" == "epoch475_omd" ]]; then
+if [[ "${TRAIN_VARIANT}" == "epoch475_ataraxos" ]]; then
 cat >"${POOL_CONFIG}" <<'YAML'
-# Epoch475 OMD league. The six-row lineage slice is always exactly:
+# Epoch475 Ataraxos league. The six-row lineage slice is always exactly:
 # current, 1 epoch old, 4 epochs old, 16 epochs old, 64 epochs old, original.
 # Before enough history exists, missing offset rows use the immutable original.
 defaults:
@@ -300,7 +300,7 @@ agents:
     model_name: Epoch475Frozen
     checkpoints: [475]
   Epoch475History:
-    model_name: TaurosV1B
+    model_name: Epoch475Ataraxos
     checkpoints:
       discover: true
       include_latest: false
@@ -359,13 +359,13 @@ INITIAL_ONLINE_WEIGHT_VALUE="0.0"
 ONLINE_ANNEAL_END_VALUE=20
 CKPT_INTERVAL_VALUE=10
 FULL_STATE_INTERVAL_VALUE=10
-if [[ "${TRAIN_VARIANT}" == "epoch475_omd" ]]; then
+if [[ "${TRAIN_VARIANT}" == "epoch475_ataraxos" ]]; then
   GOOD_REPLAYS_DIR="${GOOD_REPLAYS_DIR:-}"
-  [[ -n "${GOOD_REPLAYS_DIR}" ]] || die "GOOD_REPLAYS_DIR is required for epoch475_omd"
+  [[ -n "${GOOD_REPLAYS_DIR}" ]] || die "GOOD_REPLAYS_DIR is required for epoch475_ataraxos"
   [[ -d "${GOOD_REPLAYS_DIR}/gen1ou" ]] \
     || die "GOOD_REPLAYS_DIR must contain gen1ou/: ${GOOD_REPLAYS_DIR}"
-  OMD_DATASET_CONFIG="${CONFIG_DIR}/epoch475_omd_offline.yaml"
-  OMD_TEAM_CONFIG="${CONFIG_DIR}/epoch475_omd_teams.yaml"
+  OMD_DATASET_CONFIG="${CONFIG_DIR}/epoch475_ataraxos_offline.yaml"
+  OMD_TEAM_CONFIG="${CONFIG_DIR}/epoch475_ataraxos_teams.yaml"
   cat >"${OMD_DATASET_CONFIG}" <<YAML
 # Within the offline half: 40% pac-tauros, 30% human, 30% curated strong bots.
 replay_weight: 0.30
@@ -387,7 +387,9 @@ YAML
   ONLINE_WEIGHT_VALUE="${ONLINE_WEIGHT:-0.50}"
   INITIAL_ONLINE_WEIGHT_VALUE="${ONLINE_WEIGHT_VALUE}"
   ONLINE_ANNEAL_END_VALUE=0
-  [[ "${GRAD_ACCUM}" == "1" ]] || die "epoch475_omd requires GRAD_ACCUM=1"
+  [[ "${GRAD_ACCUM}" == "1" ]] || die "epoch475_ataraxos requires GRAD_ACCUM=1"
+  [[ "${BATCH_SIZE_PER_GPU}" == "14" ]] || die "epoch475_ataraxos requires batch size 14"
+  [[ "${DLOADER_WORKERS}" == "0" ]] || die "epoch475_ataraxos requires DLOADER_WORKERS=0 for exact 7/7 batches"
 fi
 if [[ "${ALTERNATE_COLLECT_LEARN}" == "1" ]]; then
   CKPT_INTERVAL_VALUE=1
@@ -399,20 +401,20 @@ run_name: ${RUN_NAME}
 base_model: TaurosV1A
 battle_format: gen1ou
 dataset_config: ${DATASET_CONFIG_VALUE}
-train_gin_config: grouped_v2_large_isfilter.gin
+train_gin_config: $([[ "${TRAIN_VARIANT}" == "epoch475_ataraxos" ]] && echo epoch475_ataraxos.gin || echo grouped_v2_large_isfilter.gin)
 train_pool: ${POOL_CONFIG}
 train_team_set: ${TRAIN_TEAM_SET_VALUE}
 val_pool: metamon/rl/configs/opponent_pools/taurosv1a_val.yaml
 val_team_set: smallg1onlinev1a_expert
 dset_max_size: ${ONLINE_FIFO_SIZE}
-dset_min_size: 5000
+dset_min_size: $([[ "${TRAIN_VARIANT}" == "epoch475_ataraxos" ]] && echo 4999 || echo 5000)
 initial_online_weight: ${INITIAL_ONLINE_WEIGHT_VALUE}
 online_weight: ${ONLINE_WEIGHT_VALUE}
 online_anneal_start_epoch: 0
 online_anneal_end_epoch: ${ONLINE_ANNEAL_END_VALUE}
-learning_rate: 8.0e-5
-lr_warmup_epochs: 20
-seq_floor_warmup_epochs: 20
+learning_rate: $([[ "${TRAIN_VARIANT}" == "epoch475_ataraxos" ]] && echo 1.0e-4 || echo 8.0e-5)
+lr_warmup_epochs: $([[ "${TRAIN_VARIANT}" == "epoch475_ataraxos" ]] && echo 0 || echo 20)
+seq_floor_warmup_epochs: $([[ "${TRAIN_VARIANT}" == "epoch475_ataraxos" ]] && echo 0 || echo 20)
 batch_size_per_gpu: ${BATCH_SIZE_PER_GPU}
 grad_accum: ${GRAD_ACCUM}
 epochs: ${TOTAL_LEARNER_EPOCHS}
@@ -424,7 +426,8 @@ lanes: ${LANES}
 n_workers: ${COLLECTOR_WORKERS}
 train_timesteps_per_epoch: 500
 temp_low: 1.0
-temp_high: 2.0
+temp_high: $([[ "${TRAIN_VARIANT}" == "epoch475_ataraxos" ]] && echo 1.0 || echo 2.0)
+reward_function: $([[ "${TRAIN_VARIANT}" == "epoch475_ataraxos" ]] && echo BinaryReward || echo AggressiveShapedReward)
 val_timesteps: 1000
 val_interval: 10
 dloader_workers: ${DLOADER_WORKERS}
@@ -444,7 +447,7 @@ from metamon.data.download import (
 
 download_usage_stats(gen=1, version="v5", force_download=False)
 download_parsed_replays("gen1ou", version="v6", force_download=False)
-subsets = ("pac-tauros",) if os.environ.get("TRAIN_VARIANT") == "epoch475_omd" else ("pac-base", "pac-exploratory", "pac-tauros")
+subsets = ("pac-tauros",) if os.environ.get("TRAIN_VARIANT") == "epoch475_ataraxos" else ("pac-base", "pac-exploratory", "pac-tauros")
 for subset in subsets:
     download_self_play_data(subset, "gen1ou", version="main", force_download=False, extract=False)
 download_teams("gen1ou", "hl_05_26", version="v5", force_download=False)
@@ -467,7 +470,7 @@ public = {
     "Superkazam": range(38, 51, 2),
     "Kadabra3": range(10, 21, 2),
 }
-if os.environ.get("TRAIN_VARIANT") == "epoch475_omd":
+if os.environ.get("TRAIN_VARIANT") == "epoch475_ataraxos":
     public = {"TaurosV0": public["TaurosV0"], "Kakuna": public["Kakuna"]}
 for model_name, epochs in public.items():
     model = get_pretrained_model(model_name)
@@ -483,7 +486,7 @@ LATEST="${SAVE_DIR}/${RUN_NAME}/ckpts/latest/policy.pt"
 mkdir -p "$(dirname "${FROZEN}")" "$(dirname "${LATEST}")"
 cp -f "${ONLINE_WEIGHTS}" "${FROZEN}"
 [[ -s "${LATEST}" ]] || cp "${ONLINE_WEIGHTS}" "${LATEST}"
-if [[ "${TRAIN_VARIANT}" == "epoch475_omd" ]]; then
+if [[ "${TRAIN_VARIANT}" == "epoch475_ataraxos" ]]; then
   mkdir -p "${SAVE_DIR}/${RUN_NAME}/ckpts/policy_weights"
   BASE_SNAPSHOT="${SAVE_DIR}/${RUN_NAME}/ckpts/policy_weights/policy_epoch_0.pt"
   [[ -s "${BASE_SNAPSHOT}" ]] || cp "${ONLINE_WEIGHTS}" "${BASE_SNAPSHOT}"
@@ -600,6 +603,34 @@ if (( current < PREFILL_FILES )); then
   fi
 else
   log "FIFO already contains ${current} files; skipping prefill"
+fi
+
+if [[ "${TRAIN_VARIANT}" == "epoch475_ataraxos" ]]; then
+  log "Validating exact behavior metadata in the 5,000-game FIFO"
+  BUFFER_DIR="${BUFFER_DIR}" "${PYTHON_BIN}" - <<'PY'
+import json
+import os
+from pathlib import Path
+
+import lz4.frame
+
+root = Path(os.environ["BUFFER_DIR"]) / "gen1ou"
+files = sorted(list(root.glob("*.json")) + list(root.glob("*.json.lz4")))
+if len(files) != 5000:
+    raise SystemExit(f"Ataraxos FIFO must contain exactly 5000 games; found {len(files)}")
+required = {"behavior_log_probs", "behavior_values", "behavior_legal_masks"}
+for path in files:
+    if path.name.endswith(".lz4"):
+        with lz4.frame.open(path, "rb") as f:
+            payload = json.loads(f.read().decode("utf-8"))
+    else:
+        with path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+    missing = required.difference(payload)
+    if missing:
+        raise SystemExit(f"{path.name} predates Ataraxos metadata; use a fresh PERSIST_ROOT")
+print(f"Validated behavior metadata in {len(files)} FIFO games")
+PY
 fi
 
 if [[ "${CALIBRATION_ONLY:-0}" == "1" ]]; then

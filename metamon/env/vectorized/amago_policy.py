@@ -20,7 +20,9 @@ import torch
 from .obs_utils import numpy_obs_to_torch, stack_obs_dicts, unstack_obs_dicts
 
 
-_INFERENCE_CHILDREN = frozenset({"tstep_encoder", "traj_encoder", "actor"})
+_INFERENCE_CHILDREN = frozenset(
+    {"tstep_encoder", "traj_encoder", "actor", "ataraxos_value"}
+)
 
 
 def collector_inference_dtype(device: torch.device) -> torch.dtype:
@@ -98,13 +100,20 @@ def load_collection_policy_state(policy: torch.nn.Module, state: dict) -> None:
     """Load a full learner checkpoint into an actor-only collection policy."""
     current = policy.state_dict()
     selected = {key: value for key, value in state.items() if key in current}
-    missing = sorted(set(current) - set(selected))
+    missing = sorted(
+        key for key in set(current) - set(selected)
+        if not key.startswith("ataraxos_value.") and key != "_ataraxos_step"
+    )
     if missing:
         raise RuntimeError(
             "Collection checkpoint is missing actor-path tensors: "
             + ", ".join(missing[:8])
         )
-    policy.load_state_dict(selected, strict=True)
+    # A legacy Epoch475 bootstrap has no fresh Ataraxos value head yet. Keep
+    # those initialized tensors until the first learner checkpoint publishes it.
+    merged = dict(current)
+    merged.update(selected)
+    policy.load_state_dict(merged, strict=True)
 
 
 class AmagoLadderPolicyDriver:

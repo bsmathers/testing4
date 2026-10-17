@@ -149,6 +149,19 @@ class VectorizedShowdownEnv(gym.Env):
             [] for _ in range(self.batched_envs)
         ]
         self._traj_actions: List[List[int]] = [[] for _ in range(self.batched_envs)]
+        self._traj_behavior_log_probs: List[List[List[float]]] = [
+            [] for _ in range(self.batched_envs)
+        ]
+        self._traj_behavior_values: List[List[float]] = [
+            [] for _ in range(self.batched_envs)
+        ]
+        self._traj_behavior_legal: List[List[List[bool]]] = [
+            [] for _ in range(self.batched_envs)
+        ]
+        self._pending_behavior_log_probs: Optional[np.ndarray] = None
+        self._pending_behavior_values: Optional[np.ndarray] = None
+        self._pending_behavior_legal: Optional[np.ndarray] = None
+        self._ataraxos_metadata_enabled = False
 
         self.player_username = player_username or (
             f"MMVecSD-{''.join(str(random.randint(0, 9)) for _ in range(8))}"
@@ -358,6 +371,38 @@ class VectorizedShowdownEnv(gym.Env):
         """Seed per-lane trajectory buffers with the eval POV at battle start."""
         self._traj_states[i] = [self.lanes[i].universal_state(self.eval_side)]
         self._traj_actions[i] = []
+        self._traj_behavior_log_probs[i] = []
+        self._traj_behavior_values[i] = []
+        self._traj_behavior_legal[i] = []
+
+    def record_policy_metadata(
+        self,
+        behavior_log_probs: np.ndarray,
+        behavior_values: np.ndarray,
+        behavior_legal: np.ndarray,
+    ) -> None:
+        """Attach exact behavior-policy outputs to the next outer action."""
+        logp = np.asarray(behavior_log_probs, dtype=np.float32)
+        values = np.asarray(behavior_values, dtype=np.float32).reshape(-1)
+        legal = np.asarray(behavior_legal, dtype=bool)
+        expected = (self.batched_envs, self.eval_action_space.gym_space.n)
+        if logp.shape != expected:
+            raise ValueError(f"behavior_log_probs shape {logp.shape}, expected {expected}")
+        if values.shape != (self.batched_envs,):
+            raise ValueError(f"behavior_values shape {values.shape}, expected {(self.batched_envs,)}")
+        if legal.shape != expected:
+            raise ValueError(f"behavior_legal shape {legal.shape}, expected {expected}")
+        if not np.isfinite(logp).all() or not np.isfinite(values).all():
+            raise ValueError("non-finite Ataraxos behavior metadata")
+        probs = np.exp(logp)
+        if not np.allclose(probs.sum(-1), 1.0, atol=2e-3):
+            raise ValueError("Ataraxos behavior probabilities do not sum to one")
+        if np.any(probs[~legal] > 1e-8):
+            raise ValueError("Ataraxos behavior policy assigns mass to an illegal action")
+        self._ataraxos_metadata_enabled = True
+        self._pending_behavior_log_probs = logp
+        self._pending_behavior_values = values
+        self._pending_behavior_legal = legal
 
     def _random_seed(self):
         # Showdown PRNG seed: four 16-bit ints (sodium seed also accepted as str).
@@ -837,7 +882,25 @@ class VectorizedShowdownEnv(gym.Env):
                     rewards[i] = float(self.eval_reward_function(prev, new_eval))
                 self._cycle_prev_eval[i] = None
                 if self._saving and eval_actions[i] is not None:
+                    if self._ataraxos_metadata_enabled and (
+                        self._pending_behavior_log_probs is None
+                        or self._pending_behavior_values is None
+                        or self._pending_behavior_legal is None
+                    ):
+                        raise RuntimeError("saved Ataraxos rollout is missing policy metadata")
+                    if self._ataraxos_metadata_enabled and int(eval_actions[i]) != int(actions[i]):
+                        raise RuntimeError("collector proposed an illegal action that the env repaired")
                     self._traj_actions[i].append(int(eval_actions[i]))
+                    if self._ataraxos_metadata_enabled:
+                        self._traj_behavior_log_probs[i].append(
+                            self._pending_behavior_log_probs[i].tolist()
+                        )
+                        self._traj_behavior_values[i].append(
+                            float(self._pending_behavior_values[i])
+                        )
+                        self._traj_behavior_legal[i].append(
+                            self._pending_behavior_legal[i].tolist()
+                        )
                     self._traj_states[i].append(new_eval)
                 hit_limit = self._lane_steps[i] >= self.turn_limit
                 if lane.ended or hit_limit:
@@ -850,6 +913,9 @@ class VectorizedShowdownEnv(gym.Env):
                     restarted.append(i)
 
         done_mask = terminated | truncated
+        self._pending_behavior_log_probs = None
+        self._pending_behavior_values = None
+        self._pending_behavior_legal = None
         if done_mask.any():
             self.opponent.reset_lanes(done_mask)
         if restarted:
@@ -893,6 +959,17 @@ class VectorizedShowdownEnv(gym.Env):
                 "states": [s.to_dict() for s in self._traj_states[i]],
                 "actions": self._traj_actions[i] + [-1],
             }
+            if self._ataraxos_metadata_enabled:
+                if not (
+                    len(self._traj_behavior_log_probs[i])
+                    == len(self._traj_behavior_values[i])
+                    == len(self._traj_behavior_legal[i])
+                    == len(self._traj_actions[i])
+                ):
+                    raise RuntimeError("Ataraxos collection metadata is not action-aligned")
+                output_json["behavior_log_probs"] = self._traj_behavior_log_probs[i]
+                output_json["behavior_values"] = self._traj_behavior_values[i]
+                output_json["behavior_legal_masks"] = self._traj_behavior_legal[i]
             path = os.path.join(self.save_trajectories_to, filename)
             temp_path = path + ".tmp"
             with lz4.frame.open(temp_path, "wb") as f:

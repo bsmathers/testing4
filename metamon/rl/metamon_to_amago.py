@@ -447,6 +447,13 @@ class VectorizedMetamonAMAGOWrapper(amago.envs.AMAGOEnv):
         self.add_illegal_action_mask_to_obs(obs, info)
         return obs, reward, terminated, truncated, info
 
+    def record_policy_metadata(
+        self, behavior_log_probs, behavior_values, behavior_legal
+    ):
+        self._metamon_env.record_policy_metadata(
+            behavior_log_probs, behavior_values, behavior_legal
+        )
+
     def take_long_break(self):
         if hasattr(self._metamon_env, "take_long_break"):
             self._metamon_env.take_long_break()
@@ -1555,6 +1562,10 @@ class MetamonAMAGODataset(RLDataset):
         missing_acts = torch.tensor(action_infos["missing"] + [True]).unsqueeze(-1)
         obs_torch["missing_action_mask"] = missing_acts
         obs_torch["illegal_actions"] = illegal_actions
+        if "_ataraxos_behavior_legal" in obs_torch:
+            obs_torch["illegal_actions"] = ~obs_torch[
+                "_ataraxos_behavior_legal"
+            ].bool()
         rewards_torch = torch.from_numpy(rewards).unsqueeze(-1)
         dones_torch = torch.from_numpy(dones).unsqueeze(-1)
         time_idxs = torch.arange(len(action_infos["chosen"]) + 1).long().unsqueeze(-1)

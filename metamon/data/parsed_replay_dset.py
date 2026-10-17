@@ -499,6 +499,45 @@ class MetamonDataset(Dataset):
             for k, v in o.items():
                 nested_obs[k].append(v)
 
+        # Online Ataraxos rollouts persist the exact behavior distribution and
+        # behavior-time scalar value.  Keep these aligned with states so random
+        # sequence slicing also retains the bootstrap value at the right edge.
+        if "behavior_log_probs" in data or "behavior_values" in data:
+            from metamon.rl import ataraxos_keys as atx_keys
+
+            behavior_log_probs = data.get("behavior_log_probs")
+            behavior_values = data.get("behavior_values")
+            behavior_legal = data.get("behavior_legal_masks")
+            if behavior_log_probs is None or behavior_values is None or behavior_legal is None:
+                raise ValueError("Ataraxos replay is missing behavior metadata fields")
+            if len(behavior_log_probs) != len(states) - 1:
+                raise ValueError("Ataraxos behavior_log_probs are not action-aligned")
+            if len(behavior_values) != len(states) - 1:
+                raise ValueError("Ataraxos behavior_values are not action-aligned")
+            if len(behavior_legal) != len(states) - 1:
+                raise ValueError("Ataraxos behavior_legal_masks are not action-aligned")
+            num_actions = self.action_space.gym_space.n
+            if any(len(row) != num_actions for row in behavior_log_probs):
+                raise ValueError("Ataraxos behavior distribution has wrong action dimension")
+            nested_obs[atx_keys.BEHAVIOR_LOG_PROBS] = list(behavior_log_probs) + [
+                [0.0] * num_actions
+            ]
+            nested_obs[atx_keys.BEHAVIOR_VALUE] = [
+                [float(v)] for v in behavior_values
+            ] + [[0.0]]
+            nested_obs[atx_keys.BEHAVIOR_VALID] = [[True]] * (len(states) - 1) + [[False]]
+            nested_obs[atx_keys.BEHAVIOR_LEGAL] = list(behavior_legal) + [
+                [False] * num_actions
+            ]
+
+        # A full-game outcome label is available to every offline/online state,
+        # even when the sequence loader later selects a sub-window.
+        from metamon.rl import ataraxos_keys as atx_keys
+
+        final_state = states[-1]
+        outcome = 1.0 if final_state.battle_won else (-1.0 if final_state.battle_lost else 0.0)
+        nested_obs[atx_keys.OUTCOME] = [[outcome]] * len(states)
+
         # Build actions
         action_infos = {"chosen": [], "legal": [], "missing": []}
         for s, a_idx in zip(states, data["actions"][:-1]):
@@ -524,6 +563,38 @@ class MetamonDataset(Dataset):
         )
         dones = np.zeros_like(rewards, dtype=bool)
         dones[-1] = True
+
+        # Compute traces before sequence slicing.  Reconstructing them inside a
+        # random 128-step window would incorrectly cut off future deltas at the
+        # artificial right edge of the window.
+        if atx_keys.BEHAVIOR_VALUE in nested_obs:
+            behavior_v = np.asarray(
+                [row[0] for row in nested_obs[atx_keys.BEHAVIOR_VALUE]],
+                dtype=np.float32,
+            )
+            scaled_rewards = rewards / 100.0
+            delta = (
+                scaled_rewards
+                + (1.0 - dones.astype(np.float32)) * behavior_v[1:]
+                - behavior_v[:-1]
+            )
+
+            def trace(lam: float) -> np.ndarray:
+                out = np.empty_like(delta)
+                carry = 0.0
+                for idx in range(len(delta) - 1, -1, -1):
+                    carry = float(delta[idx]) + lam * (not dones[idx]) * carry
+                    out[idx] = carry
+                return out
+
+            advantage = trace(0.5)
+            value_target = behavior_v[:-1] + trace(0.8)
+            nested_obs[atx_keys.ADVANTAGE] = [
+                [float(v)] for v in advantage
+            ] + [[0.0]]
+            nested_obs[atx_keys.VALUE_TARGET] = [
+                [float(v)] for v in value_target
+            ] + [[0.0]]
 
         # Random slice if max_seq_len specified
         if self.max_seq_len is not None:

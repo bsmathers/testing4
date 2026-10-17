@@ -1,0 +1,11 @@
+"""Reserved replay fields for the Epoch475 Ataraxos experiment."""
+
+SOURCE = "_ataraxos_online_source"
+BEHAVIOR_LOG_PROBS = "_ataraxos_behavior_log_probs"
+BEHAVIOR_VALUE = "_ataraxos_behavior_value"
+BEHAVIOR_VALID = "_ataraxos_behavior_valid"
+BEHAVIOR_LEGAL = "_ataraxos_behavior_legal"
+ADVANTAGE = "_ataraxos_advantage"
+VALUE_TARGET = "_ataraxos_value_target"
+OUTCOME = "_ataraxos_outcome"
+ADV_THRESHOLD = "_ataraxos_adv_threshold"
