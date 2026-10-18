@@ -27,10 +27,10 @@ steps_per_epoch: 1000
 ckpt_interval: 1
 full_state_ckpt_interval: 1
 mixed_precision: "bf16"
-dloader_workers: 32
+dloader_workers: 48
 
-lanes: 96
-n_workers: 8
+lanes: 64
+n_workers: 7
 train_timesteps_per_epoch: 500
 temp_low: 1.0
 temp_high: 1.0

@@ -161,11 +161,14 @@ class AmagoLadderPolicyDriver:
             )
         self.hidden_state = hidden_state
 
-    # Keep partial-lane inference memory bounded. The default remains safe for
-    # 16 GB GPUs; larger dedicated collector GPUs can raise it to recover wider
-    # batches without changing policy behavior.
+    # Keep partial-lane inference memory bounded. Chunk size and the decision to
+    # run a full batch are deliberately separate: using a 64-lane chunk must not
+    # turn a one-active-lane tail into a wasteful 64-lane policy forward.
     _PARTIAL_HIDDEN_CHUNK = max(
         1, int(os.environ.get("METAMON_PARTIAL_HIDDEN_CHUNK", "8"))
+    )
+    _FULL_BATCH_MAX_INACTIVE = max(
+        0, int(os.environ.get("METAMON_FULL_BATCH_MAX_INACTIVE", "8"))
     )
 
     def _snapshot_hidden(self, idx: np.ndarray) -> Optional[dict]:
@@ -192,18 +195,27 @@ class AmagoLadderPolicyDriver:
     @staticmethod
     def _copy_hidden_lanes(src, dst, src_idxs: np.ndarray) -> None:
         """Copy selected source lanes into a compact scratch hidden state."""
-        for dst_i, src_i in enumerate(src_idxs):
-            dst.seq_lens[dst_i].copy_(src.seq_lens[int(src_i)])
-            dst.key_cache.data[:, dst_i].copy_(src.key_cache.data[:, int(src_i)])
-            dst.val_cache.data[:, dst_i].copy_(src.val_cache.data[:, int(src_i)])
+        idx = torch.as_tensor(src_idxs, device=src.seq_lens.device, dtype=torch.long)
+        torch.index_select(src.seq_lens, 0, idx, out=dst.seq_lens)
+        torch.index_select(src.key_cache.data, 1, idx, out=dst.key_cache.data)
+        torch.index_select(src.val_cache.data, 1, idx, out=dst.val_cache.data)
 
     @staticmethod
     def _copy_hidden_lanes_back(src, dst, dst_idxs: np.ndarray) -> None:
         """Scatter a compact scratch hidden state back into selected lanes."""
-        for src_i, dst_i in enumerate(dst_idxs):
-            dst.seq_lens[int(dst_i)].copy_(src.seq_lens[src_i])
-            dst.key_cache.data[:, int(dst_i)].copy_(src.key_cache.data[:, src_i])
-            dst.val_cache.data[:, int(dst_i)].copy_(src.val_cache.data[:, src_i])
+        idx = torch.as_tensor(dst_idxs, device=dst.seq_lens.device, dtype=torch.long)
+        count = len(dst_idxs)
+        dst.seq_lens.index_copy_(0, idx, src.seq_lens[:count])
+        dst.key_cache.data.index_copy_(1, idx, src.key_cache.data[:, :count])
+        dst.val_cache.data.index_copy_(1, idx, src.val_cache.data[:, :count])
+
+    @classmethod
+    def _partial_batch_size(cls, active: int) -> int:
+        """Bucket compact inference to a small set of compile-stable shapes."""
+        size = min(8, cls._PARTIAL_HIDDEN_CHUNK)
+        while size < active:
+            size = min(size * 2, cls._PARTIAL_HIDDEN_CHUNK)
+        return size
 
     def _policy_act(self, obs_list: List[dict], lane_idxs: np.ndarray, hidden_state):
         obs_batch = stack_obs_dicts([obs_list[int(i)] for i in lane_idxs])
@@ -253,10 +265,10 @@ class AmagoLadderPolicyDriver:
         inactive_idxs = np.flatnonzero(~active)
 
         # If only a handful of lanes are inactive, a single full-batch forward is
-        # faster than compacting the active side.  Crucially, cap the snapshot at
-        # _PARTIAL_HIDDEN_CHUNK lanes so this path can never recreate the old
-        # hundreds-of-MiB transient allocation.
-        if len(inactive_idxs) <= self._PARTIAL_HIDDEN_CHUNK:
+        # faster than compacting the active side. Keep this cutoff independent of
+        # the compact-path chunk size so a large chunk cannot force nearly empty
+        # batches through the full policy.
+        if len(inactive_idxs) <= self._FULL_BATCH_MAX_INACTIVE:
             saved = self._snapshot_hidden(inactive_idxs)
             all_idxs = np.arange(self.num_lanes, dtype=np.int64)
             out, self.hidden_state = self._policy_act(
@@ -272,13 +284,25 @@ class AmagoLadderPolicyDriver:
         # rather than materializing a large advanced-indexing gather.
         for start in range(0, len(active_idxs), self._PARTIAL_HIDDEN_CHUNK):
             chunk = active_idxs[start : start + self._PARTIAL_HIDDEN_CHUNK]
+            batch_size = self._partial_batch_size(len(chunk))
+            if batch_size > len(chunk):
+                # Duplicate one real lane only as padding. Policy operations are
+                # batch-independent in eval mode, and padded outputs/state are
+                # discarded below.
+                padded_chunk = np.pad(
+                    chunk,
+                    (0, batch_size - len(chunk)),
+                    mode="edge",
+                )
+            else:
+                padded_chunk = chunk
             scratch = self.policy.traj_encoder.init_hidden_state(
-                len(chunk), self.device
+                batch_size, self.device
             )
-            self._copy_hidden_lanes(self.hidden_state, scratch, chunk)
-            out, scratch = self._policy_act(obs_list, chunk, scratch)
+            self._copy_hidden_lanes(self.hidden_state, scratch, padded_chunk)
+            out, scratch = self._policy_act(obs_list, padded_chunk, scratch)
             self._copy_hidden_lanes_back(scratch, self.hidden_state, chunk)
-            actions[chunk] = out
+            actions[chunk] = out[: len(chunk)]
             del scratch
 
         return actions

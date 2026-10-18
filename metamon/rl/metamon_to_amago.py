@@ -1568,7 +1568,12 @@ class MetamonAMAGODataset(RLDataset):
                 )
                 illegal_actions[i, legal_agent_action] = False
 
-        obs_torch = {k: torch.from_numpy(np.stack(v, axis=0)) for k, v in obs.items()}
+        obs_torch = {
+            k: torch.from_numpy(
+                v if isinstance(v, np.ndarray) else np.stack(v, axis=0)
+            )
+            for k, v in obs.items()
+        }
         missing_acts = torch.tensor(action_infos["missing"] + [True]).unsqueeze(-1)
         obs_torch["missing_action_mask"] = missing_acts
         obs_torch["illegal_actions"] = illegal_actions
