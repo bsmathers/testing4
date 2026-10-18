@@ -784,7 +784,12 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                 ),
                 dim=-1,
             ).cpu().numpy()
-            host_actions = host[:, 0].astype(np.int64, copy=False)
+            # AMAGOEnv.make_action_rep indexes ``action[..., 0]``.  Preserve
+            # the discrete action's trailing singleton dimension here; passing
+            # a flat (lanes,) array makes it select lane 0's action once and
+            # write that same previous-action one-hot into every lane's RL2
+            # input.  The raw vector env accepts either shape after reshape().
+            env_actions = host[:, 0:1].astype(np.int64, copy=False)
             if profile:
                 profile_times["policy_gpu"] += time.perf_counter() - started
                 started = time.perf_counter()
@@ -796,7 +801,7 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             if profile:
                 profile_times["metadata"] += time.perf_counter() - started
                 started = time.perf_counter()
-            *_, terminated, truncated, _ = envs.step(host_actions)
+            *_, terminated, truncated, _ = envs.step(env_actions)
             if profile:
                 profile_times["env_step"] += time.perf_counter() - started
                 started = time.perf_counter()

@@ -469,6 +469,11 @@ class VectorizedMetamonAMAGOWrapper(amago.envs.AMAGOEnv):
             self._metamon_env.resume_from_break()
 
     def step(self, action):
+        # AMAGO's discrete ``make_action_rep`` expects (batch, 1), while its
+        # stock already-vectorized interaction loop passes (batch,). Normalize
+        # at this boundary so each lane receives its own previous-action RL2
+        # feature instead of every lane receiving lane 0's action.
+        action = np.asarray(action).reshape(self.batched_envs, 1)
         next_tstep, reward, terminated, truncated, info = super().step(action)
         done = np.asarray(terminated, dtype=bool) | np.asarray(truncated, dtype=bool)
         if done.any():
