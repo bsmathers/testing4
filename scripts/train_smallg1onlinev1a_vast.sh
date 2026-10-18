@@ -592,58 +592,79 @@ fi
 # marker is published only after collection, replay parsing, and a learner
 # optimizer update all succeed. A failed or interrupted smoke test therefore
 # runs again on the next launch instead of blessing a partial setup.
-SNORLAX_SMOKE_MARKER="${PROVISION_DIR}/snorlax-first-run-smoke-v1.done"
+SNORLAX_SMOKE_MARKER="${PROVISION_DIR}/snorlax-first-run-smoke-v2.done"
 if [[ "${TRAIN_VARIANT}" == "snorlax_v1" && "${SNORLAX_FIRST_RUN_SMOKE}" == "1" \
     && ! -f "${SNORLAX_SMOKE_MARKER}" ]]; then
-  SMOKE_ROOT="$(mktemp -d "${PROVISION_DIR}/snorlax-first-run-smoke-v1.XXXXXX")"
+  SMOKE_ROOT="$(mktemp -d "${PROVISION_DIR}/snorlax-first-run-smoke-v2.XXXXXX")"
   SMOKE_SAVE="${SMOKE_ROOT}/checkpoints"
   SMOKE_BUFFER="${SMOKE_ROOT}/online_buffer"
   cleanup_first_run_smoke() {
     case "${SMOKE_ROOT}" in
-      "${PROVISION_DIR}"/snorlax-first-run-smoke-v1.*) rm -rf -- "${SMOKE_ROOT}" ;;
+      "${PROVISION_DIR}"/snorlax-first-run-smoke-v2.*) rm -rf -- "${SMOKE_ROOT}" ;;
       *) die "Refusing to clean unexpected smoke-test directory: ${SMOKE_ROOT}" ;;
     esac
   }
   trap cleanup_first_run_smoke EXIT
   mkdir -p "${SMOKE_SAVE}" "${SMOKE_BUFFER}/gen1ou"
-  log "Snorlax first-run smoke block 1/4: imports and registered interfaces"
+  log "Snorlax first-run smoke block 1/6: interfaces, retention, and opponent offsets"
   "${PYTHON_BIN}" scripts/snorlax_first_run_smoke.py preflight
 
-  log "Snorlax first-run smoke block 2/4: real checkpoint collection"
+  log "Snorlax first-run smoke block 2/6: deterministic simulator transitions and both POVs"
+  "${PYTHON_BIN}" scripts/snorlax_first_run_smoke.py simulator-transitions
+
+  log "Snorlax first-run smoke block 3/6: production-shape checkpoint collection"
   SMOKE_COLLECTOR_MP="${COLLECTOR_DTYPE}"
   [[ "${SMOKE_COLLECTOR_MP}" == "fp32" ]] && SMOKE_COLLECTOR_MP=no
   env -u SNORLAX_PERSISTENT_ALTERNATION \
     OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 \
     "${PYTHON_BIN}" -m "${RUNNER_MODULE}" \
     --run_config "${RUN_CONFIG}" --mode collect \
-    --run_name snorlax_first_run_collect --lanes 4 --n_workers 1 \
+    --run_name snorlax_first_run_collect --lanes 64 --n_workers 8 \
     --save_dir "${SMOKE_SAVE}" --buffer_dir "${SMOKE_BUFFER}" \
     --base_weights "${ONLINE_WEIGHTS}" --epochs 1 --seed 8675309 \
-    --train_timesteps_per_epoch 256 --dset_max_size 128 --dset_min_size 1 \
+    --train_timesteps_per_epoch 96 --dset_max_size 512 --dset_min_size 1 \
     --val_interval 0 --val_timesteps 1 --mixed_precision "${SMOKE_COLLECTOR_MP}"
 
-  log "Snorlax first-run smoke block 3/4: trajectory schema and learner adapter"
+  log "Snorlax first-run smoke block 4/6: trajectory schema and learner adapter"
   "${PYTHON_BIN}" scripts/snorlax_first_run_smoke.py \
     validate-buffer "${SMOKE_BUFFER}"
 
-  log "Snorlax first-run smoke block 4/4: mixed offline/online optimizer update"
+  log "Snorlax first-run smoke block 5/6: five strict mixed-data optimizer updates and full checkpoint"
   env -u SNORLAX_PERSISTENT_ALTERNATION \
+    METAMON_STRICT_NUMERICS=1 METAMON_STRICT_BATCH_CHECKS=1 \
     "${PYTHON_BIN}" -m "${RUNNER_MODULE}" \
     --run_config "${RUN_CONFIG}" --mode learn \
     --run_name snorlax_first_run_learn --lanes 4 --n_workers 1 \
     --save_dir "${SMOKE_SAVE}" --buffer_dir "${SMOKE_BUFFER}" \
     --base_weights "${ONLINE_WEIGHTS}" --epochs 1 --seed 8675310 \
-    --steps_per_epoch 1 --batch_size_per_gpu 14 --grad_accum 1 \
-    --dloader_workers 0 --dset_max_size 128 --dset_min_size 1 \
+    --steps_per_epoch 5 --batch_size_per_gpu 14 --grad_accum 1 \
+    --dloader_workers 0 --dset_max_size 512 --dset_min_size 1 \
     --initial_online_weight 0.5 --online_weight 0.5 \
     --online_anneal_start_epoch 0 --online_anneal_end_epoch 1 \
-    --ckpt_interval 1 --full_state_ckpt_interval 0 \
+    --ckpt_interval 1 --full_state_ckpt_interval 1 \
     --val_interval 0 --val_timesteps 1 --mixed_precision "${MIXED_PRECISION}"
+
+  log "Snorlax first-run smoke block 6/6: full-state resume and five more finite updates"
+  env -u SNORLAX_PERSISTENT_ALTERNATION \
+    METAMON_STRICT_NUMERICS=1 METAMON_STRICT_BATCH_CHECKS=1 \
+    "${PYTHON_BIN}" -m "${RUNNER_MODULE}" \
+    --run_config "${RUN_CONFIG}" --mode learn \
+    --run_name snorlax_first_run_learn --lanes 4 --n_workers 1 \
+    --save_dir "${SMOKE_SAVE}" --buffer_dir "${SMOKE_BUFFER}" \
+    --resume_training_state --resume_epoch 0 --epochs 2 --seed 8675310 \
+    --steps_per_epoch 5 --batch_size_per_gpu 14 --grad_accum 1 \
+    --dloader_workers 0 --dset_max_size 512 --dset_min_size 1 \
+    --initial_online_weight 0.5 --online_weight 0.5 \
+    --online_anneal_start_epoch 0 --online_anneal_end_epoch 1 \
+    --ckpt_interval 1 --full_state_ckpt_interval 1 \
+    --val_interval 0 --val_timesteps 1 --mixed_precision "${MIXED_PRECISION}"
+  "${PYTHON_BIN}" scripts/snorlax_first_run_smoke.py validate-resume \
+    "${SMOKE_SAVE}/snorlax_first_run_learn/ckpts"
 
   cleanup_first_run_smoke
   trap - EXIT
   write_marker "${SNORLAX_SMOKE_MARKER}" \
-    "Snorlax real collection, schema-v2 parsing, and mixed learner update v1"
+    "Snorlax production collection, transition invariants, retention, and resumed learner v2"
   log "Snorlax first-run smoke test passed; normal startup may proceed"
 elif [[ "${TRAIN_VARIANT}" == "snorlax_v1" && -f "${SNORLAX_SMOKE_MARKER}" ]]; then
   log "Reusing the completed Snorlax first-run smoke-test marker"

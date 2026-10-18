@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import tempfile
 from pathlib import Path
 
 import lz4.frame
@@ -39,15 +40,209 @@ def preflight() -> None:
     )
     if normalized.shape != (4, 1) or normalized[:, 0].tolist() != [2, 5, 1, 7]:
         raise RuntimeError("AMAGO action normalization lost or mixed a lane")
+
+    # Retention must preserve the exact current/-1/-4/-16/-64 lineage, while
+    # early runs must not silently substitute a newer checkpoint for an older
+    # nominal offset.
+    from metamon.rl.ataraxos_online import AtaraxosExperiment
+    from metamon.rl.evaluate import opponent_pool
+    from metamon.rl import pretrained as pretrained_module
+
+    with tempfile.TemporaryDirectory(prefix="snorlax-retention-smoke-") as tmp:
+        ckpt_root = Path(tmp)
+        policy_dir = ckpt_root / "policy_weights"
+        policy_dir.mkdir()
+        for epoch in range(131):
+            (policy_dir / f"policy_epoch_{epoch}.pt").touch()
+        removed = AtaraxosExperiment._prune_numbered_checkpoints(
+            str(policy_dir),
+            prefix="policy_epoch_",
+            suffix=".pt",
+            directories=False,
+        )
+        if removed != 64:
+            raise RuntimeError(f"checkpoint retention removed {removed}, expected 64")
+
+        class _FakeModel:
+            local_ckpt_dir = str(ckpt_root)
+
+            @staticmethod
+            def get_path_to_checkpoint(checkpoint: int) -> str:
+                return str(policy_dir / f"policy_epoch_{checkpoint}.pt")
+
+        original_get = pretrained_module.get_pretrained_model
+        pretrained_module.get_pretrained_model = lambda _name: _FakeModel()
+        try:
+            discovered = opponent_pool._discover_checkpoints(
+                "SnorlaxV1",
+                include_latest=False,
+                min_epoch=None,
+                max_epoch=None,
+                step=None,
+                offsets=[0, 1, 4, 16, 64],
+                update_interval=1,
+            )
+            for path in policy_dir.glob("policy_epoch_*.pt"):
+                path.unlink()
+            for epoch in range(11):
+                (policy_dir / f"policy_epoch_{epoch}.pt").touch()
+            early = opponent_pool._discover_checkpoints(
+                "SnorlaxV1",
+                include_latest=False,
+                min_epoch=None,
+                max_epoch=None,
+                step=None,
+                offsets=[0, 1, 4, 16, 64],
+                update_interval=1,
+            )
+        finally:
+            pretrained_module.get_pretrained_model = original_get
+        if discovered != [66, 114, 126, 129, 130]:
+            raise RuntimeError(f"wrong retained Snorlax offset lineage: {discovered}")
+        if early != [6, 9, 10]:
+            raise RuntimeError(f"early Snorlax offsets were silently substituted: {early}")
     print(
-        "PASS: imports, Snorlax registration, observation space, and "
-        f"{action_dim}-action interface",
+        "PASS: imports, lane-preserving action conversion, exact retention/offset "
+        f"lineage, observation space, and {action_dim}-action interface",
+        flush=True,
+    )
+
+
+def simulator_transitions() -> None:
+    from metamon.env.vectorized.lane import KIND_FORCESWITCH
+    from metamon.env.vectorized.opponent import BatchedOpponent
+    from metamon.env.vectorized.vector_env import VectorizedShowdownEnv
+    from metamon.rl.pretrained import get_pretrained_model
+
+    model = get_pretrained_model("TaurosV1A")
+    action_dim = model.action_space.gym_space.n
+
+    class _CountingOpponent(BatchedOpponent):
+        def __init__(self, lanes: int):
+            self.lanes = lanes
+            self.acts = np.zeros(lanes, dtype=np.int64)
+            self.observes = np.zeros(lanes, dtype=np.int64)
+            self.partial_batches = 0
+            self.reset_count = 0
+
+        def act(self, active: np.ndarray, obs_list: list[dict]) -> np.ndarray:
+            active = np.asarray(active, dtype=bool)
+            if active.any() and not active.all():
+                self.partial_batches += 1
+            self.acts += active.astype(np.int64)
+            choices = np.zeros(self.lanes, dtype=np.int64)
+            for lane in np.flatnonzero(active):
+                illegal = np.asarray(obs_list[int(lane)]["illegal_actions"], dtype=bool)
+                legal = np.flatnonzero(~illegal)
+                if len(legal) == 0:
+                    raise RuntimeError(f"opponent lane {lane} has no legal action")
+                choices[lane] = int(legal[0])
+            return choices
+
+        def observe(self, lane_idx: int, reward: float, action_idx: int) -> None:
+            del reward
+            if not 0 <= int(action_idx) < action_dim:
+                raise RuntimeError(f"observed invalid opponent action {action_idx}")
+            self.observes[lane_idx] += 1
+
+        def reset_lanes(self, done_mask: np.ndarray) -> None:
+            self.reset_count += int(np.asarray(done_mask, dtype=bool).sum())
+
+        def reset_all(self) -> None:
+            return None
+
+    rng = np.random.default_rng(24680)
+    total_forced = 0
+    total_done = 0
+    total_truncated = 0
+    total_partial = 0
+    with tempfile.TemporaryDirectory(prefix="snorlax-simulator-smoke-") as tmp:
+        trajectory_root = Path(tmp)
+        for eval_side in (0, 1):
+            done_before_side = total_done
+            lanes = 8
+            opponent = _CountingOpponent(lanes)
+            side_root = trajectory_root / f"side-{eval_side}"
+            env = VectorizedShowdownEnv(
+                player_team_set=None,
+                opponent_team_set=None,
+                opponent=opponent,
+                opponent_obs_space=model.observation_space,
+                opponent_action_space=model.action_space,
+                eval_obs_space=model.observation_space,
+                eval_action_space=model.action_space,
+                eval_reward_function=model.reward_function,
+                opponent_reward_function=model.reward_function,
+                batched_envs=lanes,
+                battle_format="gen1randombattle",
+                turn_limit=100,
+                save_trajectories_to=str(side_root),
+                n_workers=2,
+                seed=13579 + eval_side,
+                eval_player_side=eval_side,
+            )
+            try:
+                _obs, info = env.reset()
+                for _step in range(240):
+                    total_forced += sum(
+                        lane.request_kind(env.eval_side) == KIND_FORCESWITCH
+                        for lane in env.lanes
+                    )
+                    actions = np.asarray(
+                        [int(rng.choice(legal)) for legal in info["legal_actions"]],
+                        dtype=np.int64,
+                    )
+                    _obs, _rewards, terminated, truncated, info = env.step(actions)
+                    if not np.array_equal(opponent.acts, opponent.observes):
+                        raise RuntimeError(
+                            "opponent recurrent state advanced without exactly one observe"
+                        )
+                    total_done += int(np.asarray(terminated, dtype=bool).sum())
+                    total_truncated += int(np.asarray(truncated, dtype=bool).sum())
+                total_partial += opponent.partial_batches
+                if opponent.reset_count != total_done - done_before_side:
+                    raise RuntimeError("opponent reset count disagrees with completed lanes")
+            finally:
+                env.close()
+
+        files = sorted(trajectory_root.rglob("*.json.lz4"))
+        if not files:
+            raise RuntimeError("simulator transition smoke produced no trajectories")
+        decisive_by_side = {0: 0, 1: 0}
+        for path in files:
+            payload = _read(path)
+            final = payload["states"][-1]
+            won = bool(final.get("battle_won"))
+            lost = bool(final.get("battle_lost"))
+            expected = "WIN" if won else ("LOSS" if lost else "UNRESOLVED")
+            if won and lost or not path.name.endswith(f"_{expected}.json.lz4"):
+                raise RuntimeError(f"POV outcome disagrees with filename: {path.name}")
+            if won or lost:
+                side = 0 if "side-0" in path.parts else 1
+                decisive_by_side[side] += 1
+
+        if any(count == 0 for count in decisive_by_side.values()):
+            raise RuntimeError(
+                f"simulator smoke did not produce decisive outcomes from both POVs: "
+                f"{decisive_by_side}"
+            )
+
+    if total_forced == 0:
+        raise RuntimeError("simulator smoke did not exercise a forced switch")
+    if total_partial == 0:
+        raise RuntimeError("simulator smoke did not exercise a partial opponent batch")
+    if total_done == 0 or total_truncated == 0:
+        raise RuntimeError("simulator smoke did not exercise terminal and timeout resets")
+    print(
+        "PASS: both POVs, forced switches, partial lanes, act/observe accounting, "
+        f"and {total_done} terminal/reset transitions",
         flush=True,
     )
 
 
 def validate_buffer(root: Path) -> None:
     from metamon.data.parsed_replay_dset import MetamonDataset
+    from metamon.rl import ataraxos_keys
     from metamon.rl.metamon_to_amago import MetamonAMAGODataset
     from metamon.rl.pretrained import get_pretrained_model
 
@@ -141,8 +336,60 @@ def validate_buffer(root: Path) -> None:
                 raise RuntimeError(
                     f"learner observation {key!r} is misaligned for {Path(filename).name}"
                 )
+        payload = _read(Path(filename))
+        final = payload["states"][-1]
+        expected_outcome = 1.0 if final.get("battle_won") else (
+            -1.0 if final.get("battle_lost") else 0.0
+        )
+        outcomes = item.obs[ataraxos_keys.OUTCOME]
+        if not np.all(np.asarray(outcomes) == expected_outcome):
+            raise RuntimeError(
+                f"learner outcome target has the wrong POV sign for {Path(filename).name}"
+            )
     print(
         f"PASS: {len(files)} schema-v2 trajectories passed structural and learner parsing checks",
+        flush=True,
+    )
+
+
+def validate_resume(ckpt_root: Path) -> None:
+    import torch
+
+    policies = ckpt_root / "policy_weights"
+    states = ckpt_root / "training_states"
+    policy0 = policies / "policy_epoch_0.pt"
+    policy1 = policies / "policy_epoch_1.pt"
+    state0 = states / "snorlax_first_run_learn_epoch_0"
+    state1 = states / "snorlax_first_run_learn_epoch_1"
+    required = (policy0, policy1, state0, state1)
+    missing = [str(path) for path in required if not path.exists()]
+    if missing:
+        raise RuntimeError(f"checkpoint/resume smoke is missing artifacts: {missing}")
+    if list(ckpt_root.rglob("*.tmp")):
+        raise RuntimeError("checkpoint/resume smoke left an incomplete temporary artifact")
+
+    def load_policy(path: Path) -> dict:
+        try:
+            return torch.load(path, map_location="cpu", weights_only=True)
+        except TypeError:
+            return torch.load(path, map_location="cpu")
+
+    first = load_policy(policy0)
+    resumed = load_policy(policy1)
+    step0 = int(first["_ataraxos_step"].item())
+    step1 = int(resumed["_ataraxos_step"].item())
+    if step0 != 5 or step1 != 10:
+        raise RuntimeError(
+            f"checkpoint/resume optimizer steps are {step0} and {step1}, expected 5 and 10"
+        )
+    for name, tensor in resumed.items():
+        if torch.is_tensor(tensor) and tensor.is_floating_point() and not torch.isfinite(tensor).all():
+            raise RuntimeError(f"resumed policy contains non-finite tensor: {name}")
+    for state_dir in (state0, state1):
+        if not any(path.is_file() and path.stat().st_size > 0 for path in state_dir.rglob("*")):
+            raise RuntimeError(f"full training state is empty: {state_dir}")
+    print(
+        "PASS: full optimizer state resumed from step 5 and advanced to step 10",
         flush=True,
     )
 
@@ -151,11 +398,18 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("preflight")
+    subparsers.add_parser("simulator-transitions")
     validate = subparsers.add_parser("validate-buffer")
     validate.add_argument("root", type=Path)
+    resume = subparsers.add_parser("validate-resume")
+    resume.add_argument("ckpt_root", type=Path)
     args = parser.parse_args()
     if args.command == "preflight":
         preflight()
+    elif args.command == "simulator-transitions":
+        simulator_transitions()
+    elif args.command == "validate-resume":
+        validate_resume(args.ckpt_root)
     else:
         validate_buffer(args.root)
 

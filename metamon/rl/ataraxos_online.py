@@ -902,6 +902,7 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
 
     def train_step(self, batch, log_step: bool):
         self.optimizer.train()
+        strict_numerics = os.environ.get("METAMON_STRICT_NUMERICS") == "1"
         # ``grad_update_counter`` is process-local in AMAGO. The optimizer's
         # group counter is checkpointed and therefore remains authoritative
         # across the one-process-per-epoch alternating launcher.
@@ -924,6 +925,8 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         with self.accelerator.accumulate(self.policy_aclr):
             self.optimizer.zero_grad()
             loss = self.policy_aclr(batch, log_step=log_step)
+            if strict_numerics and not bool(torch.isfinite(loss).all()):
+                raise RuntimeError("Ataraxos smoke update produced a non-finite loss")
             if events:
                 events[1].record()
             reported_loss = loss
@@ -938,6 +941,13 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                 events[2].record()
             if self.accelerator.sync_gradients:
                 self.policy.add_l2sp_gradients()
+                if strict_numerics:
+                    for name, parameter in self.policy.named_parameters():
+                        gradient = parameter.grad
+                        if gradient is not None and not bool(torch.isfinite(gradient).all()):
+                            raise RuntimeError(
+                                f"Ataraxos smoke update produced a non-finite gradient: {name}"
+                            )
                 self.accelerator.clip_grad_norm_(
                     self.policy_aclr.parameters(), self.grad_clip
                 )
@@ -949,6 +959,18 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                 events[3].record()
             self.optimizer.step()
             self.lr_schedule.step()
+            if strict_numerics and self.accelerator.sync_gradients:
+                for name, parameter in self.policy.named_parameters():
+                    if not bool(torch.isfinite(parameter).all()):
+                        raise RuntimeError(
+                            f"Ataraxos smoke update produced a non-finite parameter: {name}"
+                        )
+                for state in self.optimizer.state.values():
+                    for value in state.values():
+                        if torch.is_tensor(value) and not bool(torch.isfinite(value).all()):
+                            raise RuntimeError(
+                                "Ataraxos smoke update produced non-finite optimizer state"
+                            )
             if events:
                 events[4].record()
                 if not hasattr(self, "_learner_profile_events"):
