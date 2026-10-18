@@ -123,7 +123,18 @@ run_log="${PERSIST_ROOT}/logs/vast-bootstrap-and-training.log"
 log "Launching commit ${commit}; progress will also be written to ${run_log}"
 
 export REPO_DIR PERSIST_ROOT GOOD_REPLAYS_DIR PYTHON_BIN
-export COLLECTOR_PROCESSES="${COLLECTOR_PROCESSES:-1}"
+if (( cpu_count >= 64 && vram_mib >= 30000 )); then
+  default_collector_processes=2
+  default_lanes=128
+  default_collector_workers=16
+  default_partial_hidden_chunk=32
+else
+  default_collector_processes=1
+  default_lanes=96
+  default_collector_workers=8
+  default_partial_hidden_chunk=8
+fi
+export COLLECTOR_PROCESSES="${COLLECTOR_PROCESSES:-${default_collector_processes}}"
 export COLLECTOR_DEVICE="${COLLECTOR_DEVICE:-gpu}"
 if [[ -z "${COLLECTOR_DTYPE:-}" ]]; then
   if [[ "${COLLECTOR_DEVICE}" == "cpu" ]]; then
@@ -133,8 +144,9 @@ if [[ -z "${COLLECTOR_DTYPE:-}" ]]; then
   fi
 fi
 export COLLECTOR_DTYPE
-export LANES="${LANES:-96}"
-export COLLECTOR_WORKERS="${COLLECTOR_WORKERS:-8}"
+export LANES="${LANES:-${default_lanes}}"
+export COLLECTOR_WORKERS="${COLLECTOR_WORKERS:-${default_collector_workers}}"
+export METAMON_PARTIAL_HIDDEN_CHUNK="${METAMON_PARTIAL_HIDDEN_CHUNK:-${default_partial_hidden_chunk}}"
 export DLOADER_WORKERS=0
 export BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-14}"
 export GAMES_PER_LEARNER_EPOCH="${GAMES_PER_LEARNER_EPOCH:-2000}"

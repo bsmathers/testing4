@@ -161,11 +161,12 @@ class AmagoLadderPolicyDriver:
             )
         self.hidden_state = hidden_state
 
-    # Keep partial-lane inference memory bounded.  A Tauros-sized transformer KV
-    # cache is large enough that cloning dozens of inactive lanes can OOM a 16 GB
-    # learner/collector GPU.  Eight lanes keeps temporary cache storage small while
-    # preserving a useful amount of batching.
-    _PARTIAL_HIDDEN_CHUNK = 8
+    # Keep partial-lane inference memory bounded. The default remains safe for
+    # 16 GB GPUs; larger dedicated collector GPUs can raise it to recover wider
+    # batches without changing policy behavior.
+    _PARTIAL_HIDDEN_CHUNK = max(
+        1, int(os.environ.get("METAMON_PARTIAL_HIDDEN_CHUNK", "8"))
+    )
 
     def _snapshot_hidden(self, idx: np.ndarray) -> Optional[dict]:
         """Save a *small* set of lanes before a full-batch policy forward."""

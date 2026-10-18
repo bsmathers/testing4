@@ -402,17 +402,31 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                     obs=obs, rl2s=rl2s, time_idxs=tids,
                     sample=sample, hidden_state=hidden_state,
                 )
+            # Collection needs these four small GPU results on the host. Packing
+            # them into one transfer avoids four separate CUDA synchronizations
+            # per environment step, which dominates short cached forwards.
+            action_dim = behavior_lp.shape[-1]
+            host = torch.cat(
+                (
+                    actions.reshape(-1, 1).float(),
+                    behavior_lp.float(),
+                    behavior_v.reshape(-1, 1).float(),
+                    (~obs["illegal_actions"][:, -1].bool()).float(),
+                ),
+                dim=-1,
+            ).cpu().numpy()
+            host_actions = host[:, 0].astype(np.int64, copy=False)
             target = envs.env
             while not hasattr(target, "record_policy_metadata") and hasattr(target, "env"):
                 target = target.env
             if not hasattr(target, "record_policy_metadata"):
                 raise RuntimeError("Ataraxos collection env cannot record policy metadata")
             target.record_policy_metadata(
-                behavior_lp.float().cpu().numpy(),
-                behavior_v.float().cpu().numpy(),
-                (~obs["illegal_actions"][:, -1].bool()).cpu().numpy(),
+                host[:, 1 : 1 + action_dim],
+                host[:, 1 + action_dim],
+                host[:, 2 + action_dim :].astype(bool, copy=False),
             )
-            *_, terminated, truncated, _ = envs.step(actions.squeeze(1).cpu().numpy())
+            *_, terminated, truncated, _ = envs.step(host_actions)
             done = terminated | truncated
             if done.ndim == 2:
                 done = done.squeeze(1)

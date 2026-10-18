@@ -575,6 +575,7 @@ start_collectors() {
   local -a collector_prefix
   local collector_mp="${COLLECTOR_DTYPE}"
   COLLECTOR_PIDS=()
+  log "Starting ${COLLECTOR_PROCESSES} collector process(es), ${LANES} lanes each, ${COLLECTOR_WORKERS} simulator workers each"
   collector_prefix=(env)
   if [[ "${COLLECTOR_DEVICE}" == "cpu" ]]; then
     collector_prefix+=(CUDA_VISIBLE_DEVICES= METAMON_CPU_COLLECTOR=1)
