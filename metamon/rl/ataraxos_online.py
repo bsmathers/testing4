@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import os
 import shutil
 import subprocess
@@ -273,13 +274,24 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             and (entry.name.endswith(".json") or entry.name.endswith(".json.lz4"))
         }
 
-    def _external_collect_phase(self, epoch: int) -> None:
-        """Collect one epoch while retaining this learner and its dataset indexes."""
+    def _stop_external_collectors(self) -> None:
+        children = getattr(self, "_persistent_collectors", [])
+        self._persistent_collectors = []
+        for child, _stream in children:
+            if child.poll() is None:
+                child.terminate()
+        for child, stream in children:
+            try:
+                child.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=10)
+            stream.close()
+
+    def _ensure_external_collectors(self):
         buffer_dir = Path(os.environ["SNORLAX_BUFFER_DIR"])
-        replay_dir = buffer_dir / "gen1ou"
         log_dir = Path(os.environ["SNORLAX_LOG_DIR"])
         latest = os.environ["SNORLAX_LATEST_WEIGHTS"]
-        target = int(os.environ.get("GAMES_PER_LEARNER_EPOCH", "2000"))
         processes = int(os.environ.get("COLLECTOR_PROCESSES", "8"))
         lanes = int(os.environ.get("LANES", "64"))
         workers = int(os.environ.get("COLLECTOR_WORKERS", "8"))
@@ -288,24 +300,28 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         run_config = os.environ["SNORLAX_RUN_CONFIG"]
         module = os.environ.get("RUNNER_MODULE", "metamon.rl.ataraxos_online")
         save_dir = os.environ["METAMON_SAVE_DIR"]
-        baseline = self._replay_names(replay_dir)
-        children: list[tuple[subprocess.Popen, object]] = []
-        self.optimizer.eval()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        print(
-            f"[PersistentCycle] collect epoch={epoch} target={target} "
-            f"processes={processes} lanes={lanes}",
-            flush=True,
-        )
+        pause_file = log_dir / ".persistent-collectors-paused"
+        ack_dir = log_dir / ".persistent-collector-acks"
+        ack_dir.mkdir(parents=True, exist_ok=True)
+        children = getattr(self, "_persistent_collectors", [])
+        if children and all(child.poll() is None for child, _stream in children):
+            return children, pause_file, ack_dir
+        if children:
+            self._stop_external_collectors()
+        pause_file.unlink(missing_ok=True)
+        for ack in ack_dir.glob("*.ready"):
+            ack.unlink()
+        children = []
         try:
             for idx in range(processes):
-                log_path = log_dir / f"collector-epoch-{epoch}-{idx}.log"
+                log_path = log_dir / f"collector-persistent-{idx}.log"
                 stream = log_path.open("a", encoding="utf-8", buffering=1)
                 child_env = dict(os.environ)
                 child_env.pop("SNORLAX_PERSISTENT_ALTERNATION", None)
                 child_env.update(
                     METAMON_RUN_MODE="collect",
+                    SNORLAX_COLLECT_PAUSE_FILE=str(pause_file),
+                    SNORLAX_COLLECT_ACK_FILE=str(ack_dir / f"{idx}.ready"),
                     OMP_NUM_THREADS="1",
                     MKL_NUM_THREADS="1",
                     OPENBLAS_NUM_THREADS="1",
@@ -322,12 +338,44 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                     "--buffer_dir", str(buffer_dir),
                     "--base_weights", latest,
                     "--epochs", "1000000",
-                    "--seed", str(1000 + epoch * processes + idx),
+                    "--seed", str(1000 + idx),
                     "--mixed_precision", collector_mp,
                 ]
                 children.append(
                     (subprocess.Popen(command, env=child_env, stdout=stream, stderr=subprocess.STDOUT), stream)
                 )
+        except BaseException:
+            self._persistent_collectors = children
+            self._stop_external_collectors()
+            raise
+        self._persistent_collectors = children
+        if not getattr(self, "_collector_cleanup_registered", False):
+            atexit.register(self._stop_external_collectors)
+            self._collector_cleanup_registered = True
+        return children, pause_file, ack_dir
+
+    def _external_collect_phase(self, epoch: int) -> None:
+        """Collect with GPU/env processes retained across learner phases."""
+        buffer_dir = Path(os.environ["SNORLAX_BUFFER_DIR"])
+        replay_dir = buffer_dir / "gen1ou"
+        log_dir = Path(os.environ["SNORLAX_LOG_DIR"])
+        target = int(os.environ.get("GAMES_PER_LEARNER_EPOCH", "2000"))
+        processes = int(os.environ.get("COLLECTOR_PROCESSES", "8"))
+        lanes = int(os.environ.get("LANES", "64"))
+        baseline = self._replay_names(replay_dir)
+        self.optimizer.eval()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        children, pause_file, ack_dir = self._ensure_external_collectors()
+        for ack in ack_dir.glob("*.ready"):
+            ack.unlink()
+        pause_file.unlink(missing_ok=True)
+        print(
+            f"[PersistentCycle] collect epoch={epoch} target={target} "
+            f"processes={processes} lanes={lanes}",
+            flush=True,
+        )
+        try:
             fresh = 0
             while fresh < target:
                 time.sleep(10)
@@ -335,21 +383,23 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                     status = child.poll()
                     if status is not None:
                         raise RuntimeError(
-                            f"collector exited with status {status}; inspect {log_dir}/collector-epoch-{epoch}-*.log"
+                            f"collector exited with status {status}; inspect "
+                            f"{log_dir}/collector-persistent-*.log"
                         )
                 fresh = len(self._replay_names(replay_dir) - baseline)
                 print(f"[PersistentCycle] collect epoch={epoch} {fresh}/{target}", flush=True)
-        finally:
-            for child, _stream in children:
-                if child.poll() is None:
-                    child.terminate()
-            for child, stream in children:
-                try:
-                    child.wait(timeout=20)
-                except subprocess.TimeoutExpired:
-                    child.kill()
-                    child.wait(timeout=10)
-                stream.close()
+            pause_file.touch()
+            deadline = time.monotonic() + 30.0
+            while len(list(ack_dir.glob("*.ready"))) < processes:
+                for child, _stream in children:
+                    if child.poll() is not None:
+                        raise RuntimeError("collector exited while entering standby")
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("collectors did not enter standby within 30 seconds")
+                time.sleep(0.25)
+        except BaseException:
+            self._stop_external_collectors()
+            raise
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -649,6 +699,27 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             )
         return result
 
+    def collect_new_training_data(self) -> None:
+        pause_file = os.environ.get("SNORLAX_COLLECT_PAUSE_FILE")
+        ack_file = os.environ.get("SNORLAX_COLLECT_ACK_FILE")
+        resumed = False
+        if pause_file and ack_file and os.path.exists(pause_file):
+            Path(ack_file).touch()
+            print("[PersistentCollector] standby", flush=True)
+            while os.path.exists(pause_file):
+                time.sleep(0.25)
+            Path(ack_file).unlink(missing_ok=True)
+            resumed = True
+        if resumed:
+            # The learner atomically published a new averaged policy while this
+            # collector was paused. Do not carry an old-policy hidden state or a
+            # partially played battle into the new collection phase.
+            self.read_latest_policy()
+            self.train_envs.reset()
+            self.hidden_state = None
+            print("[PersistentCollector] resumed with latest policy", flush=True)
+        return super().collect_new_training_data()
+
     def interact(self, envs, timesteps, hidden_state=None, render=False, save_on_done=False, episodes=None, sample=True):
         # This is the stock AMAGO loop with one deliberate addition before
         # env.step: attach the exact behavior distribution/value to the battle.
@@ -682,6 +753,9 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         profile_times = {name: 0.0 for name in ("hook", "policy_gpu", "metadata", "env_step", "next_obs")}
         profile_steps = 0
         for _ in range(timesteps):
+            pause_file = os.environ.get("SNORLAX_COLLECT_PAUSE_FILE")
+            if pause_file and os.path.exists(pause_file):
+                break
             started = time.perf_counter()
             self.on_interact_step(obs)
             if profile:
