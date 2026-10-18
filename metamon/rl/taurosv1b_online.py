@@ -704,6 +704,28 @@ def main() -> None:
         from metamon.env.vectorized.amago_policy import optimize_policy_for_collection
 
         optimize_policy_for_collection(experiment.policy, experiment.DEVICE)
+        # optimize_policy_for_collection detaches training-only children from
+        # the module, but torch optimizers retain their own strong references to
+        # every original parameter. Collector processes never step an optimizer;
+        # prune those stale references so removed critic/training tensors can
+        # actually leave the GPU and parked collectors can be made lightweight.
+        active_param_ids = {
+            id(parameter) for parameter in experiment.policy.parameters()
+        }
+        optimizer = experiment.optimizer
+        dropped_optimizer_params = 0
+        for group in optimizer.param_groups:
+            original = group["params"]
+            retained = [
+                parameter
+                for parameter in original
+                if id(parameter) in active_param_ids
+            ]
+            dropped_optimizer_params += len(original) - len(retained)
+            group["params"] = retained
+        for parameter in list(optimizer.state):
+            if id(parameter) not in active_param_ids:
+                del optimizer.state[parameter]
         removed = getattr(experiment.policy, "_metamon_removed_children", ())
         dtype = getattr(experiment.policy, "_metamon_collection_dtype", torch.float32)
         cache_len = getattr(
@@ -712,7 +734,8 @@ def main() -> None:
         print(
             "Collector policy optimized: "
             f"dtype={dtype}, kv_cache_len={cache_len}, "
-            f"removed={','.join(removed) or 'none'}",
+            f"removed={','.join(removed) or 'none'}, "
+            f"optimizer_params_released={dropped_optimizer_params}",
             flush=True,
         )
 

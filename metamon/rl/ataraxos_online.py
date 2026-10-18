@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import gc
 import os
 import re
 import shutil
@@ -330,6 +331,35 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         )
         os.replace(temporary, marker)
 
+    @staticmethod
+    def _warm_collectors_have_headroom() -> bool:
+        """Keep parked collectors only when the learner has ample headroom."""
+        min_gpu_gib = float(os.environ.get("SNORLAX_WARM_MIN_GPU_GIB", "12"))
+        min_ram_gib = float(os.environ.get("SNORLAX_WARM_MIN_RAM_GIB", "64"))
+        gpu_free_gib = float("inf")
+        if torch.cuda.is_available():
+            gpu_free, _gpu_total = torch.cuda.mem_get_info()
+            gpu_free_gib = gpu_free / (1024**3)
+        ram_free_gib = float("inf")
+        try:
+            with open("/proc/meminfo", encoding="utf-8") as stream:
+                available_kib = next(
+                    int(line.split()[1])
+                    for line in stream
+                    if line.startswith("MemAvailable:")
+                )
+            ram_free_gib = available_kib / (1024**2)
+        except (OSError, StopIteration, ValueError):
+            pass
+        keep = gpu_free_gib >= min_gpu_gib and ram_free_gib >= min_ram_gib
+        print(
+            "[PersistentCycle] parked collector headroom "
+            f"gpu={gpu_free_gib:.1f}GiB ram={ram_free_gib:.1f}GiB "
+            f"keep_warm={str(keep).lower()}",
+            flush=True,
+        )
+        return keep
+
     def _ensure_external_collectors(self):
         buffer_dir = Path(os.environ["SNORLAX_BUFFER_DIR"])
         log_dir = Path(os.environ["SNORLAX_LOG_DIR"])
@@ -453,10 +483,11 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         except BaseException:
             self._stop_external_collectors()
             raise
-        # Collector processes retain substantial CPU indexes, CUDA contexts,
-        # model weights, and simulator state even while paused. Reap them before
-        # the dataloader and compiled learner allocate their peak memory.
-        self._stop_external_collectors()
+        # Parked collectors explicitly evict actor/opponent weights and KV
+        # caches. Keep their Python/Showdown processes warm only if the host
+        # still has a conservative learner-memory reserve.
+        if not self._warm_collectors_have_headroom():
+            self._stop_external_collectors()
         self._mark_collection_ready(epoch)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -763,8 +794,23 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         ack_file = os.environ.get("SNORLAX_COLLECT_ACK_FILE")
         resumed = False
         if pause_file and ack_file and os.path.exists(pause_file):
+            # Retain the initialized process and Showdown workers but release
+            # the large actor/opponent policies and both sets of KV caches while
+            # the learner owns the GPU.
+            self.hidden_state = None
+            target = self.train_envs.env
+            while not hasattr(target, "opponent") and hasattr(target, "env"):
+                target = target.env
+            opponent = getattr(target, "opponent", None)
+            release = getattr(opponent, "release_gpu_memory", None)
+            if release is not None:
+                release()
+            self.policy.to("cpu")
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             Path(ack_file).touch()
-            print("[PersistentCollector] standby", flush=True)
+            print("[PersistentCollector] standby with GPU state released", flush=True)
             while os.path.exists(pause_file):
                 time.sleep(0.25)
             Path(ack_file).unlink(missing_ok=True)
@@ -773,6 +819,7 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             # The learner atomically published a new averaged policy while this
             # collector was paused. Do not carry an old-policy hidden state or a
             # partially played battle into the new collection phase.
+            self.policy.to(self.DEVICE)
             self.read_latest_policy()
             self.train_envs.reset()
             self.hidden_state = None
