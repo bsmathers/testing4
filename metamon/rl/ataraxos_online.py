@@ -307,7 +307,15 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
                 for t in range(delta.size - 1, -1, -1):
                     carry = float(delta[t]) + 0.5 * (1.0 - float(done[t])) * carry
                     adv[t] = carry
-                values.extend(np.abs(adv).tolist())
+                # Long online games are learned only through the exact-history
+                # prefix (see __getitem__). Compute the gate over the positions
+                # that can actually enter PPO so the requested quantile has its
+                # intended selected fraction.
+                eligible = adv
+                max_seq_len = getattr(self, "max_seq_len", None)
+                if max_seq_len is not None:
+                    eligible = eligible[: int(max_seq_len)]
+                values.extend(np.abs(eligible).tolist())
             except (
                 OSError,
                 KeyError,
