@@ -107,10 +107,10 @@ if (( cpu_count >= 64 && vram_mib >= 30000 )); then
   # several independent coordinators on large hosts instead of making two
   # coordinators manage ever-larger lane batches. The 5090 has ample memory for
   # these actor-only bf16 policies and their compact 33-step KV caches.
-  # Eight coordinators are the validated throughput default. Persistent workers
+  # Twelve coordinators use more of the large host. Persistent workers
   # release their GPU policies/caches during learning and remain warm only when
   # conservative GPU/RAM headroom checks pass.
-  default_collector_processes=8
+  default_collector_processes=12
   default_lanes=64
   default_collector_workers=8
   default_partial_hidden_chunk=64
