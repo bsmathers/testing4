@@ -109,7 +109,7 @@ class TaggedDataset(RLDataset):
 
 
 class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
-    """Low-discrepancy sampling for the configured online-weight ramp."""
+    """Low-discrepancy sampling for the configured online/offline mixture."""
 
     def __init__(self, *, fifo, offline, **kwargs):
         self.adv_threshold = 0.01
@@ -120,14 +120,13 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
         super().__init__(fifo=tagged_fifo, offline=tagged_offline, **kwargs)
 
     def sample_random_trajectory(self):
-        # Deterministic low-discrepancy allocation avoids Bernoulli noise when
-        # the first ramp epochs contain only a handful of online trajectories.
-        # At the 0.5 cap this alternates sources and yields exactly 7/7 in every
-        # batch of 14.
+        # Deterministic low-discrepancy allocation avoids Bernoulli source-count
+        # noise. At the configured 0.5 weight this alternates sources and yields
+        # exactly 7/7 in every batch of 14.
         worker = get_worker_info()
         # Each loader worker owns a private counter. Stagger their phases so
-        # small early-ramp weights are not rounded down independently in every
-        # worker. The 50% cap remains exactly 7/7 in every 14-sample batch.
+        # arbitrary configured weights remain well distributed across workers.
+        # The 50% setting remains exactly 7/7 in every 14-sample batch.
         phase = 0.0 if worker is None else worker.id / float(worker.num_workers)
         before = int(
             self._sample_idx * self.current_online_weight + phase + 1e-9
@@ -249,6 +248,11 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
                 raise RuntimeError(
                     f"invalid online FIFO replay: {filename}: {exc}"
                 ) from exc
+        if unresolved:
+            raise RuntimeError(
+                "Ataraxos FIFO contains unresolved trajectories without a valid "
+                f"terminal zero-sum target: {unresolved}"
+            )
         if not values:
             raise RuntimeError("could not compute Ataraxos advantage threshold from FIFO")
         decisive = wins + losses
