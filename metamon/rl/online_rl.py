@@ -756,6 +756,13 @@ def _apply_async_mode(
     """Configure distributed roles (AMAGO only ships collect/learn helpers)."""
     if mode == "collect":
         experiment = amago.cli_utils.make_experiment_collect_only(experiment)
+        # Snorlax launches a fresh collector process for each collect phase with
+        # an explicit Schedule-Free behavior-policy (y) checkpoint. Reloading
+        # latest/policy.pt here would silently replace y with the averaged x
+        # iterate before the first action. Legacy long-running collectors retain
+        # AMAGO's normal latest-policy polling behavior.
+        if os.environ.get("TRAIN_VARIANT") == "snorlax_v1":
+            experiment.always_load_latest = False
         # AMAGO's collect-only helper forces at least 1,000,000 epochs so that
         # a production collector runs until it is killed.  Respect our CLI
         # contract instead: production explicitly requests 1,000,000 epochs,

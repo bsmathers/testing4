@@ -10,11 +10,15 @@ It is a one-shot remote training run, not a short local experiment.
 - Add a fresh scalar head trained on zero-sum game outcomes.
 - Alternate 2,000 newly collected games with 1,000 learner updates. Retain a
   5,000-game FIFO, or approximately 2.5 learner epochs of online collection.
-- Ramp online sampling linearly from 0% to 50% over the first 100 epochs.
+- Ramp online sampling linearly from 0% to 50% over the first 100 epochs. The offline corpus is intentionally strong; the ramp is retained rather than treated as a source-quality problem.
 - Use batch size 14 with deterministic low-discrepancy source allocation.
 - Use clipped PPO, behavior-policy reverse KL, a decaying uniform-policy magnet,
-  outcome-value regression, and top-quartile absolute-advantage filtering for
-  online positions. The myopic reference policy is uniform over legal actions.
+  and outcome-value regression online. Advantage filtering starts disabled and
+  ramps over epochs 0-100 to retain the top 75% of online positions by absolute
+  advantage (25th-percentile cutoff). Snorlax intentionally omits Ataraxos's
+  additional 0.01 absolute-advantage floor so the final gate really retains at
+  least 75% of online states. The myopic reference policy is uniform over legal
+  actions.
 - Use observed-action cross entropy and outcome-value regression offline.
   Pac-exploratory action labels receive weight 0.25; their value labels retain
   full weight.
@@ -28,10 +32,33 @@ It is a one-shot remote training run, not a short local experiment.
 - Use grouped AdamW rates of 1e-5 for the representation, 2e-5 for the actor,
   and 1e-4 for the new value head. Hold through 100,000 updates, then linearly
   decay over 400,000 updates to 10% of each rate.
-- Apply recent-weighted Schedule-Free averaging with beta 0.8 and r 99. Raw
-  checkpoints, validation, collection, and league play use the averaged model.
+- Apply recent-weighted Schedule-Free averaging with beta 0.8 and r 99.
+  Numbered/latest checkpoints, validation, and league play use the averaged
+  evaluation iterate x. PPO collection uses a separate atomic
+  `latest/behavior_policy.pt` containing the optimizer's gradient-query iterate
+  y, so the behavior policy matches the point where Schedule-Free evaluates the
+  next PPO gradient.
 - Apply a weak L2-SP anchor to the Epoch475 encoder and actor, decaying to zero
   over 100,000 updates.
+- The fresh scalar value head trains immediately, but value-loss gradients into
+  the shared Epoch475 transformer are ramped from 0% to 100% over the first
+  100,000 optimizer updates. This separates critic calibration from early actor
+  representation drift while leaving actor/BC gradients unchanged.
+- Disable timestep/trajectory dropout for Snorlax PPO. Behavior probabilities
+  are recorded in eval mode, so stochastic train-mode dropout would otherwise
+  create non-unit PPO ratios before any parameter update. Ataraxos likewise
+  uses zero dropout in its move network.
+- Online trajectories at most 128 actions are learned in full. For longer
+  online games, PPO/value supervision uses the first 128 actions rather than a
+  random mid-game slice, preserving the exact preceding transformer history
+  used by the collector. Full-game GAE/TD(lambda) targets are computed before
+  this prefix restriction. Offline imitation keeps ordinary random 128-step
+  windows.
+- On the first learner forward after each collection boundary, modules stay in
+  eval behavior for that forward only (autograd remains enabled). This prevents
+  SigmaReparam's train-only spectral-buffer refresh from changing the policy
+  before the first PPO ratio is evaluated; normal train-mode updates resume
+  immediately afterward.
 - Retain the ten newest 50-epoch milestone policy/full-state checkpoints plus
   the current epoch and previous 64 epochs of each type. This keeps every
   configured lineage offset exact while bounding storage. The rolling latest
@@ -43,8 +70,10 @@ It is a one-shot remote training run, not a short local experiment.
   every tenth completed epoch; a validation failure stops the launcher.
 
 The online replay schema stores the exact post-mask behavior log probabilities,
-legal-action mask, and behavior-time scalar value for every action. A persistent
-root from an older experiment is rejected rather than mixed into this run.
+legal-action mask, and behavior-time scalar value for every action. Unresolved
+turn-limit/tie trajectories are excluded from this FIFO because they do not have
+a valid terminal zero-sum target. A persistent root from an older experiment is
+rejected rather than mixed into this run.
 
 ## Permanent configuration
 
@@ -71,6 +100,8 @@ paths can be overridden with the corresponding `STRONG_REPLAYS_*` and
 `GOOD_REPLAYS_DIR` environment variables.
 
 The launcher runs in the foreground and resumes only from complete
-epoch-boundary model/optimizer states. Policy and optimizer-state checkpoints
+epoch-boundary model/optimizer states. The expensive first-run Snorlax smoke
+block remains in the launcher source for manual debugging but is commented out
+and does not execute during production launch. Policy and optimizer-state checkpoints
 are published atomically; an orphan policy from an interrupted save is removed
 before resumed collection. Use a fresh `PERSIST_ROOT` for SnorlaxV1.

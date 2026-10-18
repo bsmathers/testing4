@@ -344,7 +344,7 @@ class OpponentPoolConfig:
                 "for the run to save an epoch / latest/policy.pt."
             )
         name, merged = self.rng.choice(population)
-        return sample_policy_from_merged(name, merged)
+        return sample_policy_from_merged(name, merged, rng=self.rng)
 
     def team_set_for(self, team_set_name: str) -> TeamSet:
         if team_set_name not in self._team_cache:

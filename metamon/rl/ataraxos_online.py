@@ -103,31 +103,77 @@ class TaggedDataset(RLDataset):
             )
             data.obs[keys.ADVANTAGE] = torch.zeros(T, 1)
             data.obs[keys.VALUE_TARGET] = torch.zeros(T, 1)
-        threshold = 0.01 if self.owner is None else self.owner.adv_threshold
+        threshold = 0.0 if self.owner is None else self.owner.adv_threshold
         data.obs[keys.ADV_THRESHOLD] = torch.full((T, 1), float(threshold))
         return data
 
 
 class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
-    """Low-discrepancy sampling for the configured online-weight ramp."""
+    """Low-discrepancy sampling with a conservative advantage-filter ramp."""
+
+    _ADV_QUANTILE_START = 0.0
+    _ADV_QUANTILE_END = 0.25
+    _ADV_FLOOR_START = 0.0
+    _ADV_FLOOR_END = 0.0
+    _ADV_RAMP_END_EPOCH = 100
 
     def __init__(self, *, fifo, offline, **kwargs):
-        self.adv_threshold = 0.01
+        self.adv_threshold = 0.0
+        self.adv_quantile = self._ADV_QUANTILE_START
+        self.adv_floor = self._ADV_FLOOR_START
         self.current_online_weight = 0.0
         self._sample_idx = 0
         tagged_fifo = TaggedDataset(fifo, online=True, owner=self)
         tagged_offline = TaggedDataset(offline, online=False, owner=self)
         super().__init__(fifo=tagged_fifo, offline=tagged_offline, **kwargs)
 
+    def __getitem__(self, i):
+        """Keep online PPO windows aligned with collector history.
+
+        AMAGO ordinarily takes a random max-seq-len slice. A transformer policy
+        cannot reproduce the collector's behavior distribution at the left edge
+        of a mid-episode slice because the preceding trajectory context is gone.
+        For online PPO trajectories longer than the model context, keep the
+        episode prefix instead. Every supervised online token then has exactly
+        the same preceding history as it did during collection. Offline
+        imitation/value data keeps AMAGO's ordinary random-window sampler.
+
+        This intentionally gives up PPO supervision on positions beyond the
+        128-step context in unusually long games rather than use corrupted
+        importance ratios. Advantage/value targets for the retained prefix were
+        computed on the full game before slicing.
+        """
+        self.check_configured()
+        data = self.sample_random_trajectory()
+        if self.max_seq_len is None:
+            return data
+        is_online = bool(data.obs[keys.SOURCE][0, 0].item())
+        if not is_online:
+            return data.random_slice(
+                length=self.max_seq_len, padded_sampling=self.padded_sampling
+            )
+        if len(data) <= self.max_seq_len:
+            return data
+
+        stop = self.max_seq_len
+        tcp = slice(0, stop + 1)
+        tc = slice(0, stop)
+        data.obs = {k: v[tcp] for k, v in data.obs.items()}
+        data.rl2s = data.rl2s[tcp]
+        data.time_idxs = data.time_idxs[tcp]
+        data.dones = data.dones[tc]
+        data.rews = data.rews[tc]
+        data.actions = data.actions[tc]
+        return data
+
     def sample_random_trajectory(self):
-        # Deterministic low-discrepancy allocation avoids Bernoulli noise when
-        # the first ramp epochs contain only a handful of online trajectories.
-        # At the 0.5 cap this alternates sources and yields exactly 7/7 in every
-        # batch of 14.
+        # Deterministic low-discrepancy allocation avoids Bernoulli source-count
+        # noise. At the configured 0.5 weight this alternates sources and yields
+        # exactly 7/7 in every batch of 14.
         worker = get_worker_info()
         # Each loader worker owns a private counter. Stagger their phases so
-        # small early-ramp weights are not rounded down independently in every
-        # worker. The 50% cap remains exactly 7/7 in every 14-sample batch.
+        # arbitrary configured weights remain well distributed across workers.
+        # The 50% setting remains exactly 7/7 in every 14-sample batch.
         phase = 0.0 if worker is None else worker.id / float(worker.num_workers)
         before = int(
             self._sample_idx * self.current_online_weight + phase + 1e-9
@@ -142,6 +188,21 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
         self._sampling_metrics[dataset.dset_name] += 1
         return dataset.sample_random_trajectory()
 
+    @classmethod
+    def _advantage_filter_params(cls, epoch: int) -> tuple[float, float]:
+        """Ramp from no filtering to retaining the top 75% of online states."""
+        end = max(int(cls._ADV_RAMP_END_EPOCH), 1)
+        progress = min(max(float(epoch) / end, 0.0), 1.0)
+        quantile = (
+            cls._ADV_QUANTILE_START
+            + progress * (cls._ADV_QUANTILE_END - cls._ADV_QUANTILE_START)
+        )
+        floor = (
+            cls._ADV_FLOOR_START
+            + progress * (cls._ADV_FLOOR_END - cls._ADV_FLOOR_START)
+        )
+        return float(quantile), float(floor)
+
     def update_dset_weights(self, epoch: int):
         super().update_dset_weights(epoch)
         self.current_online_weight = next(
@@ -149,16 +210,24 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
             if dataset is self.fifo
         )
         self._sample_idx = 0
+        self.adv_quantile, self.adv_floor = self._advantage_filter_params(epoch)
         if self.fifo.ready_for_training and self.current_online_weight > 0.0:
-            self.adv_threshold = self._compute_advantage_threshold()
+            self.adv_threshold = self._compute_advantage_threshold(
+                quantile=self.adv_quantile,
+                floor=self.adv_floor,
+            )
         print(
             f"  [Ataraxos] epoch={epoch} "
             f"online={self.current_online_weight:.4f} "
             f"offline={1.0 - self.current_online_weight:.4f} "
+            f"adv_quantile={self.adv_quantile:.4f} "
+            f"adv_floor={self.adv_floor:.6f} "
             f"adv_threshold={self.adv_threshold:.6f}", flush=True
         )
 
-    def _compute_advantage_threshold(self) -> float:
+    def _compute_advantage_threshold(
+        self, *, quantile: float, floor: float
+    ) -> float:
         parsed = self.fifo.dataset.parsed_replay_dset
         values = []
         wins = losses = unresolved = 0
@@ -238,7 +307,15 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
                 for t in range(delta.size - 1, -1, -1):
                     carry = float(delta[t]) + 0.5 * (1.0 - float(done[t])) * carry
                     adv[t] = carry
-                values.extend(np.abs(adv).tolist())
+                # Long online games are learned only through the exact-history
+                # prefix (see __getitem__). Compute the gate over the positions
+                # that can actually enter PPO so the requested quantile has its
+                # intended selected fraction.
+                eligible = adv
+                max_seq_len = getattr(self, "max_seq_len", None)
+                if max_seq_len is not None:
+                    eligible = eligible[: int(max_seq_len)]
+                values.extend(np.abs(eligible).tolist())
             except (
                 OSError,
                 KeyError,
@@ -249,6 +326,11 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
                 raise RuntimeError(
                     f"invalid online FIFO replay: {filename}: {exc}"
                 ) from exc
+        if unresolved:
+            raise RuntimeError(
+                "Ataraxos FIFO contains unresolved trajectories without a valid "
+                f"terminal zero-sum target: {unresolved}"
+            )
         if not values:
             raise RuntimeError("could not compute Ataraxos advantage threshold from FIFO")
         decisive = wins + losses
@@ -257,7 +339,13 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
                 "Ataraxos FIFO has a one-sided outcome collapse: "
                 f"wins={wins}, losses={losses}, unresolved={unresolved}"
             )
-        return max(float(np.quantile(np.asarray(values), 0.75)), 0.01)
+        if not 0.0 <= quantile <= 1.0:
+            raise ValueError(f"advantage-filter quantile must be in [0, 1], got {quantile}")
+        if floor < 0.0:
+            raise ValueError(f"advantage-filter floor must be nonnegative, got {floor}")
+        if quantile == 0.0 and floor == 0.0:
+            return 0.0
+        return max(float(np.quantile(np.asarray(values), quantile)), float(floor))
 
 
 class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
@@ -317,6 +405,49 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             Path(os.environ["SNORLAX_LOG_DIR"])
             / f"collection-epoch-{epoch}-outcomes.txt"
         )
+
+    @classmethod
+    def _purge_unresolved_online_replays(cls, replay_dir: Path) -> int:
+        """Remove schema-v3 trajectories without a decisive terminal outcome.
+
+        Earlier Snorlax collectors persisted turn-limit boundaries and simulator
+        ties. The learner then interpreted their missing terminal result as a
+        zero payoff, which is not a valid target for an unfinished game. New
+        collectors no longer write these files; this cleanup makes an existing
+        FIFO safe to resume after upgrading.
+        """
+        removed = 0
+        for name in cls._replay_names(replay_dir):
+            path = replay_dir / name
+            try:
+                if name.endswith(".lz4"):
+                    with lz4.frame.open(path, "rb") as stream:
+                        payload = orjson.loads(stream.read())
+                else:
+                    with path.open("rb") as stream:
+                        payload = orjson.loads(stream.read())
+                if payload.get("ataraxos_collector_version") != 3:
+                    continue
+                final = payload["states"][-1]
+                won = bool(final.get("battle_won"))
+                lost = bool(final.get("battle_lost"))
+                if won and lost:
+                    raise ValueError("final state is both won and lost")
+                if not won and not lost:
+                    path.unlink()
+                    removed += 1
+            except (
+                OSError,
+                IndexError,
+                KeyError,
+                TypeError,
+                ValueError,
+                orjson.JSONDecodeError,
+            ) as exc:
+                raise RuntimeError(
+                    f"cannot validate Snorlax FIFO outcome for {path}: {exc}"
+                ) from exc
+        return removed
 
     @classmethod
     def _count_collection_outcomes(
@@ -448,13 +579,58 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         )
         os.replace(temporary, marker)
 
+    def _behavior_policy_path(self) -> str:
+        configured = os.environ.get("SNORLAX_BEHAVIOR_WEIGHTS")
+        if configured:
+            return configured
+        return os.path.join(self.ckpt_dir, "latest", "behavior_policy.pt")
+
+    def _write_behavior_policy(self) -> str:
+        """Publish the Schedule-Free y iterate used for PPO data collection.
+
+        Schedule-Free evaluates gradients at y but validation/checkpoints at the
+        averaged x iterate. In on-policy RL the rollout distribution is part of
+        the objective, so collectors must use y as well; otherwise the very first
+        PPO ratio after collection already includes an optimizer-internal x->y
+        policy change. This conversion is reversible and does not advance the
+        optimizer.
+        """
+        path = self._behavior_policy_path()
+        temporary = path + ".tmp"
+
+        # Persistent collection boundaries leave the optimizer in eval/x mode.
+        # Be defensive on manual entry points so the saved artifact is always y.
+        self.optimizer.eval()
+        self.optimizer.train()
+        try:
+            if self.accelerator.is_main_process:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                torch.save(self.policy.state_dict(), temporary)
+                os.replace(temporary, path)
+            self.accelerator.wait_for_everyone()
+        finally:
+            # Restore x for validation/checkpoint semantics and so repeated calls
+            # are idempotent.
+            self.optimizer.eval()
+        return path
+
     def _external_collect_phase(self, epoch: int) -> dict[str, int | float] | None:
         """Run direct collector subprocesses, matching the fast pre-warm design."""
         buffer_dir = Path(os.environ["SNORLAX_BUFFER_DIR"])
         replay_dir = buffer_dir / "gen1ou"
         log_dir = Path(os.environ["SNORLAX_LOG_DIR"])
-        latest = os.environ["SNORLAX_LATEST_WEIGHTS"]
+        behavior_weights = self._behavior_policy_path()
         target = int(os.environ.get("GAMES_PER_LEARNER_EPOCH", "2000"))
+        removed_unresolved = self._purge_unresolved_online_replays(replay_dir)
+        if removed_unresolved:
+            print(
+                f"[PersistentCycle] removed {removed_unresolved} unresolved "
+                "schema-v3 replay(s) from the FIFO",
+                flush=True,
+            )
+        min_fifo = int(os.environ.get("ONLINE_FIFO_SIZE", "5000"))
+        current_fifo = len(self._replay_names(replay_dir))
+        target = max(target, max(min_fifo - current_fifo, 0))
         processes = int(os.environ.get("COLLECTOR_PROCESSES", "8"))
         lanes = int(os.environ.get("LANES", "64"))
         workers = int(os.environ.get("COLLECTOR_WORKERS", "8"))
@@ -502,7 +678,7 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                     "--n_workers", str(workers),
                     "--save_dir", save_dir,
                     "--buffer_dir", str(buffer_dir),
-                    "--base_weights", latest,
+                    "--base_weights", behavior_weights,
                     "--epochs", "1000000",
                     "--seed", str(1000 + epoch * processes + idx),
                     "--mixed_precision", collector_mp,
@@ -609,14 +785,9 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                 check=False,
             )
         if result.returncode:
-            # Validation is observability, not training state. The policy and
-            # full optimizer checkpoint have already been published atomically;
-            # do not terminate a long training run because an evaluator failed.
-            print(
-                f"[PersistentCycle] WARNING validation epoch={epoch} exited "
-                f"with status {result.returncode}; training will continue; "
-                f"inspect {validation_log}",
-                flush=True,
+            raise RuntimeError(
+                f"validation epoch={epoch} exited with status {result.returncode}; "
+                f"inspect {validation_log}"
             )
 
     def learn(self):
@@ -629,6 +800,11 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         for epoch in range(start_epoch, self.epochs):
             self.epoch = epoch
             self.policy_aclr.eval()
+            behavior_path = self._write_behavior_policy()
+            print(
+                f"[PersistentCycle] behavior policy epoch={epoch} {behavior_path}",
+                flush=True,
+            )
             collection_log = self._external_collect_phase(epoch)
             self.accelerator.wait_for_everyone()
 
@@ -689,12 +865,16 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             del loader
             del self.train_dloader
 
-            if self.ckpt_interval and epoch % self.ckpt_interval == 0:
-                self.save_checkpoint()
+            # Publish the rolling x/y pair so validation can evaluate this
+            # epoch, but do not commit the numbered/full optimizer checkpoint
+            # until validation passes. Otherwise a failed validation could be
+            # bypassed simply by restarting at the next epoch.
             if self.always_save_latest:
                 self.write_latest_policy()
-            self._collection_ready_marker().unlink(missing_ok=True)
             self._external_validation_phase(epoch)
+            if self.ckpt_interval and epoch % self.ckpt_interval == 0:
+                self.save_checkpoint()
+            self._collection_ready_marker().unlink(missing_ok=True)
 
     @classmethod
     def _prune_numbered_checkpoints(
@@ -1011,7 +1191,18 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         return hidden_state, (return_history, special_history)
 
     def train_step(self, batch, log_step: bool):
+        # Schedule-Free leaves parameters at x across collection/checkpoint
+        # boundaries. The first gradient query converts them to y. Evaluate that
+        # first forward with modules in eval mode (autograd remains enabled) so
+        # SigmaReparam buffers are identical to the behavior-policy artifact.
+        # Dropout is also configured to zero, making the pre-update PPO policy
+        # exactly reproducible apart from normal floating-point kernel noise.
+        first_query_after_eval = not bool(
+            self.optimizer.param_groups[0].get("train_mode", False)
+        )
         self.optimizer.train()
+        if first_query_after_eval:
+            self.policy_aclr.eval()
         strict_numerics = os.environ.get("METAMON_STRICT_NUMERICS") == "1"
         # ``grad_update_counter`` is process-local in AMAGO. The optimizer's
         # group counter is checkpointed and therefore remains authoritative
@@ -1034,7 +1225,11 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         # gradient clipping, without changing the update.
         with self.accelerator.accumulate(self.policy_aclr):
             self.optimizer.zero_grad()
-            loss = self.policy_aclr(batch, log_step=log_step)
+            try:
+                loss = self.policy_aclr(batch, log_step=log_step)
+            finally:
+                if first_query_after_eval:
+                    self.policy_aclr.train()
             if strict_numerics and not bool(torch.isfinite(loss).all()):
                 raise RuntimeError("Ataraxos smoke update produced a non-finite loss")
             if events:
@@ -1172,9 +1367,13 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         self.accelerator.wait_for_everyone()
 
     def write_latest_policy(self) -> None:
-        # Collectors and league opponents always consume the averaged policy.
+        # The ordinary latest checkpoint remains the averaged x iterate for
+        # validation/league use. Publish y separately for on-policy PPO
+        # collection, then restore x before returning.
         self.optimizer.eval()
-        return super().write_latest_policy()
+        result = super().write_latest_policy()
+        self._write_behavior_policy()
+        return result
 
 
 def main():

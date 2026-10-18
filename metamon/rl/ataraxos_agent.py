@@ -53,6 +53,7 @@ class AtaraxosAgent(MultiTaskAgent):
         magnet_ceil: float = 0.1,
         l2sp_coef: float = 1e-4,
         l2sp_decay_steps: int = 100_000,
+        value_backbone_warmup_steps: int = 100_000,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -77,6 +78,7 @@ class AtaraxosAgent(MultiTaskAgent):
         self.magnet_ceil = float(magnet_ceil)
         self.l2sp_coef = float(l2sp_coef)
         self.l2sp_decay_steps = int(l2sp_decay_steps)
+        self.value_backbone_warmup_steps = int(value_backbone_warmup_steps)
         self._l2sp_anchor: dict[str, torch.Tensor] | None = None
         self.register_buffer("_ataraxos_step", torch.zeros((), dtype=torch.long))
         self.register_buffer(
@@ -306,7 +308,24 @@ class AtaraxosAgent(MultiTaskAgent):
         log_probs = torch.where(
             probs > 0, probs.clamp_min(1e-30).log(), torch.full_like(probs, -70.0)
         )
-        values = torch.tanh(self.ataraxos_value(s))
+
+        # The scalar outcome head is new, while the actor/trunk come from the
+        # already-strong Epoch475 policy. Let the critic calibrate on the frozen
+        # representation first, then gradually allow value-loss gradients into
+        # the shared transformer. Head gradients are unaffected by this scaling.
+        step = getattr(self, "_ataraxos_host_step", None)
+        if step is None:
+            step = int(self._ataraxos_step.item())
+        if self.value_backbone_warmup_steps <= 0:
+            value_backbone_scale = 1.0
+        else:
+            value_backbone_scale = min(
+                max(step / float(self.value_backbone_warmup_steps), 0.0), 1.0
+            )
+        value_features = (
+            s.detach() + value_backbone_scale * (s - s.detach())
+        )
+        values = torch.tanh(self.ataraxos_value(value_features))
 
         T = batch.actions.shape[1]
         chosen = batch.actions.argmax(dim=-1)
@@ -383,9 +402,6 @@ class AtaraxosAgent(MultiTaskAgent):
             (values[:, :T] - outcome).square(), offline_states
         )
 
-        step = getattr(self, "_ataraxos_host_step", None)
-        if step is None:
-            step = int(self._ataraxos_step.item())
         temperature = (
             self.magnet_coef
             / (self._ataraxos_online_mass.float() + 1.0).pow(self.magnet_decay)
@@ -398,9 +414,9 @@ class AtaraxosAgent(MultiTaskAgent):
             self.offline_policy_coef * offline_ce
             + self.offline_value_coef * offline_value
         )
-        # Weight by the actual trajectory composition of this batch.  This is
-        # essential during the 0 -> 50% ramp: a batch containing one online
-        # trajectory must not receive the same online weight as a 7/7 batch.
+        # Weight by the actual trajectory composition of this batch. Production
+        # Snorlax ramps from offline-only to a 50/50 source mixture, while
+        # ablations may use other source ratios.
         batch_online_fraction = source[:, 0, 0].float().mean()
         loss = (
             batch_online_fraction * online_loss
@@ -431,7 +447,9 @@ class AtaraxosAgent(MultiTaskAgent):
                 "Ataraxos/Behavior KL": behavior_kl.detach(),
                 "Ataraxos/Uniform KL": magnet_kl.detach(),
                 "Ataraxos/Value Loss": online_value.detach(),
+                "Ataraxos/Offline Value Loss": offline_value.detach(),
                 "Ataraxos/Offline CE": offline_ce.detach(),
+                "Ataraxos/Value Backbone Scale": float(value_backbone_scale),
                 "Ataraxos/Magnet Coef": temperature.detach(),
                 "Ataraxos/Online Mass": self._ataraxos_online_mass.detach(),
                 "Ataraxos/Batch Online Fraction": batch_online_fraction.detach(),

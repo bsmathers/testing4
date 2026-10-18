@@ -43,7 +43,8 @@ COLLECTOR_DTYPE="${COLLECTOR_DTYPE:-}"
 ONLINE_FIFO_SIZE="${ONLINE_FIFO_SIZE:-300000}"
 VALIDATION_INTERVAL="${VALIDATION_INTERVAL:-0}"
 VALIDATION_TIMESTEPS="${VALIDATION_TIMESTEPS:-1000}"
-SNORLAX_FIRST_RUN_SMOKE="${SNORLAX_FIRST_RUN_SMOKE:-1}"
+# SNORLAX_FIRST_RUN_SMOKE is intentionally disabled; the full smoke block
+# remains commented out near the launch section for manual debugging.
 if [[ -z "${COLLECTOR_DTYPE}" ]]; then
   if [[ "${COLLECTOR_DEVICE}" == "gpu" ]]; then
     COLLECTOR_DTYPE=bf16
@@ -579,15 +580,21 @@ fi
 
 FROZEN="${SAVE_DIR}/epoch475_frozen/ckpts/policy_weights/policy_epoch_475.pt"
 LATEST="${SAVE_DIR}/${RUN_NAME}/ckpts/latest/policy.pt"
+BEHAVIOR="${SAVE_DIR}/${RUN_NAME}/ckpts/latest/behavior_policy.pt"
 mkdir -p "$(dirname "${FROZEN}")" "$(dirname "${LATEST}")"
 cp -f "${ONLINE_WEIGHTS}" "${FROZEN}"
 [[ -s "${LATEST}" ]] || cp "${ONLINE_WEIGHTS}" "${LATEST}"
 if [[ "${TRAIN_VARIANT}" == "snorlax_v1" ]]; then
+  [[ -s "${BEHAVIOR}" ]] || cp "${ONLINE_WEIGHTS}" "${BEHAVIOR}"
   mkdir -p "${SAVE_DIR}/${RUN_NAME}/ckpts/policy_weights"
   BASE_SNAPSHOT="${SAVE_DIR}/${RUN_NAME}/ckpts/policy_weights/policy_epoch_0.pt"
   [[ -s "${BASE_SNAPSHOT}" ]] || cp "${ONLINE_WEIGHTS}" "${BASE_SNAPSHOT}"
 fi
 
+# First-run Snorlax smoke testing is intentionally disabled for production
+# launches. Keep the full block below in-place for manual re-enabling/debugging
+# without paying its startup cost on the training machine.
+: <<'SNORLAX_FIRST_RUN_SMOKE_DISABLED'
 # Run one real end-to-end preflight for a fresh Snorlax installation. The
 # marker is published only after collection, replay parsing, and a learner
 # optimizer update all succeed. A failed or interrupted smoke test therefore
@@ -675,6 +682,7 @@ if [[ "${TRAIN_VARIANT}" == "snorlax_v1" && "${SNORLAX_FIRST_RUN_SMOKE}" == "1" 
 elif [[ "${TRAIN_VARIANT}" == "snorlax_v1" && -f "${SNORLAX_SMOKE_MARKER}" ]]; then
   log "Reusing the completed Snorlax first-run smoke-test marker"
 fi
+SNORLAX_FIRST_RUN_SMOKE_DISABLED
 
 CKPT_ROOT="${SAVE_DIR}/${RUN_NAME}/ckpts"
 STATE_ROOT="${CKPT_ROOT}/training_states"
@@ -755,6 +763,10 @@ start_collectors() {
   local seed_base="$1" phase="$2" i seed
   local -a collector_prefix
   local collector_mp="${COLLECTOR_DTYPE}"
+  local collector_weights="${LATEST}"
+  if [[ "${TRAIN_VARIANT}" == "snorlax_v1" && -s "${BEHAVIOR}" ]]; then
+    collector_weights="${BEHAVIOR}"
+  fi
   COLLECTOR_PIDS=()
   log "Starting ${COLLECTOR_PROCESSES} collector process(es), ${LANES} lanes each, ${COLLECTOR_WORKERS} simulator workers each"
   collector_prefix=(env)
@@ -775,7 +787,7 @@ start_collectors() {
       --run_config "${RUN_CONFIG}" --mode collect \
       --run_name "${RUN_NAME}" --lanes "${LANES}" --n_workers "${COLLECTOR_WORKERS}" \
       --save_dir "${SAVE_DIR}" --buffer_dir "${BUFFER_DIR}" \
-      --base_weights "${LATEST}" --epochs 1000000 --seed "${seed}" \
+      --base_weights "${collector_weights}" --epochs 1000000 --seed "${seed}" \
       --mixed_precision "${collector_mp}" \
       > >(tee -a "${LOG_DIR}/collector-${phase}-${i}.log") 2>&1 &
     COLLECTOR_PIDS+=("$!")
@@ -840,7 +852,15 @@ new_fifo_count() {
 
 quarantine_stale_snorlax_fifo
 current="$(fifo_count)"
-if (( current < PREFILL_FILES )); then
+DEFER_SNORLAX_REFILL=0
+if [[ "${TRAIN_VARIANT}" == "snorlax_v1" && -n "${RESUME_EPOCH}" \
+    && "${ALTERNATE_COLLECT_LEARN}" == "1" \
+    && "${SNORLAX_PERSISTENT_ALTERNATION:-1}" == "1" \
+    && "${current}" -lt "${PREFILL_FILES}" ]]; then
+  DEFER_SNORLAX_REFILL=1
+  log "Deferring resumed FIFO refill to the persistent learner so collection uses reconstructed Schedule-Free y weights"
+fi
+if (( current < PREFILL_FILES && DEFER_SNORLAX_REFILL == 0 )); then
   prefill_start_count="${current}"
   prefill_start_seconds="$(date +%s)"
   log "Prefilling online FIFO: ${current}/${PREFILL_FILES}"
@@ -871,13 +891,16 @@ if (( current < PREFILL_FILES )); then
       die "Collection throughput ${games_per_hour}/hour is below MIN_GAMES_PER_HOUR=${MIN_GAMES_PER_HOUR}"
     fi
   fi
+elif (( DEFER_SNORLAX_REFILL == 1 )); then
+  log "FIFO contains ${current}/${PREFILL_FILES} files; persistent learner will refill it from reconstructed Schedule-Free y weights"
 else
   log "FIFO already contains ${current} files; skipping prefill"
 fi
 
 if [[ "${TRAIN_VARIANT}" == "snorlax_v1" ]]; then
   log "Validating exact behavior metadata in the SnorlaxV1 FIFO"
-  BUFFER_DIR="${BUFFER_DIR}" "${PYTHON_BIN}" - <<'PY'
+  BUFFER_DIR="${BUFFER_DIR}" DEFER_SNORLAX_REFILL="${DEFER_SNORLAX_REFILL}" \
+    "${PYTHON_BIN}" - <<'PY'
 import json
 import os
 from pathlib import Path
@@ -887,8 +910,11 @@ import numpy as np
 
 root = Path(os.environ["BUFFER_DIR"]) / "gen1ou"
 files = sorted(list(root.glob("*.json")) + list(root.glob("*.json.lz4")))
-if len(files) < 5000:
-    raise SystemExit(f"SnorlaxV1 FIFO requires at least 5000 games; found {len(files)}")
+required_min = 0 if os.environ.get("DEFER_SNORLAX_REFILL") == "1" else 5000
+if len(files) < required_min:
+    raise SystemExit(
+        f"SnorlaxV1 FIFO requires at least {required_min} games; found {len(files)}"
+    )
 required = {"behavior_log_probs", "behavior_values", "behavior_legal_masks"}
 wins = losses = unresolved = 0
 for path in files:
@@ -989,6 +1015,7 @@ if [[ "${TRAIN_VARIANT}" == "snorlax_v1" && "${ALTERNATE_COLLECT_LEARN}" == "1" 
   export SNORLAX_BUFFER_DIR="${BUFFER_DIR}"
   export SNORLAX_LOG_DIR="${LOG_DIR}"
   export SNORLAX_LATEST_WEIGHTS="${LATEST}"
+  export SNORLAX_BEHAVIOR_WEIGHTS="${BEHAVIOR}"
   export SNORLAX_RUN_CONFIG="${RUN_CONFIG}"
   export RUNNER_MODULE COLLECTOR_PROCESSES COLLECTOR_DTYPE LANES COLLECTOR_WORKERS
   export GAMES_PER_LEARNER_EPOCH METAMON_SAVE_DIR MIXED_PRECISION

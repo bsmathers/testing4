@@ -337,7 +337,7 @@ class VectorizedShowdownEnv(gym.Env):
         from metamon.env import get_metamon_teams
         from metamon.rl.evaluate.common import random_choice
 
-        name = str(random_choice(self._player_team_set_config))
+        name = str(random_choice(self._player_team_set_config, rng=self._rng))
         if name not in self._player_team_cache:
             self._player_team_cache[name] = get_metamon_teams(self.battle_format, name)
         return self._player_team_cache[name]
@@ -983,7 +983,16 @@ class VectorizedShowdownEnv(gym.Env):
         timestamp = datetime.now().strftime("%m-%d-%Y-%H:%M:%S")
         opponent_name = self.metamon_opponent_name
 
-        if self.save_trajectories_to is not None:
+        # Snorlax/Ataraxos uses terminal zero-sum outcomes for both GAE and the
+        # fresh value head. A turn-limit boundary (or simulator tie) has no
+        # terminal outcome, so saving it as a zero target would silently label
+        # an unfinished game as a draw. Keep generic replay collection behavior
+        # unchanged, but exclude unresolved schema-v3 rollouts from the online
+        # RL FIFO so collection continues until a decisive game is produced.
+        save_training_trajectory = not (
+            self._ataraxos_metadata_enabled and result == "UNRESOLVED"
+        )
+        if self.save_trajectories_to is not None and save_training_trajectory:
             filename = (
                 f"metamon-{self.metamon_battle_format}-{battle_id}_Unrated_"
                 f"{self.player_username}_vs_{opponent_name}_{timestamp}_{result}.json.lz4"
