@@ -10,7 +10,7 @@ It is a one-shot remote training run, not a short local experiment.
 - Add a fresh scalar head trained on zero-sum game outcomes.
 - Alternate 2,000 newly collected games with 1,000 learner updates. Retain a
   5,000-game FIFO, or approximately 2.5 learner epochs of online collection.
-- Use a fixed 50/50 online/offline learner mixture from epoch 0. This matches the original Snorlax Ataraxos adaptation and avoids an initial block of pure offline behavior cloning that can rapidly move the Epoch475 policy before self-play gradients are present.
+- Ramp online sampling linearly from 0% to 50% over the first 100 epochs. The offline corpus is intentionally strong; the ramp is retained rather than treated as a source-quality problem.
 - Use batch size 14 with deterministic low-discrepancy source allocation.
 - Use clipped PPO, behavior-policy reverse KL, a decaying uniform-policy magnet,
   and outcome-value regression online. Advantage filtering starts disabled and
@@ -36,6 +36,10 @@ It is a one-shot remote training run, not a short local experiment.
   checkpoints, validation, collection, and league play use the averaged model.
 - Apply a weak L2-SP anchor to the Epoch475 encoder and actor, decaying to zero
   over 100,000 updates.
+- The fresh scalar value head trains immediately, but value-loss gradients into
+  the shared Epoch475 transformer are ramped from 0% to 100% over the first
+  100,000 optimizer updates. This separates critic calibration from early actor
+  representation drift while leaving actor/BC gradients unchanged.
 - Retain the ten newest 50-epoch milestone policy/full-state checkpoints plus
   the current epoch and previous 64 epochs of each type. This keeps every
   configured lineage offset exact while bounding storage. The rolling latest
