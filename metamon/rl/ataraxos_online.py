@@ -1179,7 +1179,18 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         return hidden_state, (return_history, special_history)
 
     def train_step(self, batch, log_step: bool):
+        # Schedule-Free leaves parameters at x across collection/checkpoint
+        # boundaries. The first gradient query converts them to y. Evaluate that
+        # first forward with modules in eval mode (autograd remains enabled) so
+        # SigmaReparam buffers are identical to the behavior-policy artifact.
+        # Dropout is also configured to zero, making the pre-update PPO policy
+        # exactly reproducible apart from normal floating-point kernel noise.
+        first_query_after_eval = not bool(
+            self.optimizer.param_groups[0].get("train_mode", False)
+        )
         self.optimizer.train()
+        if first_query_after_eval:
+            self.policy_aclr.eval()
         strict_numerics = os.environ.get("METAMON_STRICT_NUMERICS") == "1"
         # ``grad_update_counter`` is process-local in AMAGO. The optimizer's
         # group counter is checkpointed and therefore remains authoritative
@@ -1202,7 +1213,11 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         # gradient clipping, without changing the update.
         with self.accelerator.accumulate(self.policy_aclr):
             self.optimizer.zero_grad()
-            loss = self.policy_aclr(batch, log_step=log_step)
+            try:
+                loss = self.policy_aclr(batch, log_step=log_step)
+            finally:
+                if first_query_after_eval:
+                    self.policy_aclr.train()
             if strict_numerics and not bool(torch.isfinite(loss).all()):
                 raise RuntimeError("Ataraxos smoke update produced a non-finite loss")
             if events:
