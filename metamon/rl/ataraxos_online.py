@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -126,6 +127,52 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
         tagged_fifo = TaggedDataset(fifo, online=True, owner=self)
         tagged_offline = TaggedDataset(offline, online=False, owner=self)
         super().__init__(fifo=tagged_fifo, offline=tagged_offline, **kwargs)
+
+    _ONLINE_CONTEXT_BURN_IN = 32
+
+    def __getitem__(self, i):
+        """Sample with a context burn-in for online PPO trajectories.
+
+        AMAGO normally takes an arbitrary max-seq-len window. For a transformer
+        policy that is incorrect for stored PPO behavior probabilities at the
+        left edge of a mid-episode window: the collector had the preceding
+        attention context, while the learner would not. Snorlax uses a 32-step
+        left attention window, so prepend 32 context steps and exclude them from
+        behavior-valid losses. Offline imitation keeps AMAGO's ordinary sampler.
+        """
+        self.check_configured()
+        data = self.sample_random_trajectory()
+        if self.max_seq_len is None:
+            return data
+        is_online = bool(data.obs[keys.SOURCE][0, 0].item())
+        if not is_online or len(data) <= self.max_seq_len:
+            return data.random_slice(
+                length=self.max_seq_len, padded_sampling=self.padded_sampling
+            )
+
+        burn_in = min(self._ONLINE_CONTEXT_BURN_IN, self.max_seq_len - 1)
+        train_len = self.max_seq_len - burn_in
+        # Choose the supervised region uniformly, including the terminal end of
+        # long games. The physical slice starts up to burn_in steps earlier.
+        train_start = random.randrange(0, len(data) - train_len + 1)
+        slice_start = max(0, train_start - burn_in)
+        slice_stop = slice_start + self.max_seq_len
+        valid_start = train_start - slice_start
+        valid_stop = valid_start + train_len
+
+        tcp = slice(slice_start, slice_stop + 1)
+        tc = slice(slice_start, slice_stop)
+        data.obs = {k: v[tcp] for k, v in data.obs.items()}
+        data.rl2s = data.rl2s[tcp]
+        data.time_idxs = data.time_idxs[tcp]
+        data.dones = data.dones[tc]
+        data.rews = data.rews[tc]
+        data.actions = data.actions[tc]
+
+        behavior_valid = data.obs[keys.BEHAVIOR_VALID]
+        behavior_valid[:valid_start] = False
+        behavior_valid[valid_stop:] = False
+        return data
 
     def sample_random_trajectory(self):
         # Deterministic low-discrepancy allocation avoids Bernoulli source-count
