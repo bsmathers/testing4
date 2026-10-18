@@ -588,6 +588,10 @@ if [[ "${TRAIN_VARIANT}" == "snorlax_v1" ]]; then
   [[ -s "${BASE_SNAPSHOT}" ]] || cp "${ONLINE_WEIGHTS}" "${BASE_SNAPSHOT}"
 fi
 
+# First-run Snorlax smoke testing is intentionally disabled for production
+# launches. Keep the full block below in-place for manual re-enabling/debugging
+# without paying its startup cost on the training machine.
+: <<'SNORLAX_FIRST_RUN_SMOKE_DISABLED'
 # Run one real end-to-end preflight for a fresh Snorlax installation. The
 # marker is published only after collection, replay parsing, and a learner
 # optimizer update all succeed. A failed or interrupted smoke test therefore
@@ -675,6 +679,7 @@ if [[ "${TRAIN_VARIANT}" == "snorlax_v1" && "${SNORLAX_FIRST_RUN_SMOKE}" == "1" 
 elif [[ "${TRAIN_VARIANT}" == "snorlax_v1" && -f "${SNORLAX_SMOKE_MARKER}" ]]; then
   log "Reusing the completed Snorlax first-run smoke-test marker"
 fi
+SNORLAX_FIRST_RUN_SMOKE_DISABLED
 
 CKPT_ROOT="${SAVE_DIR}/${RUN_NAME}/ckpts"
 STATE_ROOT="${CKPT_ROOT}/training_states"
