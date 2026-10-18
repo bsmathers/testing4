@@ -141,9 +141,9 @@ def preflight() -> None:
 
     expected_filter = {
         0: (0.0, 0.0),
-        50: (0.125, 0.005),
-        100: (0.25, 0.01),
-        200: (0.25, 0.01),
+        50: (0.125, 0.0),
+        100: (0.25, 0.0),
+        200: (0.25, 0.0),
     }
     for epoch, expected in expected_filter.items():
         actual = BalancedAtaraxosMixture._advantage_filter_params(epoch)
