@@ -514,6 +514,11 @@ class MetamonDataset(Dataset):
                 raise ValueError(
                     "Ataraxos replay predates the native outcome and lane/action fixes"
                 )
+            final_online_state = states[-1]
+            if not final_online_state.battle_won and not final_online_state.battle_lost:
+                raise ValueError(
+                    "Ataraxos online replay has no decisive terminal outcome"
+                )
             behavior_log_probs = data.get("behavior_log_probs")
             behavior_values = data.get("behavior_values")
             behavior_legal = data.get("behavior_legal_masks")
