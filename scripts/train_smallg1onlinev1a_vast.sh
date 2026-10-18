@@ -43,6 +43,7 @@ COLLECTOR_DTYPE="${COLLECTOR_DTYPE:-}"
 ONLINE_FIFO_SIZE="${ONLINE_FIFO_SIZE:-300000}"
 VALIDATION_INTERVAL="${VALIDATION_INTERVAL:-0}"
 VALIDATION_TIMESTEPS="${VALIDATION_TIMESTEPS:-1000}"
+SNORLAX_FIRST_RUN_SMOKE="${SNORLAX_FIRST_RUN_SMOKE:-1}"
 if [[ -z "${COLLECTOR_DTYPE}" ]]; then
   if [[ "${COLLECTOR_DEVICE}" == "gpu" ]]; then
     COLLECTOR_DTYPE=bf16
@@ -118,6 +119,7 @@ cd "${REPO_DIR}"
 [[ "${ONLINE_FIFO_SIZE}" =~ ^[1-9][0-9]*$ ]] || die "ONLINE_FIFO_SIZE must be positive"
 [[ "${VALIDATION_INTERVAL}" =~ ^[0-9]+$ ]] || die "VALIDATION_INTERVAL must be non-negative"
 [[ "${VALIDATION_TIMESTEPS}" =~ ^[1-9][0-9]*$ ]] || die "VALIDATION_TIMESTEPS must be positive"
+[[ "${SNORLAX_FIRST_RUN_SMOKE}" =~ ^[01]$ ]] || die "SNORLAX_FIRST_RUN_SMOKE must be 0 or 1"
 if [[ "${COLLECTOR_DEVICE}" == "cpu" && "${COLLECTOR_DTYPE}" != "fp32" ]]; then
   die "CPU collection requires COLLECTOR_DTYPE=fp32"
 fi
@@ -584,6 +586,67 @@ if [[ "${TRAIN_VARIANT}" == "snorlax_v1" ]]; then
   mkdir -p "${SAVE_DIR}/${RUN_NAME}/ckpts/policy_weights"
   BASE_SNAPSHOT="${SAVE_DIR}/${RUN_NAME}/ckpts/policy_weights/policy_epoch_0.pt"
   [[ -s "${BASE_SNAPSHOT}" ]] || cp "${ONLINE_WEIGHTS}" "${BASE_SNAPSHOT}"
+fi
+
+# Run one real end-to-end preflight for a fresh Snorlax installation. The
+# marker is published only after collection, replay parsing, and a learner
+# optimizer update all succeed. A failed or interrupted smoke test therefore
+# runs again on the next launch instead of blessing a partial setup.
+SNORLAX_SMOKE_MARKER="${PROVISION_DIR}/snorlax-first-run-smoke-v1.done"
+if [[ "${TRAIN_VARIANT}" == "snorlax_v1" && "${SNORLAX_FIRST_RUN_SMOKE}" == "1" \
+    && ! -f "${SNORLAX_SMOKE_MARKER}" ]]; then
+  SMOKE_ROOT="$(mktemp -d "${PROVISION_DIR}/snorlax-first-run-smoke-v1.XXXXXX")"
+  SMOKE_SAVE="${SMOKE_ROOT}/checkpoints"
+  SMOKE_BUFFER="${SMOKE_ROOT}/online_buffer"
+  cleanup_first_run_smoke() {
+    case "${SMOKE_ROOT}" in
+      "${PROVISION_DIR}"/snorlax-first-run-smoke-v1.*) rm -rf -- "${SMOKE_ROOT}" ;;
+      *) die "Refusing to clean unexpected smoke-test directory: ${SMOKE_ROOT}" ;;
+    esac
+  }
+  trap cleanup_first_run_smoke EXIT
+  mkdir -p "${SMOKE_SAVE}" "${SMOKE_BUFFER}/gen1ou"
+  log "Snorlax first-run smoke block 1/4: imports and registered interfaces"
+  "${PYTHON_BIN}" scripts/snorlax_first_run_smoke.py preflight
+
+  log "Snorlax first-run smoke block 2/4: real checkpoint collection"
+  SMOKE_COLLECTOR_MP="${COLLECTOR_DTYPE}"
+  [[ "${SMOKE_COLLECTOR_MP}" == "fp32" ]] && SMOKE_COLLECTOR_MP=no
+  env -u SNORLAX_PERSISTENT_ALTERNATION \
+    OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 \
+    "${PYTHON_BIN}" -m "${RUNNER_MODULE}" \
+    --run_config "${RUN_CONFIG}" --mode collect \
+    --run_name snorlax_first_run_collect --lanes 4 --n_workers 1 \
+    --save_dir "${SMOKE_SAVE}" --buffer_dir "${SMOKE_BUFFER}" \
+    --base_weights "${ONLINE_WEIGHTS}" --epochs 1 --seed 8675309 \
+    --train_timesteps_per_epoch 256 --dset_max_size 128 --dset_min_size 1 \
+    --val_interval 0 --val_timesteps 1 --mixed_precision "${SMOKE_COLLECTOR_MP}"
+
+  log "Snorlax first-run smoke block 3/4: trajectory schema and learner adapter"
+  "${PYTHON_BIN}" scripts/snorlax_first_run_smoke.py \
+    validate-buffer "${SMOKE_BUFFER}"
+
+  log "Snorlax first-run smoke block 4/4: mixed offline/online optimizer update"
+  env -u SNORLAX_PERSISTENT_ALTERNATION \
+    "${PYTHON_BIN}" -m "${RUNNER_MODULE}" \
+    --run_config "${RUN_CONFIG}" --mode learn \
+    --run_name snorlax_first_run_learn --lanes 4 --n_workers 1 \
+    --save_dir "${SMOKE_SAVE}" --buffer_dir "${SMOKE_BUFFER}" \
+    --base_weights "${ONLINE_WEIGHTS}" --epochs 1 --seed 8675310 \
+    --steps_per_epoch 1 --batch_size_per_gpu 14 --grad_accum 1 \
+    --dloader_workers 0 --dset_max_size 128 --dset_min_size 1 \
+    --initial_online_weight 0.5 --online_weight 0.5 \
+    --online_anneal_start_epoch 0 --online_anneal_end_epoch 1 \
+    --ckpt_interval 1 --full_state_ckpt_interval 0 \
+    --val_interval 0 --val_timesteps 1 --mixed_precision "${MIXED_PRECISION}"
+
+  cleanup_first_run_smoke
+  trap - EXIT
+  write_marker "${SNORLAX_SMOKE_MARKER}" \
+    "Snorlax real collection, schema-v2 parsing, and mixed learner update v1"
+  log "Snorlax first-run smoke test passed; normal startup may proceed"
+elif [[ "${TRAIN_VARIANT}" == "snorlax_v1" && -f "${SNORLAX_SMOKE_MARKER}" ]]; then
+  log "Reusing the completed Snorlax first-run smoke-test marker"
 fi
 
 CKPT_ROOT="${SAVE_DIR}/${RUN_NAME}/ckpts"
