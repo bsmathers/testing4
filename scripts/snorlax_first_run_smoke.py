@@ -23,6 +23,8 @@ def preflight() -> None:
     # Import the exact entry point so registration and dependency failures occur
     # before the expensive collection block.
     import metamon.rl.ataraxos_online  # noqa: F401
+    import torch
+    from metamon.env.vectorized.amago_policy import normalize_discrete_policy_actions
     from metamon.rl.pretrained import get_pretrained_model
 
     model = get_pretrained_model("TaurosV1A")
@@ -31,6 +33,12 @@ def preflight() -> None:
         raise RuntimeError(f"invalid Snorlax action dimension: {action_dim}")
     if getattr(model.observation_space, "gym_space", None) is None:
         raise RuntimeError("Snorlax observation space was not initialized")
+    lane_actions = torch.tensor([2, 5, 1, 7]).reshape(4, 1, 1)
+    normalized = normalize_discrete_policy_actions(
+        lane_actions, 4, context="smoke policy"
+    )
+    if normalized.shape != (4, 1) or normalized[:, 0].tolist() != [2, 5, 1, 7]:
+        raise RuntimeError("AMAGO action normalization lost or mixed a lane")
     print(
         "PASS: imports, Snorlax registration, observation space, and "
         f"{action_dim}-action interface",

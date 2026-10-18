@@ -25,6 +25,24 @@ _INFERENCE_CHILDREN = frozenset(
 )
 
 
+def normalize_discrete_policy_actions(
+    actions: torch.Tensor, batch_size: int, *, context: str
+) -> torch.Tensor:
+    """Validate AMAGO's rollout shape and remove only its sequence axis.
+
+    AMAGO discrete policies return ``(batch, sequence=1, action=1)`` during
+    one-step inference. Environment boundaries consume ``(batch, action=1)``.
+    Keeping this conversion in one place prevents either singleton dimension
+    from being confused with the lane dimension.
+    """
+    expected = (int(batch_size), 1, 1)
+    if tuple(actions.shape) != expected:
+        raise RuntimeError(
+            f"{context} action batch has shape {tuple(actions.shape)}, expected {expected}"
+        )
+    return actions.reshape(int(batch_size), 1)
+
+
 def collector_inference_dtype(device: torch.device) -> torch.dtype:
     """Resolve the explicitly requested rollout dtype."""
     requested = os.environ.get("METAMON_COLLECTOR_DTYPE", "").strip().lower()
@@ -231,12 +249,10 @@ class AmagoLadderPolicyDriver:
                 hidden_state=hidden_state,
                 sample=self.sample,
             )
-        expected = (len(lane_idxs), 1)
-        if tuple(act_out.shape) != expected:
-            raise RuntimeError(
-                f"policy action batch has shape {tuple(act_out.shape)}, expected {expected}"
-            )
-        out = act_out.squeeze(1).cpu().numpy().astype(np.int64).reshape(-1)
+        env_actions = normalize_discrete_policy_actions(
+            act_out, len(lane_idxs), context="opponent policy"
+        )
+        out = env_actions[:, 0].cpu().numpy().astype(np.int64, copy=False)
         return out, hidden_state
 
     def act(self, active: np.ndarray, obs_list: List[dict]) -> np.ndarray:

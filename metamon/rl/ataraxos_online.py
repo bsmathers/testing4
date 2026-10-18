@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader, get_worker_info
 from metamon.rl import ataraxos_keys as keys
 from metamon.rl import taurosv1b_online as v1b
 from metamon.rl.recent_schedule_free import RecentScheduleFreeAdamW
+from metamon.env.vectorized.amago_policy import normalize_discrete_policy_actions
 
 
 def _fixed_length_collate(samples, *, max_seq_len: int):
@@ -811,19 +812,11 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                     obs=obs, rl2s=rl2s, time_idxs=tids,
                     sample=sample, hidden_state=hidden_state,
                 )
-            # AMAGO keeps the singleton sequence axis during inference:
-            # (lanes, sequence=1, discrete_action=1).  The environment action
-            # below deliberately removes only that sequence axis when packing
-            # the host transfer.  Requiring (lanes, 1) here incorrectly rejects
-            # the standard AMAGO output before collection can begin.
-            expected_actions = (self.parallel_actors, 1, 1)
+            actions = normalize_discrete_policy_actions(
+                actions, self.parallel_actors, context="collector policy"
+            )
             expected_logp = (self.parallel_actors, self.policy.action_dim)
             expected_values = (self.parallel_actors, 1)
-            if tuple(actions.shape) != expected_actions:
-                raise RuntimeError(
-                    f"collector actions have shape {tuple(actions.shape)}, "
-                    f"expected {expected_actions}"
-                )
             if tuple(behavior_lp.shape) != expected_logp:
                 raise RuntimeError(
                     f"collector behavior logits have shape {tuple(behavior_lp.shape)}, "
