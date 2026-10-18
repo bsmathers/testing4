@@ -378,7 +378,11 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         try:
             fresh = 0
             while fresh < target:
-                time.sleep(10)
+                # Collection finishes in about a minute on the target host. A
+                # shorter poll avoids idling for up to ten seconds after the
+                # target has already been written, without burdening the
+                # filesystem with continuous rescans.
+                time.sleep(5)
                 for child, _stream in children:
                     status = child.poll()
                     if status is not None:
