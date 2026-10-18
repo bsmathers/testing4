@@ -239,8 +239,12 @@ def expand_value_list(value) -> list:
     return [value]
 
 
-def random_choice(value):
+def random_choice(value, rng: Optional[random.Random] = None):
     """Draw a single random element from a config value.
+
+    ``rng`` defaults to the module-global generator for backwards compatibility.
+    Seeded experiment paths should pass their owned random.Random so nested
+    checkpoint/temperature/team draws are reproducible too.
 
     Accepts all forms understood by :func:`expand_value_list`, plus one
     additional form for non-uniform sampling:
@@ -257,12 +261,13 @@ def random_choice(value):
 
     instead of repeating ``elite_sets_filled`` four times in a plain list.
     """
+    generator = rng if rng is not None else random
     if isinstance(value, dict) and "weighted" in value:
         mapping = value["weighted"]
         population = list(mapping.keys())
         weights = [float(mapping[k]) for k in population]
-        return random.choices(population, weights=weights, k=1)[0]
-    return random.choice(expand_value_list(value))
+        return generator.choices(population, weights=weights, k=1)[0]
+    return generator.choice(expand_value_list(value))
 
 
 def parse_team_set_config(value: str):
@@ -356,7 +361,11 @@ def expand_agent_pool_entries(base_name: str, merged: dict) -> List[Tuple[str, d
     return [(f"{base_name}-{i}", merged) for i in range(1, num_agents + 1)]
 
 
-def sample_policy_from_merged(name: str, merged: dict) -> PolicySpec:
+def sample_policy_from_merged(
+    name: str,
+    merged: dict,
+    rng: Optional[random.Random] = None,
+) -> PolicySpec:
     """Sample a :class:`PolicySpec` from a ladder-style merged agent config.
 
     Draws from ``checkpoints`` / ``temperatures`` / ``team_set`` (or singular
@@ -365,12 +374,14 @@ def sample_policy_from_merged(name: str, merged: dict) -> PolicySpec:
     """
     model_name = merged.get("model_name", name)
     checkpoint = random_choice(
-        merged.get("checkpoints", merged.get("checkpoint", [None]))
+        merged.get("checkpoints", merged.get("checkpoint", [None])), rng=rng
     )
     temperature = float(
-        random_choice(merged.get("temperatures", merged.get("temperature", [1.0])))
+        random_choice(
+            merged.get("temperatures", merged.get("temperature", [1.0])), rng=rng
+        )
     )
-    team_set = str(random_choice(merged.get("team_set", "competitive")))
+    team_set = str(random_choice(merged.get("team_set", "competitive"), rng=rng))
     battle_backend = str(merged.get("battle_backend", "metamon"))
     return PolicySpec(
         name=name,
