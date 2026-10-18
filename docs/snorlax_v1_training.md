@@ -32,14 +32,33 @@ It is a one-shot remote training run, not a short local experiment.
 - Use grouped AdamW rates of 1e-5 for the representation, 2e-5 for the actor,
   and 1e-4 for the new value head. Hold through 100,000 updates, then linearly
   decay over 400,000 updates to 10% of each rate.
-- Apply recent-weighted Schedule-Free averaging with beta 0.8 and r 99. Raw
-  checkpoints, validation, collection, and league play use the averaged model.
+- Apply recent-weighted Schedule-Free averaging with beta 0.8 and r 99.
+  Numbered/latest checkpoints, validation, and league play use the averaged
+  evaluation iterate x. PPO collection uses a separate atomic
+  `latest/behavior_policy.pt` containing the optimizer's gradient-query iterate
+  y, so the behavior policy matches the point where Schedule-Free evaluates the
+  next PPO gradient.
 - Apply a weak L2-SP anchor to the Epoch475 encoder and actor, decaying to zero
   over 100,000 updates.
 - The fresh scalar value head trains immediately, but value-loss gradients into
   the shared Epoch475 transformer are ramped from 0% to 100% over the first
   100,000 optimizer updates. This separates critic calibration from early actor
   representation drift while leaving actor/BC gradients unchanged.
+- Disable timestep/trajectory dropout for Snorlax PPO. Behavior probabilities
+  are recorded in eval mode, so stochastic train-mode dropout would otherwise
+  create non-unit PPO ratios before any parameter update. Ataraxos likewise
+  uses zero dropout in its move network.
+- Online trajectories at most 128 actions are learned in full. For longer
+  online games, PPO/value supervision uses the first 128 actions rather than a
+  random mid-game slice, preserving the exact preceding transformer history
+  used by the collector. Full-game GAE/TD(lambda) targets are computed before
+  this prefix restriction. Offline imitation keeps ordinary random 128-step
+  windows.
+- On the first learner forward after each collection boundary, modules stay in
+  eval behavior for that forward only (autograd remains enabled). This prevents
+  SigmaReparam's train-only spectral-buffer refresh from changing the policy
+  before the first PPO ratio is evaluated; normal train-mode updates resume
+  immediately afterward.
 - Retain the ten newest 50-epoch milestone policy/full-state checkpoints plus
   the current epoch and previous 64 epochs of each type. This keeps every
   configured lineage offset exact while bounding storage. The rolling latest
@@ -81,6 +100,8 @@ paths can be overridden with the corresponding `STRONG_REPLAYS_*` and
 `GOOD_REPLAYS_DIR` environment variables.
 
 The launcher runs in the foreground and resumes only from complete
-epoch-boundary model/optimizer states. Policy and optimizer-state checkpoints
+epoch-boundary model/optimizer states. The expensive first-run Snorlax smoke
+block remains in the launcher source for manual debugging but is commented out
+and does not execute during production launch. Policy and optimizer-state checkpoints
 are published atomically; an orphan policy from an interrupted save is removed
 before resumed collection. Use a fresh `PERSIST_ROOT` for SnorlaxV1.
