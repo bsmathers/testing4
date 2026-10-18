@@ -756,6 +756,12 @@ def _apply_async_mode(
     """Configure distributed roles (AMAGO only ships collect/learn helpers)."""
     if mode == "collect":
         experiment = amago.cli_utils.make_experiment_collect_only(experiment)
+        # AMAGO's collect-only helper forces at least 1,000,000 epochs so that
+        # a production collector runs until it is killed.  Respect our CLI
+        # contract instead: production explicitly requests 1,000,000 epochs,
+        # while bounded collectors (especially the first-run smoke) must stop
+        # after the requested number of epochs.
+        experiment.epochs = epochs
         experiment.val_timesteps_per_epoch = 0
         experiment.val_interval = None
         return experiment
