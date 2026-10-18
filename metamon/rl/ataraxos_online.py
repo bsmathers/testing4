@@ -319,6 +319,49 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         )
 
     @classmethod
+    def _purge_unresolved_online_replays(cls, replay_dir: Path) -> int:
+        """Remove schema-v3 trajectories without a decisive terminal outcome.
+
+        Earlier Snorlax collectors persisted turn-limit boundaries and simulator
+        ties. The learner then interpreted their missing terminal result as a
+        zero payoff, which is not a valid target for an unfinished game. New
+        collectors no longer write these files; this cleanup makes an existing
+        FIFO safe to resume after upgrading.
+        """
+        removed = 0
+        for name in cls._replay_names(replay_dir):
+            path = replay_dir / name
+            try:
+                if name.endswith(".lz4"):
+                    with lz4.frame.open(path, "rb") as stream:
+                        payload = orjson.loads(stream.read())
+                else:
+                    with path.open("rb") as stream:
+                        payload = orjson.loads(stream.read())
+                if payload.get("ataraxos_collector_version") != 3:
+                    continue
+                final = payload["states"][-1]
+                won = bool(final.get("battle_won"))
+                lost = bool(final.get("battle_lost"))
+                if won and lost:
+                    raise ValueError("final state is both won and lost")
+                if not won and not lost:
+                    path.unlink()
+                    removed += 1
+            except (
+                OSError,
+                IndexError,
+                KeyError,
+                TypeError,
+                ValueError,
+                orjson.JSONDecodeError,
+            ) as exc:
+                raise RuntimeError(
+                    f"cannot validate Snorlax FIFO outcome for {path}: {exc}"
+                ) from exc
+        return removed
+
+    @classmethod
     def _count_collection_outcomes(
         cls, replay_dir: Path, replay_names: set[str]
     ) -> dict[str, int | float]:
@@ -455,6 +498,16 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         log_dir = Path(os.environ["SNORLAX_LOG_DIR"])
         latest = os.environ["SNORLAX_LATEST_WEIGHTS"]
         target = int(os.environ.get("GAMES_PER_LEARNER_EPOCH", "2000"))
+        removed_unresolved = self._purge_unresolved_online_replays(replay_dir)
+        if removed_unresolved:
+            print(
+                f"[PersistentCycle] removed {removed_unresolved} unresolved "
+                "schema-v3 replay(s) from the FIFO",
+                flush=True,
+            )
+        min_fifo = int(os.environ.get("ONLINE_FIFO_SIZE", "5000"))
+        current_fifo = len(self._replay_names(replay_dir))
+        target = max(target, max(min_fifo - current_fifo, 0))
         processes = int(os.environ.get("COLLECTOR_PROCESSES", "8"))
         lanes = int(os.environ.get("LANES", "64"))
         workers = int(os.environ.get("COLLECTOR_WORKERS", "8"))
@@ -609,14 +662,9 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                 check=False,
             )
         if result.returncode:
-            # Validation is observability, not training state. The policy and
-            # full optimizer checkpoint have already been published atomically;
-            # do not terminate a long training run because an evaluator failed.
-            print(
-                f"[PersistentCycle] WARNING validation epoch={epoch} exited "
-                f"with status {result.returncode}; training will continue; "
-                f"inspect {validation_log}",
-                flush=True,
+            raise RuntimeError(
+                f"validation epoch={epoch} exited with status {result.returncode}; "
+                f"inspect {validation_log}"
             )
 
     def learn(self):
