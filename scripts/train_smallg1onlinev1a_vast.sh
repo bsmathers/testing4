@@ -891,6 +891,8 @@ if (( current < PREFILL_FILES && DEFER_SNORLAX_REFILL == 0 )); then
       die "Collection throughput ${games_per_hour}/hour is below MIN_GAMES_PER_HOUR=${MIN_GAMES_PER_HOUR}"
     fi
   fi
+elif (( DEFER_SNORLAX_REFILL == 1 )); then
+  log "FIFO contains ${current}/${PREFILL_FILES} files; persistent learner will refill it from reconstructed Schedule-Free y weights"
 else
   log "FIFO already contains ${current} files; skipping prefill"
 fi
