@@ -311,6 +311,96 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
     def _collection_ready_marker() -> Path:
         return Path(os.environ["SNORLAX_LOG_DIR"]) / ".collection-ready"
 
+    @staticmethod
+    def _collection_outcome_report(epoch: int) -> Path:
+        return (
+            Path(os.environ["SNORLAX_LOG_DIR"])
+            / f"collection-epoch-{epoch}-outcomes.txt"
+        )
+
+    @classmethod
+    def _count_collection_outcomes(
+        cls, replay_dir: Path, replay_names: set[str]
+    ) -> dict[str, int | float]:
+        wins = losses = unresolved = 0
+        for name in replay_names:
+            path = replay_dir / name
+            try:
+                if name.endswith(".lz4"):
+                    with lz4.frame.open(path, "rb") as stream:
+                        payload = orjson.loads(stream.read())
+                else:
+                    with path.open("rb") as stream:
+                        payload = orjson.loads(stream.read())
+                if payload.get("ataraxos_collector_version") != 3:
+                    raise ValueError("trajectory is not Snorlax collector schema v3")
+                final = payload["states"][-1]
+                won = bool(final.get("battle_won"))
+                lost = bool(final.get("battle_lost"))
+                if won and lost:
+                    raise ValueError("final state is both won and lost")
+                if won:
+                    wins += 1
+                elif lost:
+                    losses += 1
+                else:
+                    unresolved += 1
+            except (
+                OSError,
+                IndexError,
+                KeyError,
+                TypeError,
+                ValueError,
+                orjson.JSONDecodeError,
+            ) as exc:
+                raise RuntimeError(
+                    f"cannot determine collection outcome for {path}: {exc}"
+                ) from exc
+        games = wins + losses + unresolved
+        decisive = wins + losses
+        return {
+            "Games": games,
+            "Wins": wins,
+            "Losses": losses,
+            "Unresolved": unresolved,
+            "Win Rate": wins / decisive if decisive else 0.0,
+            "Decisive Fraction": decisive / games if games else 0.0,
+        }
+
+    @classmethod
+    def _write_collection_outcome_report(
+        cls, epoch: int, metrics: dict[str, int | float]
+    ) -> None:
+        report = cls._collection_outcome_report(epoch)
+        temporary = report.with_suffix(".tmp")
+        lines = [f"Collection epoch: {epoch}"]
+        lines.extend(f"{name}: {value}" for name, value in metrics.items())
+        temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        os.replace(temporary, report)
+
+    @classmethod
+    def _read_collection_outcome_report(
+        cls, epoch: int
+    ) -> dict[str, int | float] | None:
+        report = cls._collection_outcome_report(epoch)
+        try:
+            lines = report.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            return None
+        parsed: dict[str, int | float] = {}
+        integer_names = {"Games", "Wins", "Losses", "Unresolved"}
+        for line in lines[1:]:
+            name, separator, raw_value = line.partition(": ")
+            if not separator:
+                raise RuntimeError(f"malformed collection report: {report}")
+            parsed[name] = (
+                int(raw_value) if name in integer_names else float(raw_value)
+            )
+        required = integer_names | {"Win Rate", "Decisive Fraction"}
+        if set(parsed) != required:
+            raise RuntimeError(f"incomplete collection report: {report}")
+        return parsed
+
     def _collection_is_ready(self, epoch: int) -> bool:
         marker = self._collection_ready_marker()
         expected = f"collection complete for learner epoch {epoch}"
@@ -358,7 +448,7 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         )
         os.replace(temporary, marker)
 
-    def _external_collect_phase(self, epoch: int) -> None:
+    def _external_collect_phase(self, epoch: int) -> dict[str, int | float] | None:
         """Run direct collector subprocesses, matching the fast pre-warm design."""
         buffer_dir = Path(os.environ["SNORLAX_BUFFER_DIR"])
         replay_dir = buffer_dir / "gen1ou"
@@ -379,7 +469,7 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                 "resuming learner",
                 flush=True,
             )
-            return
+            return self._read_collection_outcome_report(epoch)
         baseline = self._replay_names(replay_dir)
         self.optimizer.eval()
         if torch.cuda.is_available():
@@ -451,9 +541,20 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                     child.kill()
                     child.wait(timeout=10)
                 stream.close()
+        fresh_names = self._replay_names(replay_dir) - baseline
+        metrics = self._count_collection_outcomes(replay_dir, fresh_names)
+        self._write_collection_outcome_report(epoch, metrics)
+        print(
+            f"[PersistentCycle] outcomes epoch={epoch} "
+            f"wins={metrics['Wins']} losses={metrics['Losses']} "
+            f"unresolved={metrics['Unresolved']} "
+            f"win_rate={metrics['Win Rate']:.4f}",
+            flush=True,
+        )
         self._mark_collection_ready(epoch)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        return metrics
 
     def _external_validation_phase(self, epoch: int) -> None:
         interval = int(os.environ.get("VALIDATION_INTERVAL", "0"))
@@ -528,8 +629,17 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         for epoch in range(start_epoch, self.epochs):
             self.epoch = epoch
             self.policy_aclr.eval()
-            self._external_collect_phase(epoch)
+            collection_log = self._external_collect_phase(epoch)
             self.accelerator.wait_for_everyone()
+
+            if collection_log is not None:
+                self.log(collection_log, key="collection")
+            else:
+                print(
+                    f"[PersistentCycle] collection epoch={epoch} predates "
+                    "per-round outcome logging; W&B starts next round",
+                    flush=True,
+                )
 
             dset_log = self.dataset.on_end_of_collection(experiment=self)
             self.log(dset_log, key="dataset")
