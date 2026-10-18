@@ -764,6 +764,15 @@ class VectorizedShowdownEnv(gym.Env):
         self._configure_player_team_for_reset()
         self._configure_opponent_for_reset(options.get("opponent"))
         self.opponent.reset_all()
+        # ``_advance_lanes`` may need to take opponent-only actions while the
+        # initial battle is settling (for example after an immediate Gen 1
+        # self-KO/forced switch).  Normally these arrays are allocated by
+        # ``step``, but reset reaches that path before the first outer step.
+        self._step_eval_actions = None
+        self._step_opp_actions = np.full(
+            (self.batched_envs,), -1, dtype=np.int64
+        )
+        self._committed_side_actions = {}
         for i in range(self.batched_envs):
             self._start_lane(i)
         self._advance_lanes(list(range(self.batched_envs)))
