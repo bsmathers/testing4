@@ -905,9 +905,17 @@ class VectorizedShowdownEnv(gym.Env):
                     self._traj_states[i].append(new_eval)
                 hit_limit = self._lane_steps[i] >= self.turn_limit
                 if lane.ended or hit_limit:
+                    # AMAGO stores only ``terminated`` in its replay Timestep,
+                    # while this vector env has already auto-reset the lane by
+                    # the time it returns.  Keep a time-limit boundary terminal
+                    # to prevent value targets from bootstrapping into the next
+                    # battle.  ``truncated`` remains set as an explicit label.
                     terminated[i] = bool(lane.ended) or hit_limit
                     truncated[i] = hit_limit and not lane.ended
-                    infos[i]["won"] = bool(new_eval.battle_won)
+                    # A time-limit boundary is terminal for learning, but it is
+                    # not a loss and must not enter win-rate statistics.
+                    if lane.ended and lane.winner is not None:
+                        infos[i]["won"] = lane.side_won(self.eval_side)
                     if self._saving:
                         self._save_lane_outcome(i, new_eval)
                     self._start_lane(i)

@@ -32,6 +32,7 @@ from metamon.interface import (
     UniversalAction,
     UniversalState,
 )
+from metamon.backend.replay_parser.str_parsing import clean_name
 
 _LANE_LOGGER = logging.getLogger("metamon.env.vectorized.lane")
 _LANE_LOGGER.addHandler(logging.NullHandler())
@@ -175,6 +176,24 @@ class StreamBattleLane:
                 for side in SIDES:
                     self._touch_side(side)
             self.ended = True
+
+    def side_won(self, side: str) -> bool:
+        """Return the authoritative Showdown outcome for a physical side.
+
+        ``self.winner`` comes directly from the simulator's ``|win|`` line.  Do
+        not derive evaluation outcomes from ``UniversalState``: that secondary
+        parser is intentionally best-effort and its exceptions are recoverable.
+        """
+        if side not in SIDES:
+            raise ValueError(f"Unknown battle side: {side!r}")
+        if not self.ended or self.winner is None:
+            raise ValueError("Battle has no decisive outcome")
+        player_idx = 0 if side == "p1" else 1
+        players = self._battles[side].players
+        expected = players[player_idx] if len(players) > player_idx else None
+        if not expected:
+            expected = f"{side}-{self.lane_id}"
+        return clean_name(self.winner) == clean_name(expected)
 
     def _on_request(self, side: str, req: dict) -> None:
         self.last_request[side] = req

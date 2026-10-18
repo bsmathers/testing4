@@ -470,6 +470,14 @@ class VectorizedMetamonAMAGOWrapper(amago.envs.AMAGOEnv):
 
     def step(self, action):
         next_tstep, reward, terminated, truncated, info = super().step(action)
+        done = np.asarray(terminated, dtype=bool) | np.asarray(truncated, dtype=bool)
+        if done.any():
+            # One value per completed battle. AMAGO averages special metrics, so
+            # this reports the fraction that ended naturally rather than at the
+            # vector environment's turn limit.
+            info[f"{AMAGO_ENV_LOG_PREFIX} Decisive Fraction"] = (
+                ~np.asarray(truncated, dtype=bool)[done]
+            ).astype(np.float32)
         if "won" in info:
             wins = info["won"]
             publish_battle_outcomes(wins)
