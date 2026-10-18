@@ -337,6 +337,10 @@ def vectorized_ladder_eval(
     wrapped = make_env()
     env = wrapped._metamon_env if hasattr(wrapped, "_metamon_env") else wrapped.env
     num_lanes = env.batched_envs
+    # The pool opponent is always converted to the actor-only collection form.
+    # Do the same to the evaluated policy so dtype, KV-cache length, and the
+    # recurrent action path are identical on both sides of a self-play test.
+    policy = optimize_policy_for_collection(policy, device)
     eval_actor = AmagoBatchedOpponent(
         policy=policy,
         device=device,
@@ -354,6 +358,7 @@ def vectorized_ladder_eval(
     steps = 0
     returns: List[float] = []
     wins: List[float] = []
+    decisive: List[float] = []
     valid_ratios: List[float] = []
     episode_return = np.zeros((num_lanes,), dtype=np.float64)
 
@@ -365,13 +370,27 @@ def vectorized_ladder_eval(
         steps += 1
         episode_return += rewards
 
+        # Mirror AMAGOEnv/SequenceWrapper bookkeeping using the action actually
+        # committed by the environment (rather than a repaired illegal index).
+        # The old unused implementation omitted both observe() and reset_lanes(),
+        # which left rl2/time/KV state stuck across every battle.
+        committed = env._committed_side_actions
+        for i in range(num_lanes):
+            used = committed.get((i, env.eval_side))
+            if used is not None:
+                eval_actor.observe(i, float(rewards[i]), int(used))
+
         done = terminated | truncated
         if done.any():
+            eval_actor.reset_lanes(done)
             done_idx = np.where(done)[0]
             for i in done_idx:
+                if episodes_done >= total_battles:
+                    break
                 episodes_done += 1
                 returns.append(float(episode_return[i]))
                 episode_return[i] = 0.0
+                decisive.append(float(not truncated[i]))
                 won = info.get("won")
                 if isinstance(won, list):
                     if won[i] is not None:
@@ -407,6 +426,10 @@ def vectorized_ladder_eval(
         )
     if wins:
         results[f"Average Win Rate in {env_name}"] = float(np.mean(wins))
+    if decisive:
+        results[f"Average Decisive Fraction in {env_name}"] = float(
+            np.mean(decisive)
+        )
     if valid_ratios:
         results[f"Average Valid Actions in {env_name}"] = float(np.mean(valid_ratios))
     return results

@@ -216,12 +216,19 @@ def pretrained_vs_metamon(
             episodes=total_battles,
         )
     else:
-        agent.env_mode = "already_vectorized"
-        agent.parallel_actors = num_parallel
-        results = agent.evaluate_test(
-            make_env,
+        from metamon.env.vectorized import vectorized_ladder_eval
+
+        # Keep both policies on the same explicit ladder driver. AMAGO's
+        # already-vectorized wrapper otherwise puts the evaluated policy on a
+        # different inference/state-management path from the pool opponent.
+        results = vectorized_ladder_eval(
+            policy=agent.policy,
+            device=agent.DEVICE,
+            make_env=make_env,
+            total_battles=total_battles,
+            action_dim=pretrained_model.action_space.gym_space.n,
+            sample=agent_sample,
             timesteps=max(total_battles * 250 // num_parallel, 250),
-            episodes=total_battles,
         )
     return results
 
