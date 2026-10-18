@@ -673,7 +673,10 @@ class MetamonBackendBattle(pe.AbstractBattle):
         """
         winner = self._mm_battle.winner
         p1 = self.player_role == "p1"
-        if winner is None:
+        # A tie is terminal, but it is neither a win nor a loss for either POV.
+        # Returning False here made ``lost`` (defined as ``not won``) label
+        # every tie as a loss.
+        if winner is None or winner == Winner.TIE:
             return None
         elif p1:
             return winner == Winner.PLAYER_1
