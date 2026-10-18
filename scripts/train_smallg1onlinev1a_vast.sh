@@ -121,8 +121,8 @@ cd "${REPO_DIR}"
 if [[ "${COLLECTOR_DEVICE}" == "cpu" && "${COLLECTOR_DTYPE}" != "fp32" ]]; then
   die "CPU collection requires COLLECTOR_DTYPE=fp32"
 fi
-(( COLLECTOR_WORKERS <= LANES )) \
-  || die "COLLECTOR_WORKERS (${COLLECTOR_WORKERS}) cannot exceed LANES (${LANES})"
+(( LANES % COLLECTOR_WORKERS == 0 )) \
+  || die "LANES (${LANES}) must be divisible by COLLECTOR_WORKERS (${COLLECTOR_WORKERS})"
 
 PROVISION_DIR="${PERSIST_ROOT}/provision"
 RUNTIME_MARKER="${PROVISION_DIR}/python-runtime-v1.done"

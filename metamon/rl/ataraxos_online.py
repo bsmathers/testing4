@@ -17,7 +17,7 @@ import numpy as np
 import orjson
 import torch
 from amago.loading import MAGIC_PAD_VAL, RLDataset, RLData_pad_collate
-from torch.utils.data import DataLoader, get_worker_info
+from torch.utils.data import DataLoader
 
 from metamon.rl import ataraxos_keys as keys
 from metamon.rl import taurosv1b_online as v1b
@@ -114,10 +114,6 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
         self.adv_threshold = 0.01
         self.current_online_weight = 0.0
         self._sample_idx = 0
-        # FIFO filenames are immutable and atomically published. Cache each
-        # validated game's absolute advantages so an epoch only parses the new
-        # arrivals instead of reopening all 5,000 compressed trajectories.
-        self._advantage_cache: dict[str, np.ndarray] = {}
         tagged_fifo = TaggedDataset(fifo, online=True, owner=self)
         tagged_offline = TaggedDataset(offline, online=False, owner=self)
         super().__init__(fifo=tagged_fifo, offline=tagged_offline, **kwargs)
@@ -127,18 +123,8 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
         # the first ramp epochs contain only a handful of online trajectories.
         # At the 0.5 cap this alternates sources and yields exactly 7/7 in every
         # batch of 14.
-        worker = get_worker_info()
-        # Each loader worker owns a private dataset copy and therefore a private
-        # counter. Evenly stagger their phases so tiny early-ramp weights are not
-        # rounded down independently in every worker. At the 0.5 cap every
-        # 14-sample batch still contains exactly seven trajectories per source.
-        phase = 0.0 if worker is None else worker.id / float(worker.num_workers)
-        before = int(
-            self._sample_idx * self.current_online_weight + phase + 1e-9
-        )
-        after = int(
-            (self._sample_idx + 1) * self.current_online_weight + phase + 1e-9
-        )
+        before = int(self._sample_idx * self.current_online_weight + 1e-9)
+        after = int((self._sample_idx + 1) * self.current_online_weight + 1e-9)
         dataset = self.fifo if after > before else self.offline
         self._sample_idx += 1
         if not self.fifo.ready_for_training:
@@ -164,19 +150,9 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
 
     def _compute_advantage_threshold(self) -> float:
         parsed = self.fifo.dataset.parsed_replay_dset
+        values = []
         filenames = list(parsed.filenames)
-        live = set(filenames)
-        self._advantage_cache = {
-            name: value
-            for name, value in self._advantage_cache.items()
-            if name in live
-        }
-        values: list[np.ndarray] = []
         for filename in filenames:
-            cached = self._advantage_cache.get(filename)
-            if cached is not None:
-                values.append(cached)
-                continue
             try:
                 if filename.endswith(".lz4"):
                     with lz4.frame.open(filename, "rb") as f:
@@ -235,9 +211,7 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
                 for t in range(delta.size - 1, -1, -1):
                     carry = float(delta[t]) + 0.5 * (1.0 - float(done[t])) * carry
                     adv[t] = carry
-                absolute = np.abs(adv)
-                self._advantage_cache[filename] = absolute
-                values.append(absolute)
+                values.extend(np.abs(adv).tolist())
             except (
                 OSError,
                 KeyError,
@@ -250,11 +224,7 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
                 ) from exc
         if not values:
             raise RuntimeError("could not compute Ataraxos advantage threshold from FIFO")
-        # Every live online replay has now passed the same numerical/action
-        # checks performed by MetamonDataset.load_filename. The DataLoader is
-        # recreated after this point, so workers inherit the cheaper safe path.
-        parsed.validate_behavior_metadata = False
-        return max(float(np.quantile(np.concatenate(values), 0.75)), 0.01)
+        return max(float(np.quantile(np.asarray(values), 0.75)), 0.01)
 
 
 class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
@@ -283,8 +253,8 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         # to spend about a minute compiling a new forward/backward graph at the
         # start of learner phases. A fixed right-padded shape is loss-equivalent:
         # Ataraxos already masks every MAGIC_PAD_VAL timestep.
-        loader_kwargs = dict(
-            dataset=self.dataset,
+        train_dloader = DataLoader(
+            self.dataset,
             batch_size=self.batch_size,
             num_workers=self.dloader_workers,
             collate_fn=partial(
@@ -292,30 +262,17 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             ),
             pin_memory=True,
         )
-        if self.dloader_workers > 0:
-            # Replay decoding/observation construction is CPU-heavy and has
-            # variable latency. Keep the queue bounded at two batches/worker:
-            # deeper queues waste substantial work when each 1,000-step epoch
-            # destroys and rebuilds its loader after refreshing the FIFO.
-            loader_kwargs["prefetch_factor"] = 2
-        train_dloader = DataLoader(
-            **loader_kwargs,
-        )
         self.train_dloader = self.accelerator.prepare(train_dloader)
         return self.train_dloader
 
     @staticmethod
-    def _replay_count(root: Path) -> int:
-        try:
-            with os.scandir(root) as entries:
-                return sum(
-                    1
-                    for entry in entries
-                    if entry.is_file()
-                    and entry.name.endswith((".json", ".json.lz4"))
-                )
-        except FileNotFoundError:
-            return 0
+    def _replay_names(root: Path) -> set[str]:
+        return {
+            entry.name
+            for entry in os.scandir(root)
+            if entry.is_file()
+            and (entry.name.endswith(".json") or entry.name.endswith(".json.lz4"))
+        }
 
     @staticmethod
     def _collection_ready_marker() -> Path:
@@ -346,12 +303,6 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             ready = bool(matches and int(matches[-1][0]) >= int(matches[-1][1]))
             if ready:
                 self._mark_collection_ready(epoch)
-        # A retained log/marker must not skip collection after the buffer was
-        # erased or only partially restored on a replacement instance.
-        min_fifo = int(os.environ.get("ONLINE_FIFO_SIZE", "5000"))
-        replay_dir = Path(os.environ["SNORLAX_BUFFER_DIR"]) / "gen1ou"
-        if ready and self._replay_count(replay_dir) < min_fifo:
-            ready = False
         if not ready:
             marker.unlink(missing_ok=True)
         return ready
@@ -386,7 +337,7 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                 flush=True,
             )
             return
-        baseline_count = self._replay_count(replay_dir)
+        baseline = self._replay_names(replay_dir)
         self.optimizer.eval()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -435,12 +386,8 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                     )
                 )
             fresh = 0
-            polls = 0
             while fresh < target:
-                # Collection is fast enough that a ten-second poll overshoots by
-                # hundreds of games. One directory scan per second is cheap for
-                # the bounded FIFO and stops the GPU/CPU workers promptly.
-                time.sleep(1)
+                time.sleep(10)
                 for child, _stream in children:
                     status = child.poll()
                     if status is not None:
@@ -448,13 +395,8 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                             f"collector exited with status {status}; inspect "
                             f"{log_dir}/collector-epoch-{epoch}-*.log"
                         )
-                fresh = max(self._replay_count(replay_dir) - baseline_count, 0)
-                polls += 1
-                if polls % 5 == 0 or fresh >= target:
-                    print(
-                        f"[PersistentCycle] collect epoch={epoch} {fresh}/{target}",
-                        flush=True,
-                    )
+                fresh = len(self._replay_names(replay_dir) - baseline)
+                print(f"[PersistentCycle] collect epoch={epoch} {fresh}/{target}", flush=True)
         finally:
             for child, _stream in children:
                 if child.poll() is None:

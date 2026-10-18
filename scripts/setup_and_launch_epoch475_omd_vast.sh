@@ -111,10 +111,7 @@ if (( cpu_count >= 64 && vram_mib >= 30000 )); then
   # reaped before each learner phase so collector state cannot OOM the learner.
   default_collector_processes=8
   default_lanes=64
-  # Eight Python coordinators plus seven simulator workers each consume at most
-  # the 64 CPUs provisioned for collection (8 + 8*7), without the old 72-way
-  # oversubscription.
-  default_collector_workers=7
+  default_collector_workers=8
   default_partial_hidden_chunk=64
 else
   default_collector_processes=1
@@ -135,10 +132,7 @@ export COLLECTOR_DTYPE
 export LANES="${LANES:-${default_lanes}}"
 export COLLECTOR_WORKERS="${COLLECTOR_WORKERS:-${default_collector_workers}}"
 export METAMON_PARTIAL_HIDDEN_CHUNK="${METAMON_PARTIAL_HIDDEN_CHUNK:-${default_partial_hidden_chunk}}"
-export METAMON_FULL_BATCH_MAX_INACTIVE="${METAMON_FULL_BATCH_MAX_INACTIVE:-8}"
-# Collection is stopped before learning, so the loader can use the otherwise
-# idle CPUs while retaining headroom for the learner, filesystem, and OS.
-export DLOADER_WORKERS="${DLOADER_WORKERS:-48}"
+export DLOADER_WORKERS="${DLOADER_WORKERS:-32}"
 export MIXED_PRECISION="${MIXED_PRECISION:-bf16}"
 export METAMON_LOG_INTERVAL="${METAMON_LOG_INTERVAL:-50}"
 export BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-14}"

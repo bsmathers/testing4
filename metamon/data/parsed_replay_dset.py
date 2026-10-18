@@ -531,50 +531,35 @@ class MetamonDataset(Dataset):
                 raise ValueError("Ataraxos behavior values have wrong shape")
             if legal.shape != logp.shape:
                 raise ValueError("Ataraxos behavior legal masks have wrong shape")
-            # Snorlax validates every FIFO file once in the parent learner while
-            # computing its per-epoch advantage threshold. Loader workers can
-            # then skip these repeated O(T*A) checks on every random resample.
-            # Other callers retain strict validation by default.
-            if getattr(self, "validate_behavior_metadata", True):
-                if not np.isfinite(logp).all() or not np.isfinite(values).all():
-                    raise ValueError(
-                        "Ataraxos behavior metadata contains non-finite values"
-                    )
-                if np.any(np.abs(values) > 1.0001):
-                    raise ValueError("Ataraxos behavior values fall outside [-1, 1]")
-                probs = np.exp(logp)
-                if not np.allclose(probs.sum(-1), 1.0, atol=2e-3, rtol=0.0):
-                    raise ValueError(
-                        "Ataraxos behavior probabilities do not sum to one"
-                    )
-                if np.any(probs[~legal] > 1e-8):
-                    raise ValueError(
-                        "Ataraxos behavior policy assigns mass to an illegal action"
-                    )
-                chosen = np.asarray(data["actions"][:-1])
-                if (
-                    chosen.shape != (len(states) - 1,)
-                    or not np.issubdtype(chosen.dtype, np.integer)
-                    or np.any(chosen < 0)
-                    or np.any(chosen >= num_actions)
-                ):
-                    raise ValueError("Ataraxos replay actions are invalid")
-                if not legal[np.arange(len(chosen)), chosen].all():
-                    raise ValueError(
-                        "Ataraxos replay contains an illegal recorded action"
-                    )
-            nested_obs[atx_keys.BEHAVIOR_LOG_PROBS] = np.concatenate(
-                (logp, np.zeros((1, num_actions), dtype=np.float32)), axis=0
-            )
-            nested_obs[atx_keys.BEHAVIOR_VALUE] = np.concatenate(
-                (values, np.zeros(1, dtype=np.float32))
-            )[:, None]
-            nested_obs[atx_keys.BEHAVIOR_VALID] = np.concatenate(
-                (np.ones(len(states) - 1, dtype=bool), np.zeros(1, dtype=bool))
-            )[:, None]
-            nested_obs[atx_keys.BEHAVIOR_LEGAL] = np.concatenate(
-                (legal, np.zeros((1, num_actions), dtype=bool)), axis=0
-            )
+            if not np.isfinite(logp).all() or not np.isfinite(values).all():
+                raise ValueError("Ataraxos behavior metadata contains non-finite values")
+            if np.any(np.abs(values) > 1.0001):
+                raise ValueError("Ataraxos behavior values fall outside [-1, 1]")
+            probs = np.exp(logp)
+            if not np.allclose(probs.sum(-1), 1.0, atol=2e-3, rtol=0.0):
+                raise ValueError("Ataraxos behavior probabilities do not sum to one")
+            if np.any(probs[~legal] > 1e-8):
+                raise ValueError("Ataraxos behavior policy assigns mass to an illegal action")
+            chosen = np.asarray(data["actions"][:-1])
+            if (
+                chosen.shape != (len(states) - 1,)
+                or not np.issubdtype(chosen.dtype, np.integer)
+                or np.any(chosen < 0)
+                or np.any(chosen >= num_actions)
+            ):
+                raise ValueError("Ataraxos replay actions are invalid")
+            if not legal[np.arange(len(chosen)), chosen].all():
+                raise ValueError("Ataraxos replay contains an illegal recorded action")
+            nested_obs[atx_keys.BEHAVIOR_LOG_PROBS] = logp.tolist() + [
+                [0.0] * num_actions
+            ]
+            nested_obs[atx_keys.BEHAVIOR_VALUE] = [
+                [float(v)] for v in values
+            ] + [[0.0]]
+            nested_obs[atx_keys.BEHAVIOR_VALID] = [[True]] * (len(states) - 1) + [[False]]
+            nested_obs[atx_keys.BEHAVIOR_LEGAL] = legal.tolist() + [
+                [False] * num_actions
+            ]
 
         # A full-game outcome label is available to every offline/online state,
         # even when the sequence loader later selects a sub-window.
@@ -582,9 +567,7 @@ class MetamonDataset(Dataset):
 
         final_state = states[-1]
         outcome = 1.0 if final_state.battle_won else (-1.0 if final_state.battle_lost else 0.0)
-        nested_obs[atx_keys.OUTCOME] = np.full(
-            (len(states), 1), outcome, dtype=np.float32
-        )
+        nested_obs[atx_keys.OUTCOME] = [[outcome]] * len(states)
 
         # Build actions
         action_infos = {"chosen": [], "legal": [], "missing": []}
@@ -617,8 +600,9 @@ class MetamonDataset(Dataset):
         # artificial right edge of the window.
         if atx_keys.BEHAVIOR_VALUE in nested_obs:
             behavior_v = np.asarray(
-                nested_obs[atx_keys.BEHAVIOR_VALUE], dtype=np.float32
-            ).reshape(-1)
+                [row[0] for row in nested_obs[atx_keys.BEHAVIOR_VALUE]],
+                dtype=np.float32,
+            )
             # The policy's RL2 stream still receives the configured shaped
             # rewards (Epoch475 was trained with that history).  Ataraxos PPO
             # and its fresh scalar value head instead optimize the zero-sum
@@ -642,12 +626,12 @@ class MetamonDataset(Dataset):
 
             advantage = trace(0.5)
             value_target = behavior_v[:-1] + trace(0.8)
-            nested_obs[atx_keys.ADVANTAGE] = np.concatenate(
-                (advantage, np.zeros(1, dtype=np.float32))
-            )[:, None]
-            nested_obs[atx_keys.VALUE_TARGET] = np.concatenate(
-                (value_target, np.zeros(1, dtype=np.float32))
-            )[:, None]
+            nested_obs[atx_keys.ADVANTAGE] = [
+                [float(v)] for v in advantage
+            ] + [[0.0]]
+            nested_obs[atx_keys.VALUE_TARGET] = [
+                [float(v)] for v in value_target
+            ] + [[0.0]]
 
         # Random slice if max_seq_len specified
         if self.max_seq_len is not None:
