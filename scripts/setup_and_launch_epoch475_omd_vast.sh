@@ -23,7 +23,7 @@ log() { printf '\n[%s] %s\n' "$(date '+%F %T')" "$*"; }
 REPO_URL="${REPO_URL:-https://github.com/bsmathers/testing4.git}"
 REPO_REF="${REPO_REF:-main}"
 REPO_DIR="${REPO_DIR:-/workspace/testing4}"
-PERSIST_ROOT="${PERSIST_ROOT:-/workspace/snorlax-v1}"
+PERSIST_ROOT="${PERSIST_ROOT:-/workspace/snorlax-v1-v2}"
 GOOD_REPLAYS_DIR="${GOOD_REPLAYS_DIR:-/workspace/good_replays}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 UPDATE_REPO="${UPDATE_REPO:-1}"
