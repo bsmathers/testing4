@@ -416,6 +416,7 @@ class VectorizedMetamonAMAGOWrapper(amago.envs.AMAGOEnv):
 
     def __init__(self, metamon_env):
         self._metamon_env = metamon_env
+        self._validated_action_batch_shape = False
         self.metamon_action_space = metamon_env.metamon_action_space
         super().__init__(
             env=metamon_env,
@@ -473,8 +474,26 @@ class VectorizedMetamonAMAGOWrapper(amago.envs.AMAGOEnv):
         # stock already-vectorized interaction loop passes (batch,). Normalize
         # at this boundary so each lane receives its own previous-action RL2
         # feature instead of every lane receiving lane 0's action.
-        action = np.asarray(action).reshape(self.batched_envs, 1)
+        action = np.asarray(action)
+        if action.shape not in ((self.batched_envs,), (self.batched_envs, 1)):
+            raise ValueError(
+                "vectorized discrete actions must have shape "
+                f"({self.batched_envs},) or ({self.batched_envs}, 1), got {action.shape}"
+            )
+        action = action.reshape(self.batched_envs, 1)
         next_tstep, reward, terminated, truncated, info = super().step(action)
+        if not self._validated_action_batch_shape:
+            previous = next_tstep.prev_action
+            expected = action[:, 0]
+            if (
+                previous.shape != (self.batched_envs, self.action_space.n)
+                or not np.array_equal(previous.argmax(-1), expected)
+                or not np.all(previous.sum(-1) == 1)
+            ):
+                raise RuntimeError(
+                    "AMAGO vectorized previous-action encoding lost its lane axis"
+                )
+            self._validated_action_batch_shape = True
         done = np.asarray(terminated, dtype=bool) | np.asarray(truncated, dtype=bool)
         if done.any():
             # One value per completed battle. AMAGO averages special metrics, so

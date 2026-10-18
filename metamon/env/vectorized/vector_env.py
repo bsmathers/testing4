@@ -384,13 +384,18 @@ class VectorizedShowdownEnv(gym.Env):
     ) -> None:
         """Attach exact behavior-policy outputs to the next outer action."""
         logp = np.asarray(behavior_log_probs, dtype=np.float32)
-        values = np.asarray(behavior_values, dtype=np.float32).reshape(-1)
+        values = np.asarray(behavior_values, dtype=np.float32)
         legal = np.asarray(behavior_legal, dtype=bool)
         expected = (self.batched_envs, self.eval_action_space.gym_space.n)
         if logp.shape != expected:
             raise ValueError(f"behavior_log_probs shape {logp.shape}, expected {expected}")
-        if values.shape != (self.batched_envs,):
-            raise ValueError(f"behavior_values shape {values.shape}, expected {(self.batched_envs,)}")
+        if values.shape not in ((self.batched_envs,), (self.batched_envs, 1)):
+            raise ValueError(
+                "behavior_values shape "
+                f"{values.shape}, expected {(self.batched_envs,)} or "
+                f"{(self.batched_envs, 1)}"
+            )
+        values = values.reshape(self.batched_envs)
         if legal.shape != expected:
             raise ValueError(f"behavior_legal shape {legal.shape}, expected {expected}")
         if not np.isfinite(logp).all() or not np.isfinite(values).all():
@@ -510,20 +515,6 @@ class VectorizedShowdownEnv(gym.Env):
         self._committed_side_actions[(i, side)] = int(used_idx)
         self.proc.choose(i, side, choice)
 
-    def _choose_opponent_side(self, i: int) -> None:
-        """Answer a single opponent-side request with the batched opponent policy."""
-        active = np.zeros((self.batched_envs,), dtype=bool)
-        active[i] = True
-        actions = self.opponent.act(active, self._opp_obs_list(active))
-        used_idx, choice = self._resolve_action(
-            i,
-            self.opp_side,
-            self.opponent_action_space,
-            int(actions[i]),
-        )
-        self._committed_side_actions[(i, self.opp_side)] = int(used_idx)
-        self.proc.choose(i, self.opp_side, choice)
-
     def _send_side(self, i: int, side: str, *, reprompt: bool = False) -> None:
         """Re-answer a single side after an ``|error|`` re-prompt.
 
@@ -552,28 +543,32 @@ class VectorizedShowdownEnv(gym.Env):
 
     # ----- pumping ---------------------------------------------------------
 
-    def _pump_ready(self, lane_indices: List[int]) -> None:
-        if not lane_indices:
-            return
-
-        def ready() -> bool:
-            return all(self.lanes[i].decision_ready() for i in lane_indices)
-
-        self.proc.pump_until(ready)
-
     # Request kinds that Showdown expects a choice for (vs. `wait`/`done`).
     _ANSWERABLE_KINDS = (KIND_MOVE, KIND_FORCESWITCH, KIND_TEAMPREVIEW)
+
+    def _opponent_only_ready(self, lane: StreamBattleLane) -> bool:
+        """Whether a lane is parked at a fresh opponent-only decision.
+
+        This is a transition boundary for the opponent policy.  Return control
+        to ``_advance_lanes`` so the previous opponent action is observed before
+        the next action advances its recurrent state.
+        """
+        return (
+            not lane.ended
+            and not lane._side_ready(self.eval_side)
+            and lane._side_ready(self.opp_side)
+            and lane.request_kind(self.opp_side) in self._ANSWERABLE_KINDS
+            and not lane.reprompt_pending[self.opp_side]
+        )
 
     def _pump_settle(self, lane_indices: List[int]) -> None:
         """Pump until every lane reaches its next decision cycle (or ends).
 
-        Auto-resolves opponent-only follow-ups (e.g. the opponent fainted and
-        must switch while the eval side waits) and repairs single-side
-        ``|error|`` re-prompts for either side. Eval-side move/force-switch
-        requests are *never* answered here: the lane is simply left parked at
-        that decision for the next ``step`` to consume, mirroring poke-env's
-        "ask the agent once per request" model. A KO force-switch is therefore
-        just the next step's decision, not a special mid-turn case.
+        Stops at opponent-only follow-ups (e.g. the opponent fainted and must
+        switch while the eval side waits) so ``_advance_lanes`` can close the
+        prior opponent transition before requesting another action. Repairs
+        single-side ``|error|`` re-prompts in place. Eval-side move/force-switch
+        requests are left parked for the next outer ``step``.
         """
         if not lane_indices:
             return
@@ -587,7 +582,7 @@ class VectorizedShowdownEnv(gym.Env):
             done = True
             for i in lane_indices:
                 lane = self.lanes[i]
-                if lane.decision_ready():
+                if lane.decision_ready() or self._opponent_only_ready(lane):
                     continue
                 done = False
                 for s in SIDES:
@@ -602,20 +597,6 @@ class VectorizedShowdownEnv(gym.Env):
                         and lane._side_ready(s)
                     ):
                         self._send_side(i, s, reprompt=True)
-                        answered[i][s] = lane.request_serial[s]
-                    elif (
-                        advanced
-                        and not other_advanced
-                        and s == self.opp_side
-                        and lane.request_kind(s) in self._ANSWERABLE_KINDS
-                        and lane._side_ready(s)
-                        and not lane.reprompt_pending[s]
-                    ):
-                        # Opponent-only follow-up: answer it so the cycle can
-                        # resolve. (An asymmetric *eval* request just means we
-                        # are waiting for the other side's request to arrive so
-                        # the lane can park at the eval decision -- keep pumping.)
-                        self._choose_opponent_side(i)
                         answered[i][s] = lane.request_serial[s]
                     elif (
                         not advanced
@@ -694,16 +675,21 @@ class VectorizedShowdownEnv(gym.Env):
         parked at an eval-side agent decision (or ended)."""
         pending = [i for i in lane_indices if not self.lanes[i].ended]
         while pending:
-            # Wait-only barrier (no choices owed yet this iteration); the previous
-            # iteration's _pump_settle already cleared any re-prompts.
-            self._pump_ready(pending)
+            # Stop at either a synchronized cycle or an opponent-only decision.
+            # The latter must be handled here (not inside _pump_settle) so each
+            # policy action receives its own reward/action RL2 update before the
+            # next recurrent forward.
+            self._pump_settle(pending)
             opp_active = np.zeros((self.batched_envs,), dtype=bool)
             auto: List[int] = []
             for i in pending:
                 lane = self.lanes[i]
                 if lane.ended:
                     continue
-                if lane.request_kind(self.eval_side) in AGENT_KINDS:
+                if (
+                    lane.request_kind(self.eval_side) in AGENT_KINDS
+                    and lane._side_ready(self.eval_side)
+                ):
                     continue  # eval owes a decision -> parked, stop advancing it
                 auto.append(i)
                 if lane.request_kind(self.opp_side) in AGENT_KINDS:
@@ -795,7 +781,13 @@ class VectorizedShowdownEnv(gym.Env):
         return batched_obs, merged_info
 
     def step(self, actions: np.ndarray):
-        actions = np.asarray(actions).reshape(self.batched_envs)
+        actions = np.asarray(actions)
+        if actions.shape not in ((self.batched_envs,), (self.batched_envs, 1)):
+            raise ValueError(
+                "vectorized actions must have shape "
+                f"({self.batched_envs},) or ({self.batched_envs}, 1), got {actions.shape}"
+            )
+        actions = actions.reshape(self.batched_envs)
         self._step_eval_actions = actions.copy()
         self._step_opp_actions = np.full((self.batched_envs,), -1, dtype=np.int64)
         self._committed_side_actions = {}
@@ -818,6 +810,12 @@ class VectorizedShowdownEnv(gym.Env):
             and self.lanes[i].needs_agent_decision(self.eval_side)
             and self.lanes[i]._side_ready(self.eval_side)
         ]
+        if len(acting) != self.batched_envs:
+            missing = sorted(set(range(self.batched_envs)) - set(acting))
+            raise RuntimeError(
+                "vectorized env returned control before every eval lane had a "
+                f"decision; missing lanes={missing[:8]}"
+            )
 
         with self._profile_section("resolve_actions"):
             # The opponent moves simultaneously with the eval side on a normal
@@ -915,7 +913,16 @@ class VectorizedShowdownEnv(gym.Env):
                     # A time-limit boundary is terminal for learning, but it is
                     # not a loss and must not enter win-rate statistics.
                     if lane.ended and lane.winner is not None:
-                        infos[i]["won"] = lane.side_won(self.eval_side)
+                        raw_won = lane.side_won(self.eval_side)
+                        parsed_won = bool(new_eval.battle_won)
+                        parsed_lost = bool(new_eval.battle_lost)
+                        if parsed_won == parsed_lost or parsed_won != raw_won:
+                            raise RuntimeError(
+                                "decisive outcome disagrees between Showdown and "
+                                f"UniversalState on lane {i}: raw_won={raw_won}, "
+                                f"parsed_won={parsed_won}, parsed_lost={parsed_lost}"
+                            )
+                        infos[i]["won"] = raw_won
                     if self._saving:
                         self._save_lane_outcome(i, new_eval)
                     self._start_lane(i)
@@ -954,7 +961,15 @@ class VectorizedShowdownEnv(gym.Env):
 
     def _save_lane_outcome(self, i: int, final_state: UniversalState) -> None:
         """Write a finished lane's trajectory and/or result log (parsed-replay format)."""
-        result = "WIN" if final_state.battle_won else "LOSS"
+        if final_state.battle_won:
+            result = "WIN"
+        elif final_state.battle_lost:
+            result = "LOSS"
+        else:
+            # Turn-limit boundaries are valid terminal replay segments for
+            # learning, but they are not losses and must not be mislabeled in
+            # filenames or per-battle result logs.
+            result = "UNRESOLVED"
         battle_id = "".join(str(random.randint(0, 9)) for _ in range(10))
         timestamp = datetime.now().strftime("%m-%d-%Y-%H:%M:%S")
         opponent_name = self.metamon_opponent_name
@@ -979,6 +994,9 @@ class VectorizedShowdownEnv(gym.Env):
                 output_json["behavior_log_probs"] = self._traj_behavior_log_probs[i]
                 output_json["behavior_values"] = self._traj_behavior_values[i]
                 output_json["behavior_legal_masks"] = self._traj_behavior_legal[i]
+                # Version 2 guarantees lane-preserving AMAGO action encoding
+                # and one act/observe transition per opponent decision.
+                output_json["ataraxos_collector_version"] = 2
             path = os.path.join(self.save_trajectories_to, filename)
             temp_path = path + ".tmp"
             with lz4.frame.open(temp_path, "wb") as f:

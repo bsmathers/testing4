@@ -231,6 +231,11 @@ class AmagoLadderPolicyDriver:
                 hidden_state=hidden_state,
                 sample=self.sample,
             )
+        expected = (len(lane_idxs), 1)
+        if tuple(act_out.shape) != expected:
+            raise RuntimeError(
+                f"policy action batch has shape {tuple(act_out.shape)}, expected {expected}"
+            )
         out = act_out.squeeze(1).cpu().numpy().astype(np.int64).reshape(-1)
         return out, hidden_state
 
@@ -292,6 +297,11 @@ class AmagoLadderPolicyDriver:
             self.rl2s[lane_idx, 1 + action_idx] = 1.0
 
     def reset_lanes(self, done_mask: np.ndarray) -> None:
+        done_mask = np.asarray(done_mask, dtype=bool)
+        if done_mask.shape != (self.num_lanes,):
+            raise ValueError(
+                f"done mask has shape {done_mask.shape}, expected {(self.num_lanes,)}"
+            )
         if not done_mask.any():
             return
         for i in np.where(done_mask)[0]:

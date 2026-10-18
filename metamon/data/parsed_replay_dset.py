@@ -510,6 +510,10 @@ class MetamonDataset(Dataset):
         if behavior_fields.intersection(data):
             from metamon.rl import ataraxos_keys as atx_keys
 
+            if data.get("ataraxos_collector_version") != 2:
+                raise ValueError(
+                    "Ataraxos replay predates the lane/action alignment fixes"
+                )
             behavior_log_probs = data.get("behavior_log_probs")
             behavior_values = data.get("behavior_values")
             behavior_legal = data.get("behavior_legal_masks")

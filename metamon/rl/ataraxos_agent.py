@@ -271,6 +271,31 @@ class AtaraxosAgent(MultiTaskAgent):
         missing = [k for k in required if k not in batch.obs]
         if missing:
             raise RuntimeError(f"Ataraxos batch missing replay metadata: {missing}")
+        if batch.actions.ndim != 3:
+            raise RuntimeError(
+                f"Ataraxos actions must be (batch, time, action), got {batch.actions.shape}"
+            )
+        if batch.rl2s.ndim != 3 or batch.time_idxs.ndim != 3:
+            raise RuntimeError(
+                "Ataraxos RL2/time tensors must retain batch and time axes: "
+                f"rl2={batch.rl2s.shape}, time={batch.time_idxs.shape}"
+            )
+        batch_size, action_steps, action_dim = batch.actions.shape
+        if action_dim != self.action_dim:
+            raise RuntimeError(
+                f"Ataraxos action dimension is {action_dim}, expected {self.action_dim}"
+            )
+        if batch.rl2s.shape[0] != batch_size or batch.rl2s.shape[1] < action_steps + 1:
+            raise RuntimeError(
+                "Ataraxos state/action alignment is invalid: "
+                f"actions={batch.actions.shape}, rl2={batch.rl2s.shape}"
+            )
+        for name in required:
+            tensor = batch.obs[name]
+            if tensor.shape[0] != batch_size or tensor.shape[1] < action_steps + 1:
+                raise RuntimeError(
+                    f"Ataraxos field {name} is not state-aligned: {tensor.shape}"
+                )
 
         o = self.tstep_encoder(obs=batch.obs, rl2s=batch.rl2s)
         s, _ = self.traj_encoder(seq=o, time_idxs=batch.time_idxs, hidden_state=None)

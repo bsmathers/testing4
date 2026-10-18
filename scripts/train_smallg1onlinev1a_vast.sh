@@ -752,6 +752,7 @@ files = sorted(list(root.glob("*.json")) + list(root.glob("*.json.lz4")))
 if len(files) < 5000:
     raise SystemExit(f"SnorlaxV1 FIFO requires at least 5000 games; found {len(files)}")
 required = {"behavior_log_probs", "behavior_values", "behavior_legal_masks"}
+wins = losses = unresolved = 0
 for path in files:
     if path.name.endswith(".lz4"):
         with lz4.frame.open(path, "rb") as f:
@@ -762,6 +763,11 @@ for path in files:
     missing = required.difference(payload)
     if missing:
         raise SystemExit(f"{path.name} predates SnorlaxV1 metadata; use a fresh PERSIST_ROOT")
+    if payload.get("ataraxos_collector_version") != 2:
+        raise SystemExit(
+            f"{path.name} predates the lane/action alignment fixes; "
+            "use a fresh online buffer"
+        )
     states = payload.get("states")
     actions = payload.get("actions")
     logp = np.asarray(payload["behavior_log_probs"], dtype=np.float32)
@@ -793,7 +799,28 @@ for path in files:
         raise SystemExit(f"{path.name} has invalid recorded actions")
     if not legal[np.arange(steps), chosen].all():
         raise SystemExit(f"{path.name} records an action marked illegal")
-print(f"Validated behavior metadata in {len(files)} FIFO games")
+    final = states[-1]
+    won = bool(final.get("battle_won"))
+    lost = bool(final.get("battle_lost"))
+    if won and lost:
+        raise SystemExit(f"{path.name} marks its final state as both won and lost")
+    if won:
+        wins += 1
+    elif lost:
+        losses += 1
+    else:
+        unresolved += 1
+decisive = wins + losses
+if decisive >= 100 and (wins == 0 or losses == 0):
+    raise SystemExit(
+        "SnorlaxV1 FIFO has a one-sided outcome collapse: "
+        f"wins={wins}, losses={losses}, unresolved={unresolved}. "
+        "Refusing to train on a likely broken collector."
+    )
+print(
+    f"Validated {len(files)} FIFO games: wins={wins}, losses={losses}, "
+    f"unresolved={unresolved}"
+)
 PY
 fi
 

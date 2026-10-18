@@ -160,6 +160,7 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
     def _compute_advantage_threshold(self) -> float:
         parsed = self.fifo.dataset.parsed_replay_dset
         values = []
+        wins = losses = unresolved = 0
         filenames = list(parsed.filenames)
         for filename in filenames:
             try:
@@ -169,6 +170,10 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
                 else:
                     with open(filename, "rb") as f:
                         payload = orjson.loads(f.read())
+                if payload.get("ataraxos_collector_version") != 2:
+                    raise ValueError(
+                        "replay predates the lane/action alignment fixes"
+                    )
                 v = np.asarray(payload["behavior_values"], dtype=np.float32)
                 states = payload["states"]
                 actions = payload["actions"]
@@ -209,7 +214,19 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
                     raise ValueError("recorded online action is illegal")
                 state_values = np.concatenate([v, np.zeros(1, dtype=np.float32)])
                 final = states[-1]
-                outcome = 1.0 if final.get("battle_won") else (-1.0 if final.get("battle_lost") else 0.0)
+                won = bool(final.get("battle_won"))
+                lost = bool(final.get("battle_lost"))
+                if won and lost:
+                    raise ValueError("final state is both won and lost")
+                if won:
+                    wins += 1
+                    outcome = 1.0
+                elif lost:
+                    losses += 1
+                    outcome = -1.0
+                else:
+                    unresolved += 1
+                    outcome = 0.0
                 rewards = np.zeros(v.size, dtype=np.float32)
                 rewards[-1] = outcome
                 done = np.zeros(v.size, dtype=np.float32)
@@ -233,6 +250,12 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
                 ) from exc
         if not values:
             raise RuntimeError("could not compute Ataraxos advantage threshold from FIFO")
+        decisive = wins + losses
+        if decisive >= 100 and (wins == 0 or losses == 0):
+            raise RuntimeError(
+                "Ataraxos FIFO has a one-sided outcome collapse: "
+                f"wins={wins}, losses={losses}, unresolved={unresolved}"
+            )
         return max(float(np.quantile(np.asarray(values), 0.75)), 0.01)
 
 
@@ -744,6 +767,23 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             obs = amago.utils.stack_list_array_dicts(list(obs), axis=0, cat=True)
             rl2s = np.concatenate(rl2s, axis=0)
             tids = np.concatenate(tids, axis=0)
+            if rl2s.shape != (self.parallel_actors, self.policy.action_dim + 1):
+                raise RuntimeError(
+                    f"collector RL2 batch has shape {rl2s.shape}, expected "
+                    f"{(self.parallel_actors, self.policy.action_dim + 1)}"
+                )
+            if tids.shape != (self.parallel_actors, 1):
+                raise RuntimeError(
+                    f"collector time-index batch has shape {tids.shape}, expected "
+                    f"{(self.parallel_actors, 1)}"
+                )
+            bad_obs = {
+                key: value.shape
+                for key, value in obs.items()
+                if value.shape[0] != self.parallel_actors
+            }
+            if bad_obs:
+                raise RuntimeError(f"collector observations lost their lane axis: {bad_obs}")
             obs = {k: torch.from_numpy(v).to(self.DEVICE).unsqueeze(1) for k, v in obs.items()}
             return obs, torch.from_numpy(rl2s).to(self.DEVICE).unsqueeze(1), torch.from_numpy(tids).to(self.DEVICE).unsqueeze(1)
 
@@ -770,6 +810,23 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                 actions, hidden_state, behavior_lp, behavior_v = policy.get_actions_with_metadata(
                     obs=obs, rl2s=rl2s, time_idxs=tids,
                     sample=sample, hidden_state=hidden_state,
+                )
+            expected_actions = (self.parallel_actors, 1)
+            expected_logp = (self.parallel_actors, self.policy.action_dim)
+            if tuple(actions.shape) != expected_actions:
+                raise RuntimeError(
+                    f"collector actions have shape {tuple(actions.shape)}, "
+                    f"expected {expected_actions}"
+                )
+            if tuple(behavior_lp.shape) != expected_logp:
+                raise RuntimeError(
+                    f"collector behavior logits have shape {tuple(behavior_lp.shape)}, "
+                    f"expected {expected_logp}"
+                )
+            if tuple(behavior_v.shape) != expected_actions:
+                raise RuntimeError(
+                    f"collector values have shape {tuple(behavior_v.shape)}, "
+                    f"expected {expected_actions}"
                 )
             # Collection needs these four small GPU results on the host. Packing
             # them into one transfer avoids four separate CUDA synchronizations
@@ -807,7 +864,17 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                 started = time.perf_counter()
             done = terminated | truncated
             if done.ndim == 2:
+                if done.shape != (self.parallel_actors, 1):
+                    raise RuntimeError(
+                        f"collector done batch has shape {done.shape}, expected "
+                        f"{(self.parallel_actors, 1)}"
+                    )
                 done = done.squeeze(1)
+            if done.shape != (self.parallel_actors,):
+                raise RuntimeError(
+                    f"collector done batch has shape {done.shape}, expected "
+                    f"{(self.parallel_actors,)}"
+                )
             if done.any():
                 if save_on_done:
                     amago.utils.call_async_env(envs, "save_finished_trajs")
