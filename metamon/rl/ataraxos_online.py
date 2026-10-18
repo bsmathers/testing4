@@ -579,6 +579,12 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         )
         os.replace(temporary, marker)
 
+    def _behavior_policy_path(self) -> str:
+        configured = os.environ.get("SNORLAX_BEHAVIOR_WEIGHTS")
+        if configured:
+            return configured
+        return os.path.join(self.ckpt_dir, "latest", "behavior_policy.pt")
+
     def _write_behavior_policy(self) -> str:
         """Publish the Schedule-Free y iterate used for PPO data collection.
 
@@ -589,10 +595,7 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         policy change. This conversion is reversible and does not advance the
         optimizer.
         """
-        path = os.environ.get("SNORLAX_BEHAVIOR_WEIGHTS")
-        if not path:
-            latest = Path(os.environ["SNORLAX_LATEST_WEIGHTS"])
-            path = str(latest.with_name("behavior_policy.pt"))
+        path = self._behavior_policy_path()
         temporary = path + ".tmp"
 
         # Persistent collection boundaries leave the optimizer in eval/x mode.
@@ -616,9 +619,7 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         buffer_dir = Path(os.environ["SNORLAX_BUFFER_DIR"])
         replay_dir = buffer_dir / "gen1ou"
         log_dir = Path(os.environ["SNORLAX_LOG_DIR"])
-        behavior_weights = os.environ.get(
-            "SNORLAX_BEHAVIOR_WEIGHTS", os.environ["SNORLAX_LATEST_WEIGHTS"]
-        )
+        behavior_weights = self._behavior_policy_path()
         target = int(os.environ.get("GAMES_PER_LEARNER_EPOCH", "2000"))
         removed_unresolved = self._purge_unresolved_online_replays(replay_dir)
         if removed_unresolved:
@@ -1347,9 +1348,13 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         self.accelerator.wait_for_everyone()
 
     def write_latest_policy(self) -> None:
-        # Collectors and league opponents always consume the averaged policy.
+        # The ordinary latest checkpoint remains the averaged x iterate for
+        # validation/league use. Publish y separately for on-policy PPO
+        # collection, then restore x before returning.
         self.optimizer.eval()
-        return super().write_latest_policy()
+        result = super().write_latest_policy()
+        self._write_behavior_policy()
+        return result
 
 
 def main():
