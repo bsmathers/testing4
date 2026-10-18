@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import time
+from functools import partial
 from pathlib import Path
 
 import amago
@@ -14,11 +15,39 @@ import lz4.frame
 import numpy as np
 import orjson
 import torch
-from amago.loading import RLDataset
+from amago.loading import MAGIC_PAD_VAL, RLDataset, RLData_pad_collate
+from torch.utils.data import DataLoader
 
 from metamon.rl import ataraxos_keys as keys
 from metamon.rl import taurosv1b_online as v1b
 from metamon.rl.recent_schedule_free import RecentScheduleFreeAdamW
+
+
+def _fixed_length_collate(samples, *, max_seq_len: int):
+    """Right-pad every batch to one compile-stable sequence shape."""
+    batch = RLData_pad_collate(samples)
+
+    def pad_time(tensor: torch.Tensor, target: int) -> torch.Tensor:
+        missing = target - tensor.shape[1]
+        if missing < 0:
+            raise RuntimeError(
+                f"collated sequence length {tensor.shape[1]} exceeds target {target}"
+            )
+        if missing == 0:
+            return tensor
+        shape = list(tensor.shape)
+        shape[1] = missing
+        padding = tensor.new_full(shape, MAGIC_PAD_VAL)
+        return torch.cat((tensor, padding), dim=1)
+
+    state_len = max_seq_len + 1
+    batch.obs = {key: pad_time(value, state_len) for key, value in batch.obs.items()}
+    batch.rl2s = pad_time(batch.rl2s, state_len)
+    batch.time_idxs = pad_time(batch.time_idxs, state_len)
+    batch.rews = pad_time(batch.rews, max_seq_len)
+    batch.dones = pad_time(batch.dones, max_seq_len)
+    batch.actions = pad_time(batch.actions, max_seq_len)
+    return batch
 
 
 class TaggedDataset(RLDataset):
@@ -216,6 +245,24 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
     # Keep the current epoch plus the previous 64 so every configured lineage
     # offset (through -64) resolves to its exact policy checkpoint.
     _CHECKPOINT_RECENT_COUNT = 65
+
+    def init_dloaders(self):
+        # AMAGO normally pads only to the longest item in each batch. That makes
+        # the sequence dimension vary as the FIFO changes and causes torch.compile
+        # to spend about a minute compiling a new forward/backward graph at the
+        # start of learner phases. A fixed right-padded shape is loss-equivalent:
+        # Ataraxos already masks every MAGIC_PAD_VAL timestep.
+        train_dloader = DataLoader(
+            self.dataset,
+            batch_size=self.batch_size,
+            num_workers=self.dloader_workers,
+            collate_fn=partial(
+                _fixed_length_collate, max_seq_len=int(self.max_seq_len)
+            ),
+            pin_memory=True,
+        )
+        self.train_dloader = self.accelerator.prepare(train_dloader)
+        return self.train_dloader
 
     @staticmethod
     def _replay_names(root: Path) -> set[str]:
