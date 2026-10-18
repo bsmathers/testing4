@@ -113,10 +113,15 @@ def preflight() -> None:
         )
         static_rows, discover_specs = opponent_pool._split_pool_entries(pool_raw)
         discovered_rows = []
-        for base_name, merged, spec in discover_specs:
-            discovered_rows.extend(
-                opponent_pool._expand_discover_agent(base_name, merged, spec)
-            )
+        original_get = pretrained_module.get_pretrained_model
+        pretrained_module.get_pretrained_model = lambda _name: _FakeModel()
+        try:
+            for base_name, merged, spec in discover_specs:
+                discovered_rows.extend(
+                    opponent_pool._expand_discover_agent(base_name, merged, spec)
+                )
+        finally:
+            pretrained_module.get_pretrained_model = original_get
         if len(static_rows) != 7 or len(discovered_rows) != 5:
             raise RuntimeError(
                 "Snorlax opponent pool must expand to 7 static + 5 discovered/fill "
