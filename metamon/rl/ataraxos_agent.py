@@ -398,9 +398,9 @@ class AtaraxosAgent(MultiTaskAgent):
             self.offline_policy_coef * offline_ce
             + self.offline_value_coef * offline_value
         )
-        # Weight by the actual trajectory composition of this batch.  This is
-        # essential during the 0 -> 50% ramp: a batch containing one online
-        # trajectory must not receive the same online weight as a 7/7 batch.
+        # Weight by the actual trajectory composition of this batch. The
+        # production Snorlax recipe is 50/50, while smoke tests and ablations
+        # may use other source ratios.
         batch_online_fraction = source[:, 0, 0].float().mean()
         loss = (
             batch_online_fraction * online_loss
