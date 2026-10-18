@@ -691,6 +691,11 @@ def main() -> None:
             raise FileNotFoundError(args.base_weights)
         experiment.load_checkpoint_from_path(args.base_weights, is_accelerate_state=False)
         print(f"Loaded distilled V1B bootstrap: {args.base_weights}")
+        # A bounded one-epoch collector already has the exact requested policy
+        # in memory. Do not make its only epoch depend on a separate rolling
+        # checkpoint that cannot exist yet in a fresh smoke-test directory.
+        if args.mode == "collect" and args.epochs == 1:
+            experiment.always_load_latest = False
     elif args.from_scratch:
         print("From scratch: leaving random initialization in place.")
     else:

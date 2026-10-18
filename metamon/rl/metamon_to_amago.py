@@ -1914,10 +1914,13 @@ class MetamonOnlineExperiment(MetamonAMAGOExperiment):
         # when the file does not exist at all. Keep the in-memory bootstrap and
         # return immediately in that case.
         if not os.path.isfile(ckpt_name):
-            self.accelerator.print(
-                "No rolling latest policy yet; continuing with loaded bootstrap."
-            )
+            if not getattr(self, "_metamon_reported_missing_latest", False):
+                self.accelerator.print(
+                    "No rolling latest policy yet; continuing with loaded bootstrap."
+                )
+                self._metamon_reported_missing_latest = True
             return
+        self._metamon_reported_missing_latest = False
         ckpt = amago.utils.retry_load_checkpoint(ckpt_name, map_location=self.DEVICE)
         if ckpt is None:
             amago.utils.amago_warning("Latest policy checkpoint was not loaded.")
