@@ -187,6 +187,49 @@ class AtaraxosAgent(MultiTaskAgent):
             state = torch.load(anchor_path, map_location="cpu")
         self._capture_l2sp_anchor(state)
 
+    def _current_l2sp_scale(self) -> float:
+        step = getattr(self, "_ataraxos_host_step", None)
+        if step is None:
+            step = int(self._ataraxos_step.item())
+        if self.l2sp_decay_steps <= 0:
+            return 0.0
+        return max(1.0 - step / float(self.l2sp_decay_steps), 0.0)
+
+    @torch.no_grad()
+    def add_l2sp_gradients(self) -> None:
+        """Add the exact L2-SP gradient after backward and before clipping.
+
+        Building the full parameter-distance penalty into the autograd graph
+        duplicated hundreds of large elementwise kernels every update.  The
+        analytic gradient is simply coef * scale * (parameter - anchor).
+        """
+        scale = getattr(self, "_pending_l2sp_scale", None)
+        if scale is None:
+            scale = self._current_l2sp_scale()
+        if scale <= 0.0 or self.l2sp_coef <= 0.0:
+            return
+        if self._l2sp_anchor is None:
+            raise RuntimeError("Ataraxos learner has no Epoch475 L2-SP anchor")
+        parameters = []
+        anchors = []
+        gradients = []
+        for name, parameter in self.named_parameters():
+            if self._is_l2sp_parameter(name) and parameter.grad is not None:
+                parameters.append(parameter)
+                anchors.append(self._l2sp_anchor[name])
+                gradients.append(parameter.grad)
+        if not parameters:
+            return
+        coefficient = self.l2sp_coef * scale
+        if parameters[0].is_cuda:
+            deltas = torch._foreach_sub(parameters, anchors)
+            torch._foreach_add_(gradients, deltas, alpha=coefficient)
+        else:
+            for gradient, parameter, anchor in zip(
+                gradients, parameters, anchors
+            ):
+                gradient.add_(parameter - anchor, alpha=coefficient)
+
     def get_actions_with_metadata(self, obs, rl2s, time_idxs, hidden_state=None, sample=True):
         """Sample actions and return the exact behavior distribution/value."""
         s, hidden_state = self.get_state_embedding(
@@ -338,21 +381,19 @@ class AtaraxosAgent(MultiTaskAgent):
             batch_online_fraction * online_loss
             + (1.0 - batch_online_fraction) * offline_loss
         )
-        l2sp_scale = (
-            max(1.0 - step / float(self.l2sp_decay_steps), 0.0)
-            if self.l2sp_decay_steps > 0
-            else 0.0
-        )
+        l2sp_scale = self._current_l2sp_scale()
+        self._pending_l2sp_scale = l2sp_scale
         l2sp_penalty = torch.zeros((), device=loss.device)
-        if l2sp_scale > 0.0 and self.l2sp_coef > 0.0:
+        if log_step and l2sp_scale > 0.0 and self.l2sp_coef > 0.0:
             if self._l2sp_anchor is None:
                 raise RuntimeError("Ataraxos learner has no Epoch475 L2-SP anchor")
-            for name, parameter in self.named_parameters():
-                if self._is_l2sp_parameter(name):
-                    l2sp_penalty = l2sp_penalty + 0.5 * (
-                        parameter - self._l2sp_anchor[name]
-                    ).square().sum()
-            loss = loss + self.l2sp_coef * l2sp_scale * l2sp_penalty
+            with torch.no_grad():
+                for name, parameter in self.named_parameters():
+                    if self._is_l2sp_parameter(name):
+                        l2sp_penalty.add_(
+                            (parameter - self._l2sp_anchor[name]).square().sum(),
+                            alpha=0.5,
+                        )
         self._ataraxos_step.add_(1)
         self._ataraxos_online_mass.add_(batch_online_fraction.detach())
         self._ataraxos_host_step = step + 1

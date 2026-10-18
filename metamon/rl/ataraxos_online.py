@@ -403,9 +403,18 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
                     elapsed = time.perf_counter() - block_started
+                    component_profile = self._consume_learner_profile()
+                    component_text = ""
+                    if component_profile:
+                        component_text = " " + " ".join(
+                            f"{name}={milliseconds:.1f}ms"
+                            for name, milliseconds in component_profile.items()
+                        )
                     print(
                         f"[LearnerProfile] epoch={epoch} step={train_step + 1} "
-                        f"rate={20.0 / elapsed:.2f}it/s data_wait={100.0 * data_seconds / elapsed:.1f}%",
+                        f"rate={20.0 / elapsed:.2f}it/s "
+                        f"data_wait={100.0 * data_seconds / elapsed:.1f}%"
+                        f"{component_text}",
                         flush=True,
                     )
                     block_started = time.perf_counter()
@@ -696,7 +705,48 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         scale = self._lr_scale(step)
         for group in self.optimizer.param_groups:
             group["lr"] = group["ataraxos_base_lr"] * scale
-        metrics = super().train_step(batch, log_step)
+        profile = (
+            torch.cuda.is_available()
+            and getattr(self, "_learner_profile_recorded", 0)
+            < int(os.environ.get("METAMON_LEARN_PROFILE_STEPS", "200"))
+        )
+        events = None
+        if profile:
+            events = [torch.cuda.Event(enable_timing=True) for _ in range(5)]
+            events[0].record()
+        # The policy loss used to build L2-SP into the autograd graph. Its exact
+        # analytic gradient is cheaper to inject after backward and before
+        # gradient clipping, without changing the update.
+        with self.accelerator.accumulate(self.policy_aclr):
+            self.optimizer.zero_grad()
+            loss = self.policy_aclr(batch, log_step=log_step)
+            if events:
+                events[1].record()
+            metrics = {"Loss": loss} | self.policy.update_info
+            self.accelerator.backward(loss)
+            if events:
+                events[2].record()
+            if self.accelerator.sync_gradients:
+                self.policy.add_l2sp_gradients()
+                self.accelerator.clip_grad_norm_(
+                    self.policy_aclr.parameters(), self.grad_clip
+                )
+                self.policy.soft_sync_targets()
+                self.grad_update_counter += 1
+                if log_step:
+                    metrics.update(self.policy.get_grad_norms())
+            if events:
+                events[3].record()
+            self.optimizer.step()
+            self.lr_schedule.step()
+            if events:
+                events[4].record()
+                if not hasattr(self, "_learner_profile_events"):
+                    self._learner_profile_events = []
+                self._learner_profile_events.append(events)
+                self._learner_profile_recorded = (
+                    getattr(self, "_learner_profile_recorded", 0) + 1
+                )
         # AMAGO still advances its registered constant scheduler after the
         # optimizer update. It does not affect the update above, but it resets
         # the visible group LRs to their initial values. Reinstall the managed
@@ -728,6 +778,18 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                     f"ScheduleFree/Average Coef/{group['ataraxos_name']}"
                 ] = group["sf_ckp1"]
         return metrics
+
+    def _consume_learner_profile(self) -> dict[str, float]:
+        events = getattr(self, "_learner_profile_events", [])
+        if not events:
+            return {}
+        names = ("forward", "backward", "grad", "optimizer")
+        totals = {name: 0.0 for name in names}
+        for sample in events:
+            for index, name in enumerate(names):
+                totals[name] += sample[index].elapsed_time(sample[index + 1])
+        self._learner_profile_events = []
+        return {name: value / len(events) for name, value in totals.items()}
 
     def save_checkpoint(self) -> None:
         # Raw policy checkpoints and full-state model weights must contain x;
