@@ -131,7 +131,9 @@ ASSETS_MARKER="${PROVISION_DIR}/offline-assets-v1.done"
 mkdir -p "${PROVISION_DIR}"
 
 write_marker() {
-  local marker="$1" description="$2" tmp_marker="${marker}.tmp.$$"
+  local marker="$1"
+  local description="$2"
+  local tmp_marker="${marker}.tmp.$$"
   printf '%s\ncompleted %s\n' "${description}" "$(date '+%F %T')" >"${tmp_marker}"
   mv -f "${tmp_marker}" "${marker}"
 }
