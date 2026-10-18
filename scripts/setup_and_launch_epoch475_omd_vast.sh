@@ -75,8 +75,18 @@ if [[ ! -e "${REPO_DIR}" ]]; then
   log "Cloning ${REPO_URL} at ${REPO_REF}"
   git clone --branch "${REPO_REF}" --single-branch "${REPO_URL}" "${REPO_DIR}"
 elif [[ -d "${REPO_DIR}/.git" ]]; then
-  if [[ -n "$(git -C "${REPO_DIR}" status --porcelain)" ]]; then
+  # `pip install -e .` refreshes the repository's tracked egg-info files.
+  # Those generated metadata changes are harmless and expected on a rerun;
+  # continue to reject changes anywhere else so source edits are not lost.
+  unexpected_changes="$(
+    git -C "${REPO_DIR}" status --porcelain -- . \
+      ':(exclude)metamon.egg-info/**'
+  )"
+  if [[ -n "${unexpected_changes}" ]]; then
     die "Existing checkout has local changes: ${REPO_DIR}. Commit/stash them or choose another REPO_DIR."
+  fi
+  if [[ -n "$(git -C "${REPO_DIR}" status --porcelain -- metamon.egg-info)" ]]; then
+    warn "Ignoring generated metamon.egg-info changes from the earlier installation"
   fi
   current_branch="$(git -C "${REPO_DIR}" branch --show-current)"
   [[ "${current_branch}" == "${REPO_REF}" ]] \
