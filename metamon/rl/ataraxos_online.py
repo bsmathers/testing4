@@ -865,12 +865,16 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             del loader
             del self.train_dloader
 
-            if self.ckpt_interval and epoch % self.ckpt_interval == 0:
-                self.save_checkpoint()
+            # Publish the rolling x/y pair so validation can evaluate this
+            # epoch, but do not commit the numbered/full optimizer checkpoint
+            # until validation passes. Otherwise a failed validation could be
+            # bypassed simply by restarting at the next epoch.
             if self.always_save_latest:
                 self.write_latest_policy()
-            self._collection_ready_marker().unlink(missing_ok=True)
             self._external_validation_phase(epoch)
+            if self.ckpt_interval and epoch % self.ckpt_interval == 0:
+                self.save_checkpoint()
+            self._collection_ready_marker().unlink(missing_ok=True)
 
     @classmethod
     def _prune_numbered_checkpoints(
