@@ -804,6 +804,21 @@ fi
 
 if [[ "${TRAIN_VARIANT}" == "snorlax_v1" && "${ALTERNATE_COLLECT_LEARN}" == "1" \
     && "${SNORLAX_PERSISTENT_ALTERNATION:-1}" == "1" ]]; then
+  # A host OOM sends SIGKILL, so the learner cannot reap collector children.
+  # Remove only orphaned collectors belonging to this exact module/run before
+  # starting the replacement learner.
+  stale_collector_pids=()
+  while IFS= read -r pid; do
+    [[ -n "${pid}" ]] && stale_collector_pids+=("${pid}")
+  done < <(pgrep -f "${RUNNER_MODULE}.*--mode collect.*--run_name ${RUN_NAME}" || true)
+  if (( ${#stale_collector_pids[@]} > 0 )); then
+    log "Stopping ${#stale_collector_pids[@]} stale Snorlax collector process(es)"
+    kill "${stale_collector_pids[@]}" 2>/dev/null || true
+    sleep 2
+    for pid in "${stale_collector_pids[@]}"; do
+      kill -0 "${pid}" 2>/dev/null && kill -9 "${pid}" 2>/dev/null || true
+    done
+  fi
   log "Launching persistent Snorlax learner; collectors will cycle without rebuilding the learner or offline indexes"
   export SNORLAX_PERSISTENT_ALTERNATION=1
   export SNORLAX_BUFFER_DIR="${BUFFER_DIR}"
