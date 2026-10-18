@@ -13,8 +13,10 @@ It is a one-shot remote training run, not a short local experiment.
 - Use a fixed 50/50 online/offline learner mixture from epoch 0. This matches the original Snorlax Ataraxos adaptation and avoids an initial block of pure offline behavior cloning that can rapidly move the Epoch475 policy before self-play gradients are present.
 - Use batch size 14 with deterministic low-discrepancy source allocation.
 - Use clipped PPO, behavior-policy reverse KL, a decaying uniform-policy magnet,
-  outcome-value regression, and top-quartile absolute-advantage filtering for
-  online positions. The myopic reference policy is uniform over legal actions.
+  and outcome-value regression online. Advantage filtering starts disabled and
+  ramps over epochs 0-100 to retain the top 75% of online positions by absolute
+  advantage (25th-percentile cutoff); the absolute floor ramps from 0 to 0.01.
+  The myopic reference policy is uniform over legal actions.
 - Use observed-action cross entropy and outcome-value regression offline.
   Pac-exploratory action labels receive weight 0.25; their value labels retain
   full weight.
