@@ -811,7 +811,12 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                     obs=obs, rl2s=rl2s, time_idxs=tids,
                     sample=sample, hidden_state=hidden_state,
                 )
-            expected_actions = (self.parallel_actors, 1)
+            # AMAGO keeps the singleton sequence axis during inference:
+            # (lanes, sequence=1, discrete_action=1).  The environment action
+            # below deliberately removes only that sequence axis when packing
+            # the host transfer.  Requiring (lanes, 1) here incorrectly rejects
+            # the standard AMAGO output before collection can begin.
+            expected_actions = (self.parallel_actors, 1, 1)
             expected_logp = (self.parallel_actors, self.policy.action_dim)
             if tuple(actions.shape) != expected_actions:
                 raise RuntimeError(
