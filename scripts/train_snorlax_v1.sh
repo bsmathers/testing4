@@ -12,7 +12,8 @@ if [[ -n "${PERSIST_ROOT}" ]]; then
   marker="${PERSIST_ROOT}/SNORLAX_V1_EXPERIMENT"
   old_marker='SnorlaxV1; replay schema v2; schedule-free r99 beta0.8'
   previous_marker='SnorlaxV1; replay schema v3; schedule-free r99 beta0.8'
-  expected_marker='SnorlaxV1-v2; schema v3; onlineramp0to50; advq0to25; criticwarmup100k; schedule-free r99 beta0.8'
+  previous_v2_marker='SnorlaxV1-v2; schema v3; onlineramp0to50; advq0to25; criticwarmup100k; schedule-free r99 beta0.8'
+  expected_marker='SnorlaxV1-v2; schema v3; onlineramp0to50; advq0to25; criticwarmup100k; dropout0; exactprefix128; behavior-y; schedule-free r99 beta0.8'
   if [[ -d "${PERSIST_ROOT}/online_buffer/gen1ou" ]] \
       && find "${PERSIST_ROOT}/online_buffer/gen1ou" -type f \
         \( -name '*.json' -o -name '*.json.lz4' \) -print -quit | grep -q . \
@@ -23,7 +24,8 @@ if [[ -n "${PERSIST_ROOT}" ]]; then
   mkdir -p "${PERSIST_ROOT}"
   if [[ -f "${marker}" ]] \
       && { [[ "$(<"${marker}")" == "${old_marker}" ]] \
-        || [[ "$(<"${marker}")" == "${previous_marker}" ]]; }; then
+        || [[ "$(<"${marker}")" == "${previous_marker}" ]] \
+        || [[ "$(<"${marker}")" == "${previous_v2_marker}" ]]; }; then
     state_root="${PERSIST_ROOT}/checkpoints/snorlax_v1/ckpts/training_states"
     if [[ -d "${state_root}" ]] \
         && find "${state_root}" -mindepth 1 -maxdepth 1 -type d \
