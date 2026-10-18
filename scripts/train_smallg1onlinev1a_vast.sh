@@ -579,9 +579,11 @@ fi
 
 FROZEN="${SAVE_DIR}/epoch475_frozen/ckpts/policy_weights/policy_epoch_475.pt"
 LATEST="${SAVE_DIR}/${RUN_NAME}/ckpts/latest/policy.pt"
+BEHAVIOR="${SAVE_DIR}/${RUN_NAME}/ckpts/latest/behavior_policy.pt"
 mkdir -p "$(dirname "${FROZEN}")" "$(dirname "${LATEST}")"
 cp -f "${ONLINE_WEIGHTS}" "${FROZEN}"
 [[ -s "${LATEST}" ]] || cp "${ONLINE_WEIGHTS}" "${LATEST}"
+[[ -s "${BEHAVIOR}" ]] || cp "${ONLINE_WEIGHTS}" "${BEHAVIOR}"
 if [[ "${TRAIN_VARIANT}" == "snorlax_v1" ]]; then
   mkdir -p "${SAVE_DIR}/${RUN_NAME}/ckpts/policy_weights"
   BASE_SNAPSHOT="${SAVE_DIR}/${RUN_NAME}/ckpts/policy_weights/policy_epoch_0.pt"
@@ -780,7 +782,8 @@ start_collectors() {
       --run_config "${RUN_CONFIG}" --mode collect \
       --run_name "${RUN_NAME}" --lanes "${LANES}" --n_workers "${COLLECTOR_WORKERS}" \
       --save_dir "${SAVE_DIR}" --buffer_dir "${BUFFER_DIR}" \
-      --base_weights "${LATEST}" --epochs 1000000 --seed "${seed}" \
+      --base_weights "$([[ -s "${BEHAVIOR}" ]] && printf '%s' "${BEHAVIOR}" || printf '%s' "${LATEST}")" \
+      --epochs 1000000 --seed "${seed}" \
       --mixed_precision "${collector_mp}" \
       > >(tee -a "${LOG_DIR}/collector-${phase}-${i}.log") 2>&1 &
     COLLECTOR_PIDS+=("$!")
@@ -994,6 +997,7 @@ if [[ "${TRAIN_VARIANT}" == "snorlax_v1" && "${ALTERNATE_COLLECT_LEARN}" == "1" 
   export SNORLAX_BUFFER_DIR="${BUFFER_DIR}"
   export SNORLAX_LOG_DIR="${LOG_DIR}"
   export SNORLAX_LATEST_WEIGHTS="${LATEST}"
+  export SNORLAX_BEHAVIOR_WEIGHTS="${BEHAVIOR}"
   export SNORLAX_RUN_CONFIG="${RUN_CONFIG}"
   export RUNNER_MODULE COLLECTOR_PROCESSES COLLECTOR_DTYPE LANES COLLECTOR_WORKERS
   export GAMES_PER_LEARNER_EPOCH METAMON_SAVE_DIR MIXED_PRECISION
