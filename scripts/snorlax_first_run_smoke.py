@@ -112,6 +112,7 @@ def simulator_transitions() -> None:
     from metamon.env.vectorized.lane import KIND_FORCESWITCH
     from metamon.env.vectorized.opponent import BatchedOpponent
     from metamon.env.vectorized.vector_env import VectorizedShowdownEnv
+    from metamon.env.wrappers import get_metamon_teams
     from metamon.rl.pretrained import get_pretrained_model
 
     model = get_pretrained_model("TaurosV1A")
@@ -163,9 +164,14 @@ def simulator_transitions() -> None:
             lanes = 8
             opponent = _CountingOpponent(lanes)
             side_root = trajectory_root / f"side-{eval_side}"
+            # The native simulator cannot generate random teams from null team
+            # specs. Exercise the same explicit format/team path used by the
+            # real Snorlax run instead.
+            player_teams = get_metamon_teams("gen1ou", "snorlax_v1_expert")
+            opponent_teams = get_metamon_teams("gen1ou", "snorlax_v1_expert")
             env = VectorizedShowdownEnv(
-                player_team_set=None,
-                opponent_team_set=None,
+                player_team_set=player_teams,
+                opponent_team_set=opponent_teams,
                 opponent=opponent,
                 opponent_obs_space=model.observation_space,
                 opponent_action_space=model.action_space,
@@ -174,7 +180,7 @@ def simulator_transitions() -> None:
                 eval_reward_function=model.reward_function,
                 opponent_reward_function=model.reward_function,
                 batched_envs=lanes,
-                battle_format="gen1randombattle",
+                battle_format="gen1ou",
                 turn_limit=100,
                 save_trajectories_to=str(side_root),
                 n_workers=2,
