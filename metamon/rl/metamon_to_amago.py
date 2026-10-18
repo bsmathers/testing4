@@ -1908,6 +1908,16 @@ class MetamonOnlineExperiment(MetamonAMAGOExperiment):
         from metamon.env.vectorized.amago_policy import load_collection_policy_state
 
         ckpt_name = os.path.join(self.ckpt_dir, "latest", "policy.pt")
+        # A fresh collect-only smoke run has already loaded --base_weights but
+        # has not written a rolling latest checkpoint. AMAGO's retry loader is
+        # intended for briefly-partial concurrent writes and waits far too long
+        # when the file does not exist at all. Keep the in-memory bootstrap and
+        # return immediately in that case.
+        if not os.path.isfile(ckpt_name):
+            self.accelerator.print(
+                "No rolling latest policy yet; continuing with loaded bootstrap."
+            )
+            return
         ckpt = amago.utils.retry_load_checkpoint(ckpt_name, map_location=self.DEVICE)
         if ckpt is None:
             amago.utils.amago_warning("Latest policy checkpoint was not loaded.")
