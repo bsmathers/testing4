@@ -159,19 +159,6 @@ class ConfigBatchedOpponent(BatchedOpponent):
             driver.hidden_state = None
             driver.policy = None
 
-    def release_gpu_memory(self) -> None:
-        """Evict the active opponent while a persistent collector is parked."""
-        bundles = list(self._cache.values())
-        self._cache.clear()
-        self._bundle = None
-        self._active_key = None
-        for bundle in bundles:
-            self._free_bundle(bundle)
-        del bundles
-        gc.collect()
-        if self.device.type == "cuda":
-            torch.cuda.empty_cache()
-
     def configure(self, spec: Optional["PolicySpec"] = None) -> "PolicySpec":
         """Activate one sampled (or explicit) opponent for all lanes."""
         if spec is None:
