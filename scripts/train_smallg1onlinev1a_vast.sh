@@ -802,6 +802,33 @@ if [[ "${CALIBRATION_ONLY:-0}" == "1" ]]; then
   exit 0
 fi
 
+if [[ "${TRAIN_VARIANT}" == "snorlax_v1" && "${ALTERNATE_COLLECT_LEARN}" == "1" \
+    && "${SNORLAX_PERSISTENT_ALTERNATION:-1}" == "1" ]]; then
+  log "Launching persistent Snorlax learner; collectors will cycle without rebuilding the learner or offline indexes"
+  export SNORLAX_PERSISTENT_ALTERNATION=1
+  export SNORLAX_BUFFER_DIR="${BUFFER_DIR}"
+  export SNORLAX_LOG_DIR="${LOG_DIR}"
+  export SNORLAX_LATEST_WEIGHTS="${LATEST}"
+  export SNORLAX_RUN_CONFIG="${RUN_CONFIG}"
+  export RUNNER_MODULE COLLECTOR_PROCESSES COLLECTOR_DTYPE LANES COLLECTOR_WORKERS
+  export GAMES_PER_LEARNER_EPOCH METAMON_SAVE_DIR MIXED_PRECISION
+  export VALIDATION_INTERVAL VALIDATION_TIMESTEPS
+  set +e
+  "${PYTHON_BIN}" -m "${RUNNER_MODULE}" \
+    --run_config "${RUN_CONFIG}" --mode learn \
+    --run_name "${RUN_NAME}" --lanes "${LANES}" --n_workers "${COLLECTOR_WORKERS}" \
+    --save_dir "${SAVE_DIR}" --buffer_dir "${BUFFER_DIR}" --log \
+    --epochs "${TOTAL_LEARNER_EPOCHS}" --ckpt_interval 1 --full_state_ckpt_interval 1 \
+    --mixed_precision "${MIXED_PRECISION}" --dloader_workers "${DLOADER_WORKERS}" \
+    "${LEARNER_RESUME_ARGS[@]}" \
+    2>&1 | tee -a "${LOG_DIR}/learner.log"
+  learner_status="${PIPESTATUS[0]}"
+  set -e
+  (( learner_status == 0 )) \
+    || die "Persistent Snorlax learner exited with status ${learner_status}"
+  exit 0
+fi
+
 if [[ "${ALTERNATE_COLLECT_LEARN}" == "1" ]]; then
   completed_epoch="${RESUME_EPOCH:--1}"
   next_epoch=$((completed_epoch + 1))

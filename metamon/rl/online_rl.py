@@ -986,6 +986,7 @@ def create_online_experiment(
         wandb_entity=WANDB_ENTITY,
         verbose=True,
         padded_sampling="none",
+        log_interval=max(1, int(os.environ.get("METAMON_LOG_INTERVAL", "50"))),
         dloader_workers=dloader_workers,
         traj_save_len=int(1e10),
         stagger_traj_file_lengths=False,

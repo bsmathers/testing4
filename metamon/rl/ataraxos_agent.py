@@ -164,6 +164,7 @@ class AtaraxosAgent(MultiTaskAgent):
         self._l2sp_anchor = anchor
 
     def on_checkpoint_loaded(self, is_resume: bool = False):
+        self._ataraxos_host_step = int(self._ataraxos_step.item())
         # Collectors never evaluate the training loss and should not spend GPU
         # memory on a second frozen copy of the policy parameters.
         if os.environ.get("METAMON_RUN_MODE") != "learn" or self.l2sp_coef <= 0.0:
@@ -251,24 +252,26 @@ class AtaraxosAgent(MultiTaskAgent):
         online = source & behavior_valid & valid.bool()
         offline_states = (~source) & valid.bool()
 
-        # These checks guard the two invariants that make PPO's importance
-        # ratio meaningful: the stored behavior distribution is normalized,
-        # and the recorded action was legal under that exact distribution.
-        behavior_legal = batch.obs[keys.BEHAVIOR_LEGAL][:, :T].bool()
-        old_probs = old_all_lp.exp()
-        online_rows = online.expand_as(old_probs)
-        if not torch.isfinite(old_all_lp[online_rows]).all():
-            raise RuntimeError("Ataraxos behavior log probabilities are non-finite")
-        old_mass = old_probs.sum(-1, keepdim=True)
-        if not torch.allclose(
-            old_mass[online], torch.ones_like(old_mass[online]), atol=2e-3, rtol=0.0
-        ):
-            raise RuntimeError("Ataraxos behavior probabilities do not sum to one")
-        if (old_probs[online_rows & ~behavior_legal] > 1e-8).any():
-            raise RuntimeError("Ataraxos behavior policy assigns mass to an illegal action")
-        chosen_legal = behavior_legal.gather(-1, chosen.unsqueeze(-1))
-        if not chosen_legal[online].all():
-            raise RuntimeError("Ataraxos replay contains an illegal recorded action")
+        # Replay loading already validates these invariants, and the launcher
+        # fully validates the FIFO before training. Repeating four device-to-host
+        # assertions every update serializes the CUDA pipeline. Keep an opt-in
+        # diagnostic path for corruption investigations.
+        if os.environ.get("METAMON_STRICT_BATCH_CHECKS") == "1":
+            behavior_legal = batch.obs[keys.BEHAVIOR_LEGAL][:, :T].bool()
+            old_probs = old_all_lp.exp()
+            online_rows = online.expand_as(old_probs)
+            if not torch.isfinite(old_all_lp[online_rows]).all():
+                raise RuntimeError("Ataraxos behavior log probabilities are non-finite")
+            old_mass = old_probs.sum(-1, keepdim=True)
+            if not torch.allclose(
+                old_mass[online], torch.ones_like(old_mass[online]), atol=2e-3, rtol=0.0
+            ):
+                raise RuntimeError("Ataraxos behavior probabilities do not sum to one")
+            if (old_probs[online_rows & ~behavior_legal] > 1e-8).any():
+                raise RuntimeError("Ataraxos behavior policy assigns mass to an illegal action")
+            chosen_legal = behavior_legal.gather(-1, chosen.unsqueeze(-1))
+            if not chosen_legal[online].all():
+                raise RuntimeError("Ataraxos replay contains an illegal recorded action")
 
         # These were computed over the full game before the replay loader took
         # a random sequence window, so the window boundary is not a false
@@ -312,10 +315,13 @@ class AtaraxosAgent(MultiTaskAgent):
             (values[:, :T] - outcome).square(), offline_states
         )
 
-        step = int(self._ataraxos_step.item())
-        online_mass = float(self._ataraxos_online_mass.item())
-        temperature = self.magnet_coef / ((online_mass + 1.0) ** self.magnet_decay)
-        temperature = min(max(temperature, self.magnet_floor), self.magnet_ceil)
+        step = getattr(self, "_ataraxos_host_step", None)
+        if step is None:
+            step = int(self._ataraxos_step.item())
+        temperature = (
+            self.magnet_coef
+            / (self._ataraxos_online_mass.float() + 1.0).pow(self.magnet_decay)
+        ).clamp(self.magnet_floor, self.magnet_ceil)
         online_loss = (
             ppo + self.behavior_kl_coef * behavior_kl
             + temperature * magnet_kl + self.value_coef * online_value
@@ -349,6 +355,7 @@ class AtaraxosAgent(MultiTaskAgent):
             loss = loss + self.l2sp_coef * l2sp_scale * l2sp_penalty
         self._ataraxos_step.add_(1)
         self._ataraxos_online_mass.add_(batch_online_fraction.detach())
+        self._ataraxos_host_step = step + 1
 
         if log_step:
             self.update_info = {
@@ -359,8 +366,8 @@ class AtaraxosAgent(MultiTaskAgent):
                 "Ataraxos/Uniform KL": magnet_kl.detach(),
                 "Ataraxos/Value Loss": online_value.detach(),
                 "Ataraxos/Offline CE": offline_ce.detach(),
-                "Ataraxos/Magnet Coef": float(temperature),
-                "Ataraxos/Online Mass": float(online_mass),
+                "Ataraxos/Magnet Coef": temperature.detach(),
+                "Ataraxos/Online Mass": self._ataraxos_online_mass.detach(),
                 "Ataraxos/Batch Online Fraction": batch_online_fraction.detach(),
                 "Ataraxos/Offline Actor Weight": _masked_mean(
                     offline_actor_weight, offline_states

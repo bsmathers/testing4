@@ -16,6 +16,7 @@ extension, with log-space averaging weights for long-running jobs.
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Iterable
 
 import torch
@@ -141,10 +142,13 @@ class RecentScheduleFreeAdamW(torch.optim.Optimizer):
             correction1 = 1.0 - inner**step
             correction2 = 1.0 - beta2**step
 
-            for parameter in group["params"]:
+            parameters = [
+                parameter
+                for parameter in group["params"]
+                if parameter.grad is not None
+            ]
+            for parameter in parameters:
                 gradient = parameter.grad
-                if gradient is None:
-                    continue
                 if gradient.is_sparse:
                     raise RuntimeError(
                         "Schedule-Free AdamW does not support sparse gradients"
@@ -160,6 +164,49 @@ class RecentScheduleFreeAdamW(torch.optim.Optimizer):
                     state["exp_avg_sq"] = torch.zeros_like(
                         parameter, memory_format=torch.preserve_format
                     )
+
+            # The model contains hundreds of parameter tensors. Issuing the
+            # Adam/Schedule-Free algebra as individual CUDA kernels makes the
+            # optimizer launch-bound, so batch it through PyTorch's multi-tensor
+            # implementation. Keep the scalar loop for CPU/debug portability.
+            use_foreach = (
+                bool(parameters)
+                and parameters[0].is_cuda
+                and os.environ.get("METAMON_DISABLE_FOREACH_OPTIMIZER") != "1"
+            )
+            if use_foreach:
+                gradients = [parameter.grad for parameter in parameters]
+                states = [self.state[parameter] for parameter in parameters]
+                z_values = [state["z"] for state in states]
+                exp_avgs = [state["exp_avg"] for state in states]
+                exp_avg_sqs = [state["exp_avg_sq"] for state in states]
+
+                torch._foreach_mul_(exp_avgs, inner)
+                torch._foreach_add_(exp_avgs, gradients, alpha=1.0 - inner)
+                torch._foreach_mul_(exp_avg_sqs, beta2)
+                torch._foreach_addcmul_(
+                    exp_avg_sqs, gradients, gradients, value=1.0 - beta2
+                )
+                directions = torch._foreach_div(exp_avgs, correction1)
+                denominators = torch._foreach_div(exp_avg_sqs, correction2)
+                torch._foreach_sqrt_(denominators)
+                torch._foreach_add_(denominators, eps)
+                torch._foreach_div_(directions, denominators)
+                if decay != 0.0:
+                    torch._foreach_add_(directions, parameters, alpha=decay)
+                torch._foreach_lerp_(parameters, z_values, ckp1)
+                torch._foreach_add_(
+                    parameters,
+                    directions,
+                    alpha=lr * (beta * (1.0 - ckp1) - 1.0),
+                )
+                torch._foreach_add_(z_values, directions, alpha=-lr)
+                group["k"] = step
+                continue
+
+            for parameter in parameters:
+                gradient = parameter.grad
+                state = self.state[parameter]
 
                 z = state["z"]
                 exp_avg = state["exp_avg"]

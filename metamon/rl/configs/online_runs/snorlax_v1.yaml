@@ -27,7 +27,7 @@ steps_per_epoch: 1000
 ckpt_interval: 1
 full_state_ckpt_interval: 1
 mixed_precision: "bf16"
-dloader_workers: 16
+dloader_workers: 32
 
 lanes: 96
 n_workers: 8

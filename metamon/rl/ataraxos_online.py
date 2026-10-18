@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
-import json
 import os
 import shutil
+import subprocess
+import sys
 import time
+from pathlib import Path
 
 import amago
 import lz4.frame
 import numpy as np
+import orjson
 import torch
 from amago.loading import RLDataset
 
@@ -123,10 +126,10 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
             try:
                 if filename.endswith(".lz4"):
                     with lz4.frame.open(filename, "rb") as f:
-                        payload = json.loads(f.read().decode("utf-8"))
+                        payload = orjson.loads(f.read())
                 else:
-                    with open(filename, "r", encoding="utf-8") as f:
-                        payload = json.load(f)
+                    with open(filename, "rb") as f:
+                        payload = orjson.loads(f.read())
                 v = np.asarray(payload["behavior_values"], dtype=np.float32)
                 states = payload["states"]
                 actions = payload["actions"]
@@ -184,7 +187,7 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
                 KeyError,
                 ValueError,
                 TypeError,
-                json.JSONDecodeError,
+                orjson.JSONDecodeError,
             ) as exc:
                 raise RuntimeError(
                     f"invalid online FIFO replay: {filename}: {exc}"
@@ -213,6 +216,209 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
     # Keep the current epoch plus the previous 64 so every configured lineage
     # offset (through -64) resolves to its exact policy checkpoint.
     _CHECKPOINT_RECENT_COUNT = 65
+
+    @staticmethod
+    def _replay_names(root: Path) -> set[str]:
+        return {
+            entry.name
+            for entry in os.scandir(root)
+            if entry.is_file()
+            and (entry.name.endswith(".json") or entry.name.endswith(".json.lz4"))
+        }
+
+    def _external_collect_phase(self, epoch: int) -> None:
+        """Collect one epoch while retaining this learner and its dataset indexes."""
+        buffer_dir = Path(os.environ["SNORLAX_BUFFER_DIR"])
+        replay_dir = buffer_dir / "gen1ou"
+        log_dir = Path(os.environ["SNORLAX_LOG_DIR"])
+        latest = os.environ["SNORLAX_LATEST_WEIGHTS"]
+        target = int(os.environ.get("GAMES_PER_LEARNER_EPOCH", "2000"))
+        processes = int(os.environ.get("COLLECTOR_PROCESSES", "8"))
+        lanes = int(os.environ.get("LANES", "64"))
+        workers = int(os.environ.get("COLLECTOR_WORKERS", "8"))
+        dtype = os.environ.get("COLLECTOR_DTYPE", "bf16")
+        collector_mp = "no" if dtype == "fp32" else dtype
+        run_config = os.environ["SNORLAX_RUN_CONFIG"]
+        module = os.environ.get("RUNNER_MODULE", "metamon.rl.ataraxos_online")
+        save_dir = os.environ["METAMON_SAVE_DIR"]
+        baseline = self._replay_names(replay_dir)
+        children: list[tuple[subprocess.Popen, object]] = []
+        self.optimizer.eval()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print(
+            f"[PersistentCycle] collect epoch={epoch} target={target} "
+            f"processes={processes} lanes={lanes}",
+            flush=True,
+        )
+        try:
+            for idx in range(processes):
+                log_path = log_dir / f"collector-epoch-{epoch}-{idx}.log"
+                stream = log_path.open("a", encoding="utf-8", buffering=1)
+                child_env = dict(os.environ)
+                child_env.pop("SNORLAX_PERSISTENT_ALTERNATION", None)
+                child_env.update(
+                    METAMON_RUN_MODE="collect",
+                    OMP_NUM_THREADS="1",
+                    MKL_NUM_THREADS="1",
+                    OPENBLAS_NUM_THREADS="1",
+                    NUMEXPR_NUM_THREADS="1",
+                )
+                command = [
+                    sys.executable, "-m", module,
+                    "--run_config", run_config,
+                    "--mode", "collect",
+                    "--run_name", self.run_name,
+                    "--lanes", str(lanes),
+                    "--n_workers", str(workers),
+                    "--save_dir", save_dir,
+                    "--buffer_dir", str(buffer_dir),
+                    "--base_weights", latest,
+                    "--epochs", "1000000",
+                    "--seed", str(1000 + epoch * processes + idx),
+                    "--mixed_precision", collector_mp,
+                ]
+                children.append(
+                    (subprocess.Popen(command, env=child_env, stdout=stream, stderr=subprocess.STDOUT), stream)
+                )
+            fresh = 0
+            while fresh < target:
+                time.sleep(10)
+                for child, _stream in children:
+                    status = child.poll()
+                    if status is not None:
+                        raise RuntimeError(
+                            f"collector exited with status {status}; inspect {log_dir}/collector-epoch-{epoch}-*.log"
+                        )
+                fresh = len(self._replay_names(replay_dir) - baseline)
+                print(f"[PersistentCycle] collect epoch={epoch} {fresh}/{target}", flush=True)
+        finally:
+            for child, _stream in children:
+                if child.poll() is None:
+                    child.terminate()
+            for child, stream in children:
+                try:
+                    child.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait(timeout=10)
+                stream.close()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _external_validation_phase(self, epoch: int) -> None:
+        interval = int(os.environ.get("VALIDATION_INTERVAL", "0"))
+        if interval <= 0 or epoch % interval:
+            return
+        latest = os.environ["SNORLAX_LATEST_WEIGHTS"]
+        log_dir = Path(os.environ["SNORLAX_LOG_DIR"])
+        child_env = dict(os.environ)
+        child_env.pop("SNORLAX_PERSISTENT_ALTERNATION", None)
+        child_env["METAMON_RUN_MODE"] = "validate"
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        command = [
+            sys.executable,
+            "-m",
+            os.environ.get("RUNNER_MODULE", "metamon.rl.ataraxos_online"),
+            "--run_config",
+            os.environ["SNORLAX_RUN_CONFIG"],
+            "--mode",
+            "validate",
+            "--validation_once",
+            "--validation_epoch",
+            str(epoch),
+            "--run_name",
+            self.run_name,
+            "--lanes",
+            os.environ.get("LANES", "64"),
+            "--n_workers",
+            os.environ.get("COLLECTOR_WORKERS", "8"),
+            "--save_dir",
+            os.environ["METAMON_SAVE_DIR"],
+            "--buffer_dir",
+            os.environ["SNORLAX_BUFFER_DIR"],
+            "--base_weights",
+            latest,
+            "--val_timesteps",
+            os.environ.get("VALIDATION_TIMESTEPS", "1000"),
+            "--val_interval",
+            "1",
+            "--mixed_precision",
+            os.environ.get("MIXED_PRECISION", "bf16"),
+            "--log",
+        ]
+        print(f"[PersistentCycle] validation epoch={epoch}", flush=True)
+        with (log_dir / "validation.log").open("a", encoding="utf-8") as stream:
+            result = subprocess.run(
+                command,
+                env=child_env,
+                stdout=stream,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+        if result.returncode:
+            raise RuntimeError(
+                f"validation epoch {epoch} exited with status {result.returncode}"
+            )
+
+    def learn(self):
+        if os.environ.get("SNORLAX_PERSISTENT_ALTERNATION") != "1":
+            return super().learn()
+
+        from tqdm import tqdm
+
+        start_epoch = self.epoch
+        for epoch in range(start_epoch, self.epochs):
+            self.epoch = epoch
+            self.policy_aclr.eval()
+            self._external_collect_phase(epoch)
+            self.accelerator.wait_for_everyone()
+
+            dset_log = self.dataset.on_end_of_collection(experiment=self)
+            self.log(dset_log, key="dataset")
+            self.init_dloaders()
+            if not self.dataset.ready_for_training:
+                raise RuntimeError("Snorlax FIFO became unavailable after collection")
+
+            self.policy_aclr.train()
+            loader = iter(self.train_dloader)
+            progress = tqdm(
+                range(self.train_batches_per_epoch),
+                desc=f"{self.run_name} Epoch {epoch} Train",
+                colour="green",
+            ) if self.verbose else range(self.train_batches_per_epoch)
+            block_started = time.perf_counter()
+            data_seconds = 0.0
+            for train_step in progress:
+                data_started = time.perf_counter()
+                batch = next(loader)
+                data_seconds += time.perf_counter() - data_started
+                total_step = epoch * self.train_batches_per_epoch + train_step
+                log_step = total_step % self.log_interval == 0
+                loss_dict = self.train_step(batch, log_step=log_step)
+                if log_step:
+                    self.log(loss_dict, key="train-update")
+                if (train_step + 1) % 20 == 0:
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    elapsed = time.perf_counter() - block_started
+                    print(
+                        f"[LearnerProfile] epoch={epoch} step={train_step + 1} "
+                        f"rate={20.0 / elapsed:.2f}it/s data_wait={100.0 * data_seconds / elapsed:.1f}%",
+                        flush=True,
+                    )
+                    block_started = time.perf_counter()
+                    data_seconds = 0.0
+            self.accelerator.wait_for_everyone()
+            del loader
+            del self.train_dloader
+
+            if self.ckpt_interval and epoch % self.ckpt_interval == 0:
+                self.save_checkpoint()
+            if self.always_save_latest:
+                self.write_latest_policy()
+            self._external_validation_phase(epoch)
 
     @classmethod
     def _prune_numbered_checkpoints(
@@ -360,6 +566,11 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             epoch, resume_training_state=resume_training_state
         )
         if resume_training_state:
+            # AMAGO labels a state with the epoch that has already completed,
+            # but its stock loader assigns that same value to self.epoch.
+            # learn() treats self.epoch as the next epoch to run, so advance it
+            # here instead of silently repeating a completed 1,000-step block.
+            self.epoch = epoch + 1
             optimizer_step = self._optimizer_update_step()
             policy_step = int(self.policy._ataraxos_step.item())
             if int(getattr(self, "batches_per_update", 1)) == 1:
