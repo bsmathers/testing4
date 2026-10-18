@@ -103,10 +103,14 @@ log "Launching commit ${commit}; progress will also be written to ${run_log}"
 
 export REPO_DIR PERSIST_ROOT GOOD_REPLAYS_DIR PYTHON_BIN
 if (( cpu_count >= 64 && vram_mib >= 30000 )); then
-  default_collector_processes=2
-  default_lanes=128
-  default_collector_workers=16
-  default_partial_hidden_chunk=32
+  # Parsing two battle POVs and building observations are Python-bound. Use
+  # several independent coordinators on large hosts instead of making two
+  # coordinators manage ever-larger lane batches. The 5090 has ample memory for
+  # these actor-only bf16 policies and their compact 33-step KV caches.
+  default_collector_processes=8
+  default_lanes=64
+  default_collector_workers=8
+  default_partial_hidden_chunk=64
 else
   default_collector_processes=1
   default_lanes=96

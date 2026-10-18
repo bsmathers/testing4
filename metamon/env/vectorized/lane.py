@@ -20,9 +20,10 @@ called by :class:`~metamon.env.vectorized.sim_process.ShowdownSimProcess`.
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Dict, List, Optional, Tuple
+
+import orjson
 
 import metamon.backend
 from metamon.env.metamon_battle import MetamonBackendBattle
@@ -135,8 +136,8 @@ class StreamBattleLane:
                 body = line[len("|request|") :]
                 if body:
                     try:
-                        req = json.loads(body)
-                    except json.JSONDecodeError:
+                        req = orjson.loads(body)
+                    except orjson.JSONDecodeError:
                         continue
                     battle.parse_request(req)
                     self._on_request(stream, req)

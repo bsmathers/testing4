@@ -395,9 +395,14 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
 
         obs, rl2s, tids = get_t()
         episodes_finished = 0
+        target = envs.env
+        while not hasattr(target, "record_policy_metadata") and hasattr(target, "env"):
+            target = target.env
+        if not hasattr(target, "record_policy_metadata"):
+            raise RuntimeError("Ataraxos collection env cannot record policy metadata")
         for _ in range(timesteps):
             self.on_interact_step(obs)
-            with torch.no_grad(), self.caster():
+            with torch.inference_mode(), self.caster():
                 actions, hidden_state, behavior_lp, behavior_v = policy.get_actions_with_metadata(
                     obs=obs, rl2s=rl2s, time_idxs=tids,
                     sample=sample, hidden_state=hidden_state,
@@ -416,11 +421,6 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                 dim=-1,
             ).cpu().numpy()
             host_actions = host[:, 0].astype(np.int64, copy=False)
-            target = envs.env
-            while not hasattr(target, "record_policy_metadata") and hasattr(target, "env"):
-                target = target.env
-            if not hasattr(target, "record_policy_metadata"):
-                raise RuntimeError("Ataraxos collection env cannot record policy metadata")
             target.record_policy_metadata(
                 host[:, 1 : 1 + action_dim],
                 host[:, 1 + action_dim],

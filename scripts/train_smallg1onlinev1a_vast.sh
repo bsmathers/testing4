@@ -660,7 +660,14 @@ start_collectors() {
   [[ "${collector_mp}" == "fp32" ]] && collector_mp=no
   for ((i=0; i<COLLECTOR_PROCESSES; i++)); do
     seed=$((seed_base + i))
-    "${collector_prefix[@]}" "${PYTHON_BIN}" -m "${RUNNER_MODULE}" \
+    # Collector inference is on the GPU. Large inherited BLAS thread pools only
+    # oversubscribe the host and slow the Python simulation coordinators down.
+    "${collector_prefix[@]}" \
+      OMP_NUM_THREADS="${COLLECTOR_CPU_THREADS:-1}" \
+      MKL_NUM_THREADS="${COLLECTOR_CPU_THREADS:-1}" \
+      OPENBLAS_NUM_THREADS="${COLLECTOR_CPU_THREADS:-1}" \
+      NUMEXPR_NUM_THREADS="${COLLECTOR_CPU_THREADS:-1}" \
+      "${PYTHON_BIN}" -m "${RUNNER_MODULE}" \
       --run_config "${RUN_CONFIG}" --mode collect \
       --run_name "${RUN_NAME}" --lanes "${LANES}" --n_workers "${COLLECTOR_WORKERS}" \
       --save_dir "${SAVE_DIR}" --buffer_dir "${BUFFER_DIR}" \

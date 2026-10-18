@@ -14,7 +14,6 @@ and routes them. The per-lane parsing/observation logic lives in
 
 from __future__ import annotations
 
-import json
 import os
 import queue
 import struct
@@ -22,6 +21,8 @@ import subprocess
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
+
+import orjson
 
 
 HOST_SCRIPT = os.environ.get(
@@ -222,7 +223,7 @@ class ShowdownSimProcess:
                 f"{self._proc.returncode}). stderr:\n"
                 + "\n".join(self._stderr_lines[-20:])
             )
-        line = (json.dumps(msg, separators=(",", ":")) + "\n").encode("utf-8")
+        line = orjson.dumps(msg) + b"\n"
         with self._write_lock:
             assert self._proc.stdin is not None
             self._proc.stdin.write(line)
@@ -389,7 +390,7 @@ class ShowdownSimProcess:
                 pass
 
     def _send_close(self) -> None:
-        line = (json.dumps({"cmd": "close"}) + "\n").encode("utf-8")
+        line = orjson.dumps({"cmd": "close"}) + b"\n"
         with self._write_lock:
             if self._proc.stdin is not None:
                 self._proc.stdin.write(line)

@@ -32,6 +32,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import gymnasium as gym
 import lz4.frame
 import numpy as np
+import orjson
 
 from metamon.interface import (
     ActionSpace,
@@ -973,7 +974,7 @@ class VectorizedShowdownEnv(gym.Env):
             path = os.path.join(self.save_trajectories_to, filename)
             temp_path = path + ".tmp"
             with lz4.frame.open(temp_path, "wb") as f:
-                f.write(json.dumps(output_json).encode("utf-8"))
+                f.write(orjson.dumps(output_json))
             os.rename(temp_path, path)
 
         if self.save_results_to is not None:
