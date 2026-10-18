@@ -409,7 +409,7 @@ if [[ "${TRAIN_VARIANT}" == "snorlax_v1" ]]; then
   [[ "${ONLINE_FIFO_SIZE}" == "5000" ]] || die "snorlax_v1 requires a 5000-game FIFO"
   [[ "${GRAD_ACCUM}" == "1" ]] || die "snorlax_v1 requires GRAD_ACCUM=1"
   [[ "${BATCH_SIZE_PER_GPU}" == "14" ]] || die "snorlax_v1 requires batch size 14"
-  [[ "${DLOADER_WORKERS}" == "0" ]] || die "snorlax_v1 requires DLOADER_WORKERS=0 for deterministic sampling"
+  (( DLOADER_WORKERS >= 1 )) || die "snorlax_v1 requires at least one replay-loader worker"
   if [[ ! -f "${ASSETS_MARKER}" ]]; then
     "${PYTHON_BIN}" - <<'PY'
 import json
@@ -837,6 +837,7 @@ if [[ "${ALTERNATE_COLLECT_LEARN}" == "1" ]]; then
       --run_name "${RUN_NAME}" --lanes "${LANES}" --n_workers "${COLLECTOR_WORKERS}" \
       --save_dir "${SAVE_DIR}" --buffer_dir "${BUFFER_DIR}" --log \
       --epochs "${learner_limit}" --ckpt_interval 1 --full_state_ckpt_interval 1 \
+      --mixed_precision "${MIXED_PRECISION}" --dloader_workers "${DLOADER_WORKERS}" \
       "${cycle_resume[@]}" \
       2>&1 | tee -a "${LOG_DIR}/learner.log"
     learner_status="${PIPESTATUS[0]}"
@@ -881,6 +882,7 @@ set +e
   --run_config "${RUN_CONFIG}" --mode learn \
   --run_name "${RUN_NAME}" --lanes "${LANES}" --n_workers "${COLLECTOR_WORKERS}" \
   --save_dir "${SAVE_DIR}" --buffer_dir "${BUFFER_DIR}" --log \
+  --mixed_precision "${MIXED_PRECISION}" --dloader_workers "${DLOADER_WORKERS}" \
   "${LEARNER_RESUME_ARGS[@]}" \
   2>&1 | tee -a "${LOG_DIR}/learner.log"
 learner_status="${PIPESTATUS[0]}"
