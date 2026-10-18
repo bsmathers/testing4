@@ -134,6 +134,25 @@ def preflight() -> None:
         if len(public_rows) != 6 or len(static_rows) + len(discovered_rows) != 12:
             raise RuntimeError("Snorlax opponent pool lost its intended 6/6 split")
 
+    # Snorlax deliberately starts with no advantage filtering while the fresh
+    # value head calibrates, then ramps to retaining the top 75% of online
+    # states (25th-percentile |A| cutoff) by epoch 100.
+    from metamon.rl.ataraxos_online import BalancedAtaraxosMixture
+
+    expected_filter = {
+        0: (0.0, 0.0),
+        50: (0.125, 0.005),
+        100: (0.25, 0.01),
+        200: (0.25, 0.01),
+    }
+    for epoch, expected in expected_filter.items():
+        actual = BalancedAtaraxosMixture._advantage_filter_params(epoch)
+        if not np.allclose(actual, expected, atol=1e-12, rtol=0.0):
+            raise RuntimeError(
+                f"wrong advantage-filter ramp at epoch {epoch}: "
+                f"got {actual}, expected {expected}"
+            )
+
     # A collector seed must determine the complete draw, not just which pool
     # row was selected. Check checkpoint, temperature, and team-set sampling.
     seeded_raw = {
@@ -163,7 +182,8 @@ def preflight() -> None:
 
     print(
         "PASS: imports, lane-preserving action conversion, exact 12-row league, "
-        "seeded nested opponent draws, exact retention/offset lineage, "
+        "seeded nested opponent draws, conservative advantage-filter ramp, "
+        "exact retention/offset lineage, "
         f"observation space, and {action_dim}-action interface",
         flush=True,
     )
