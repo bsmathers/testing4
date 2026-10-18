@@ -2,8 +2,8 @@
 set -Eeuo pipefail
 
 # Canonical SnorlaxV1 training entry point. SnorlaxV1 is the Ataraxos-inspired
-# schedule-free continuation of Epoch475, with a 5k replay FIFO and a 0% -> 50%
-# online ramp over the first 100 learner epochs.
+# schedule-free continuation of Epoch475, with a 5k replay FIFO and a fixed
+# 50/50 online/offline learner mixture from the first epoch.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PERSIST_ROOT="${PERSIST_ROOT:-/workspace/snorlax-v1}"
