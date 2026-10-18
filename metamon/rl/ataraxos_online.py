@@ -17,7 +17,7 @@ import numpy as np
 import orjson
 import torch
 from amago.loading import MAGIC_PAD_VAL, RLDataset, RLData_pad_collate
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, get_worker_info
 
 from metamon.rl import ataraxos_keys as keys
 from metamon.rl import taurosv1b_online as v1b
@@ -123,8 +123,17 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
         # the first ramp epochs contain only a handful of online trajectories.
         # At the 0.5 cap this alternates sources and yields exactly 7/7 in every
         # batch of 14.
-        before = int(self._sample_idx * self.current_online_weight + 1e-9)
-        after = int((self._sample_idx + 1) * self.current_online_weight + 1e-9)
+        worker = get_worker_info()
+        # Each loader worker owns a private counter. Stagger their phases so
+        # small early-ramp weights are not rounded down independently in every
+        # worker. The 50% cap remains exactly 7/7 in every 14-sample batch.
+        phase = 0.0 if worker is None else worker.id / float(worker.num_workers)
+        before = int(
+            self._sample_idx * self.current_online_weight + phase + 1e-9
+        )
+        after = int(
+            (self._sample_idx + 1) * self.current_online_weight + phase + 1e-9
+        )
         dataset = self.fifo if after > before else self.offline
         self._sample_idx += 1
         if not self.fifo.ready_for_training:
@@ -303,6 +312,16 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             ready = bool(matches and int(matches[-1][0]) >= int(matches[-1][1]))
             if ready:
                 self._mark_collection_ready(epoch)
+        # Do not trust a retained marker/log after the replay buffer was erased
+        # or only partially restored on a replacement instance.
+        min_fifo = int(os.environ.get("ONLINE_FIFO_SIZE", "5000"))
+        replay_dir = Path(os.environ["SNORLAX_BUFFER_DIR"]) / "gen1ou"
+        try:
+            replay_count = len(self._replay_names(replay_dir))
+        except FileNotFoundError:
+            replay_count = 0
+        if ready and replay_count < min_fifo:
+            ready = False
         if not ready:
             marker.unlink(missing_ok=True)
         return ready
