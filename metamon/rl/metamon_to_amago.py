@@ -333,6 +333,10 @@ def make_placeholder_experiment(
         ckpt_interval=None,
         always_save_latest=False,
         always_load_latest=False,
+        # Accelerate owns one precision mode per process. Passing None reuses an
+        # existing collector/learner mode, while still defaulting to full
+        # precision when a pretrained model is initialized standalone.
+        mixed_precision=None,
         log_interval=1,
         batch_size=1,
         dloader_workers=0,
@@ -341,6 +345,8 @@ def make_placeholder_experiment(
         wandb_entity=os.environ.get("METAMON_WANDB_ENTITY"),
         verbose=True,
     )
+    # AMAGO expects this field to remain a string in summaries and autocasting.
+    experiment.mixed_precision = experiment.accelerator.mixed_precision
     return experiment
 
 
