@@ -107,11 +107,9 @@ if (( cpu_count >= 64 && vram_mib >= 30000 )); then
   # several independent coordinators on large hosts instead of making two
   # coordinators manage ever-larger lane batches. The 5090 has ample memory for
   # these actor-only bf16 policies and their compact 33-step KV caches.
-  # Twelve coordinators keep more of a 512-thread host busy while leaving
-  # enough 32 GB GPU headroom for the persistent learner and collector models.
-  # Eight coordinators sustained only ~20 completed battles/s on the target
-  # 5090 host, making each 2k collection phase take roughly 90 seconds.
-  default_collector_processes=12
+  # Eight coordinators are the validated memory-safe default. They are fully
+  # reaped before each learner phase so collector state cannot OOM the learner.
+  default_collector_processes=8
   default_lanes=64
   default_collector_workers=8
   default_partial_hidden_chunk=64

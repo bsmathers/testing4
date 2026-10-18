@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import atexit
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -288,6 +289,47 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                 child.wait(timeout=10)
             stream.close()
 
+    @staticmethod
+    def _collection_ready_marker() -> Path:
+        return Path(os.environ["SNORLAX_LOG_DIR"]) / ".collection-ready"
+
+    def _collection_is_ready(self, epoch: int) -> bool:
+        marker = self._collection_ready_marker()
+        expected = f"collection complete for learner epoch {epoch}"
+        try:
+            ready = marker.read_text(encoding="utf-8").strip() == expected
+        except FileNotFoundError:
+            ready = False
+        if not ready:
+            # Recover runs made before the durable marker existed. The learner
+            # log records the exact completed count before entering training.
+            log_path = Path(os.environ["SNORLAX_LOG_DIR"]) / "learner.log"
+            try:
+                with log_path.open("rb") as stream:
+                    stream.seek(0, os.SEEK_END)
+                    size = stream.tell()
+                    stream.seek(max(0, size - 1_000_000))
+                    tail = stream.read().decode("utf-8", errors="replace")
+            except FileNotFoundError:
+                tail = ""
+            matches = re.findall(
+                rf"\[PersistentCycle\] collect epoch={epoch} (\d+)/(\d+)", tail
+            )
+            ready = bool(matches and int(matches[-1][0]) >= int(matches[-1][1]))
+            if ready:
+                self._mark_collection_ready(epoch)
+        if not ready:
+            marker.unlink(missing_ok=True)
+        return ready
+
+    def _mark_collection_ready(self, epoch: int) -> None:
+        marker = self._collection_ready_marker()
+        temporary = marker.with_suffix(".tmp")
+        temporary.write_text(
+            f"collection complete for learner epoch {epoch}\n", encoding="utf-8"
+        )
+        os.replace(temporary, marker)
+
     def _ensure_external_collectors(self):
         buffer_dir = Path(os.environ["SNORLAX_BUFFER_DIR"])
         log_dir = Path(os.environ["SNORLAX_LOG_DIR"])
@@ -355,13 +397,20 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         return children, pause_file, ack_dir
 
     def _external_collect_phase(self, epoch: int) -> None:
-        """Collect with GPU/env processes retained across learner phases."""
+        """Collect a cycle, then release every collector resource before learning."""
         buffer_dir = Path(os.environ["SNORLAX_BUFFER_DIR"])
         replay_dir = buffer_dir / "gen1ou"
         log_dir = Path(os.environ["SNORLAX_LOG_DIR"])
         target = int(os.environ.get("GAMES_PER_LEARNER_EPOCH", "2000"))
         processes = int(os.environ.get("COLLECTOR_PROCESSES", "8"))
         lanes = int(os.environ.get("LANES", "64"))
+        if self._collection_is_ready(epoch):
+            print(
+                f"[PersistentCycle] collect epoch={epoch} already complete; "
+                "resuming learner",
+                flush=True,
+            )
+            return
         baseline = self._replay_names(replay_dir)
         self.optimizer.eval()
         if torch.cuda.is_available():
@@ -404,6 +453,11 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         except BaseException:
             self._stop_external_collectors()
             raise
+        # Collector processes retain substantial CPU indexes, CUDA contexts,
+        # model weights, and simulator state even while paused. Reap them before
+        # the dataloader and compiled learner allocate their peak memory.
+        self._stop_external_collectors()
+        self._mark_collection_ready(epoch)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -535,6 +589,7 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                 self.save_checkpoint()
             if self.always_save_latest:
                 self.write_latest_policy()
+            self._collection_ready_marker().unlink(missing_ok=True)
             self._external_validation_phase(epoch)
 
     @classmethod
