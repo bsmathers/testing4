@@ -596,6 +596,18 @@ if [[ -d "${STATE_ROOT}" ]]; then
     | sed -n 's/.*_epoch_\([0-9][0-9]*\)$/\1/p' | sort -n | tail -1)"
 fi
 
+# Full optimizer states do not embed the collector implementation version. Do
+# not silently resume a Snorlax learner created before the lane/RL2 fixes.
+ROLLOUT_SCHEMA_MARKER="${PROVISION_DIR}/snorlax-rollout-schema-v2.done"
+if [[ "${TRAIN_VARIANT}" == "snorlax_v1" ]]; then
+  if [[ -n "${RESUME_EPOCH}" && ! -f "${ROLLOUT_SCHEMA_MARKER}" ]]; then
+    die "Existing Snorlax training state predates rollout schema v2; start with a fresh PERSIST_ROOT"
+  fi
+  if [[ ! -f "${ROLLOUT_SCHEMA_MARKER}" ]]; then
+    write_marker "${ROLLOUT_SCHEMA_MARKER}" "Snorlax lane/action-aligned rollout schema v2"
+  fi
+fi
+
 LEARNER_RESUME_ARGS=()
 if [[ -n "${RESUME_EPOCH}" ]]; then
   RESUME_POLICY="${POLICY_ROOT}/policy_epoch_${RESUME_EPOCH}.pt"
