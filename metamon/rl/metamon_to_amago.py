@@ -1468,7 +1468,10 @@ class MetamonGroupedTstepEncoderV2(amago.nets.tstep_encoders.TstepEncoder):
             role_signal = torch.zeros(
                 seq.shape[1], seq.shape[2], device=seq.device, dtype=seq.dtype
             )
-            role_signal[idx] = role
+            # Autocast can leave the embedding in BF16 while adding the FP32
+            # positional embedding promotes ``seq`` (and role_signal) to FP32.
+            # Eager index_put requires exact source/destination dtype parity.
+            role_signal[idx] = role.to(dtype=role_signal.dtype)
             seq = seq + role_signal
 
         # Block-diagonal perceiver → (B, 7, latent_tokens, d_pokemon)
