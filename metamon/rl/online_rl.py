@@ -792,7 +792,14 @@ def _make_val_env(
     seed: Optional[int],
     team_set_name: str = DEFAULT_VAL_TEAM_SET,
 ):
-    team_set = get_metamon_teams(battle_format, team_set_name)
+    # Validation accepts the same scalar/list/weighted YAML team-set syntax as
+    # collection. Passing the YAML path straight to get_metamon_teams() made it
+    # look for a literal cache directory named after the config path.
+    from metamon.rl.evaluate.common import parse_team_set_config, random_choice
+
+    team_set_config = parse_team_set_config(team_set_name)
+    probe_name = str(random_choice(team_set_config))
+    team_set = get_metamon_teams(battle_format, probe_name)
     return partial(
         make_metamon_env,
         battle_format=battle_format,
@@ -800,6 +807,7 @@ def _make_val_env(
         action_space=pretrained.action_space,
         reward_function=reward_function,
         team_set=team_set,
+        player_team_set_config=team_set_config,
         batched_envs=lanes,
         n_workers=n_workers,
         opponent_sample=True,
