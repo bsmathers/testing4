@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import tempfile
 from pathlib import Path
 
@@ -101,9 +102,64 @@ def preflight() -> None:
             raise RuntimeError(f"wrong retained Snorlax offset lineage: {discovered}")
         if early != [6, 9, 10]:
             raise RuntimeError(f"early Snorlax offsets were silently substituted: {early}")
+
+        # The committed Snorlax league must be six public Tauros/Kakuna rows
+        # plus six lineage rows (one explicit Epoch475 anchor and five
+        # history/fill slots). This guards against accidental double expansion
+        # of static num_agents rows.
+        repo_root = Path(__file__).resolve().parents[1]
+        pool_raw = opponent_pool.load_config(
+            str(repo_root / "metamon/rl/configs/opponent_pools/snorlax_v1.yaml")
+        )
+        static_rows, discover_specs = opponent_pool._split_pool_entries(pool_raw)
+        discovered_rows = []
+        for base_name, merged, spec in discover_specs:
+            discovered_rows.extend(
+                opponent_pool._expand_discover_agent(base_name, merged, spec)
+            )
+        if len(static_rows) != 7 or len(discovered_rows) != 5:
+            raise RuntimeError(
+                "Snorlax opponent pool must expand to 7 static + 5 discovered/fill "
+                f"rows, got {len(static_rows)} + {len(discovered_rows)}"
+            )
+        public_rows = [
+            name for name, _ in static_rows
+            if name.startswith(("TaurosV0", "Kakuna"))
+        ]
+        if len(public_rows) != 6 or len(static_rows) + len(discovered_rows) != 12:
+            raise RuntimeError("Snorlax opponent pool lost its intended 6/6 split")
+
+    # A collector seed must determine the complete draw, not just which pool
+    # row was selected. Check checkpoint, temperature, and team-set sampling.
+    seeded_raw = {
+        "defaults": {
+            "checkpoints": [1, 2, 3],
+            "temperatures": [0.75, 1.0, 1.25],
+            "team_set": ["a", "b"],
+        },
+        "agents": {"A": {"model_name": "A"}, "B": {"model_name": "B"}},
+    }
+    pool_a = opponent_pool.OpponentPoolConfig.from_dict(
+        seeded_raw, battle_format="gen1ou", rng=random.Random(20261018)
+    )
+    pool_b = opponent_pool.OpponentPoolConfig.from_dict(
+        seeded_raw, battle_format="gen1ou", rng=random.Random(20261018)
+    )
+    draws_a = [pool_a.sample_opponent() for _ in range(32)]
+    draws_b = [pool_b.sample_opponent() for _ in range(32)]
+    keys_a = [
+        (x.name, x.checkpoint, x.temperature, x.team_set) for x in draws_a
+    ]
+    keys_b = [
+        (x.name, x.checkpoint, x.temperature, x.team_set) for x in draws_b
+    ]
+    if keys_a != keys_b:
+        raise RuntimeError("seeded opponent sampling is not fully reproducible")
+
     print(
-        "PASS: imports, lane-preserving action conversion, exact retention/offset "
-        f"lineage, observation space, and {action_dim}-action interface",
+        "PASS: imports, lane-preserving action conversion, exact 12-row league, "
+        "seeded nested opponent draws, exact retention/offset lineage, "
+        f"observation space, and {action_dim}-action interface",
         flush=True,
     )
 
@@ -354,6 +410,11 @@ def validate_buffer(root: Path) -> None:
             raise RuntimeError(
                 f"learner outcome target has the wrong POV sign for {Path(filename).name}"
             )
+    if unresolved:
+        raise RuntimeError(
+            "schema-v3 collector persisted unresolved trajectories that would "
+            f"receive an invalid zero outcome target: {unresolved}"
+        )
     decisive = wins + losses
     if decisive < 16:
         raise RuntimeError(
