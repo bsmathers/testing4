@@ -10,7 +10,7 @@ It is a one-shot remote training run, not a short local experiment.
 - Add a fresh scalar head trained on zero-sum game outcomes.
 - Alternate 2,000 newly collected games with 1,000 learner updates. Retain a
   5,000-game FIFO, or approximately 2.5 learner epochs of online collection.
-- Ramp online sampling linearly from 0% to 50% over the first 100 epochs.
+- Use a fixed 50/50 online/offline learner mixture from epoch 0. This matches the original Snorlax Ataraxos adaptation and avoids an initial block of pure offline behavior cloning that can rapidly move the Epoch475 policy before self-play gradients are present.
 - Use batch size 14 with deterministic low-discrepancy source allocation.
 - Use clipped PPO, behavior-policy reverse KL, a decaying uniform-policy magnet,
   outcome-value regression, and top-quartile absolute-advantage filtering for
@@ -43,8 +43,10 @@ It is a one-shot remote training run, not a short local experiment.
   every tenth completed epoch; a validation failure stops the launcher.
 
 The online replay schema stores the exact post-mask behavior log probabilities,
-legal-action mask, and behavior-time scalar value for every action. A persistent
-root from an older experiment is rejected rather than mixed into this run.
+legal-action mask, and behavior-time scalar value for every action. Unresolved
+turn-limit/tie trajectories are excluded from this FIFO because they do not have
+a valid terminal zero-sum target. A persistent root from an older experiment is
+rejected rather than mixed into this run.
 
 ## Permanent configuration
 
