@@ -109,10 +109,18 @@ class TaggedDataset(RLDataset):
 
 
 class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
-    """Low-discrepancy sampling for the configured online/offline mixture."""
+    """Low-discrepancy sampling with a conservative advantage-filter ramp."""
+
+    _ADV_QUANTILE_START = 0.0
+    _ADV_QUANTILE_END = 0.25
+    _ADV_FLOOR_START = 0.0
+    _ADV_FLOOR_END = 0.01
+    _ADV_RAMP_END_EPOCH = 100
 
     def __init__(self, *, fifo, offline, **kwargs):
-        self.adv_threshold = 0.01
+        self.adv_threshold = 0.0
+        self.adv_quantile = self._ADV_QUANTILE_START
+        self.adv_floor = self._ADV_FLOOR_START
         self.current_online_weight = 0.0
         self._sample_idx = 0
         tagged_fifo = TaggedDataset(fifo, online=True, owner=self)
@@ -141,6 +149,21 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
         self._sampling_metrics[dataset.dset_name] += 1
         return dataset.sample_random_trajectory()
 
+    @classmethod
+    def _advantage_filter_params(cls, epoch: int) -> tuple[float, float]:
+        """Ramp from no filtering to retaining the top 75% of online states."""
+        end = max(int(cls._ADV_RAMP_END_EPOCH), 1)
+        progress = min(max(float(epoch) / end, 0.0), 1.0)
+        quantile = (
+            cls._ADV_QUANTILE_START
+            + progress * (cls._ADV_QUANTILE_END - cls._ADV_QUANTILE_START)
+        )
+        floor = (
+            cls._ADV_FLOOR_START
+            + progress * (cls._ADV_FLOOR_END - cls._ADV_FLOOR_START)
+        )
+        return float(quantile), float(floor)
+
     def update_dset_weights(self, epoch: int):
         super().update_dset_weights(epoch)
         self.current_online_weight = next(
@@ -148,16 +171,24 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
             if dataset is self.fifo
         )
         self._sample_idx = 0
+        self.adv_quantile, self.adv_floor = self._advantage_filter_params(epoch)
         if self.fifo.ready_for_training and self.current_online_weight > 0.0:
-            self.adv_threshold = self._compute_advantage_threshold()
+            self.adv_threshold = self._compute_advantage_threshold(
+                quantile=self.adv_quantile,
+                floor=self.adv_floor,
+            )
         print(
             f"  [Ataraxos] epoch={epoch} "
             f"online={self.current_online_weight:.4f} "
             f"offline={1.0 - self.current_online_weight:.4f} "
+            f"adv_quantile={self.adv_quantile:.4f} "
+            f"adv_floor={self.adv_floor:.6f} "
             f"adv_threshold={self.adv_threshold:.6f}", flush=True
         )
 
-    def _compute_advantage_threshold(self) -> float:
+    def _compute_advantage_threshold(
+        self, *, quantile: float, floor: float
+    ) -> float:
         parsed = self.fifo.dataset.parsed_replay_dset
         values = []
         wins = losses = unresolved = 0
@@ -261,7 +292,13 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
                 "Ataraxos FIFO has a one-sided outcome collapse: "
                 f"wins={wins}, losses={losses}, unresolved={unresolved}"
             )
-        return max(float(np.quantile(np.asarray(values), 0.75)), 0.01)
+        if not 0.0 <= quantile <= 1.0:
+            raise ValueError(f"advantage-filter quantile must be in [0, 1], got {quantile}")
+        if floor < 0.0:
+            raise ValueError(f"advantage-filter floor must be nonnegative, got {floor}")
+        if quantile == 0.0 and floor == 0.0:
+            return 0.0
+        return max(float(np.quantile(np.asarray(values), quantile)), float(floor))
 
 
 class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
