@@ -584,8 +584,8 @@ BEHAVIOR="${SAVE_DIR}/${RUN_NAME}/ckpts/latest/behavior_policy.pt"
 mkdir -p "$(dirname "${FROZEN}")" "$(dirname "${LATEST}")"
 cp -f "${ONLINE_WEIGHTS}" "${FROZEN}"
 [[ -s "${LATEST}" ]] || cp "${ONLINE_WEIGHTS}" "${LATEST}"
-[[ -s "${BEHAVIOR}" ]] || cp "${ONLINE_WEIGHTS}" "${BEHAVIOR}"
 if [[ "${TRAIN_VARIANT}" == "snorlax_v1" ]]; then
+  [[ -s "${BEHAVIOR}" ]] || cp "${ONLINE_WEIGHTS}" "${BEHAVIOR}"
   mkdir -p "${SAVE_DIR}/${RUN_NAME}/ckpts/policy_weights"
   BASE_SNAPSHOT="${SAVE_DIR}/${RUN_NAME}/ckpts/policy_weights/policy_epoch_0.pt"
   [[ -s "${BASE_SNAPSHOT}" ]] || cp "${ONLINE_WEIGHTS}" "${BASE_SNAPSHOT}"
@@ -764,7 +764,9 @@ start_collectors() {
   local -a collector_prefix
   local collector_mp="${COLLECTOR_DTYPE}"
   local collector_weights="${LATEST}"
-  [[ -s "${BEHAVIOR}" ]] && collector_weights="${BEHAVIOR}"
+  if [[ "${TRAIN_VARIANT}" == "snorlax_v1" && -s "${BEHAVIOR}" ]]; then
+    collector_weights="${BEHAVIOR}"
+  fi
   COLLECTOR_PIDS=()
   log "Starting ${COLLECTOR_PROCESSES} collector process(es), ${LANES} lanes each, ${COLLECTOR_WORKERS} simulator workers each"
   collector_prefix=(env)
