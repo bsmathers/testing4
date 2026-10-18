@@ -124,16 +124,30 @@ fi
 (( LANES % COLLECTOR_WORKERS == 0 )) \
   || die "LANES (${LANES}) must be divisible by COLLECTOR_WORKERS (${COLLECTOR_WORKERS})"
 
-if [[ "${INSTALL_DEPS}" == "1" && "$(id -u)" -eq 0 ]] && command -v apt-get >/dev/null; then
-  log "Installing required system build tools"
+PROVISION_DIR="${PERSIST_ROOT}/provision"
+RUNTIME_MARKER="${PROVISION_DIR}/python-runtime-v1.done"
+ENGINE_MARKER="${PROVISION_DIR}/native-engine-v1.done"
+ASSETS_MARKER="${PROVISION_DIR}/offline-assets-v1.done"
+mkdir -p "${PROVISION_DIR}"
+
+write_marker() {
+  local marker="$1" description="$2" tmp_marker="${marker}.tmp.$$"
+  printf '%s\ncompleted %s\n' "${description}" "$(date '+%F %T')" >"${tmp_marker}"
+  mv -f "${tmp_marker}" "${marker}"
+}
+
+missing_build_tools=()
+for required_command in git curl gcc g++ make; do
+  command -v "${required_command}" >/dev/null || missing_build_tools+=("${required_command}")
+done
+if (( ${#missing_build_tools[@]} > 0 )); then
+  [[ "${INSTALL_DEPS}" == "1" && "$(id -u)" -eq 0 ]] && command -v apt-get >/dev/null \
+    || die "Missing required build commands: ${missing_build_tools[*]}"
+  log "Installing missing system build tools: ${missing_build_tools[*]}"
   apt-get update
   DEBIAN_FRONTEND=noninteractive apt-get install -y \
     git curl ca-certificates build-essential xz-utils
 fi
-for required_command in git curl gcc g++ make; do
-  command -v "${required_command}" >/dev/null \
-    || die "Missing required command: ${required_command}"
-done
 command -v nvidia-smi >/dev/null || die "nvidia-smi is unavailable; start a Vast GPU instance"
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
 df -h "${PERSIST_ROOT}"
@@ -153,31 +167,51 @@ print(f"GPU: {torch.cuda.get_device_name(0)}; VRAM: {torch.cuda.get_device_prope
 PY
 }
 
-if [[ "${INSTALL_DEPS}" == "1" ]]; then
-  log "Installing project dependencies while preserving the image's PyTorch, CUDA, NumPy, and FlashAttention stack"
-  "${PYTHON_BIN}" -m pip install -U pip setuptools wheel packaging ninja
-  "${PYTHON_BIN}" -m pip install -e . --no-deps
-  "${PYTHON_BIN}" -m pip install \
-    'gymnasium>=0.26,<=0.29.1' gin-config wandb einops tqdm lz4 termcolor rich \
-    huggingface_hub datasets ratarmountcore accelerate orjson requests tabulate psutil \
-    'websockets==12.0' \
-    'poke-env @ git+https://github.com/UT-Austin-RPL/poke-env.git' \
-    'amago @ git+https://github.com/UT-Austin-RPL/amago@v3.4.0'
+project_runtime_ready() {
+  "${PYTHON_BIN}" -c \
+    'import amago, gin, gymnasium, lz4, wandb, metamon' \
+    >/dev/null 2>&1
+}
+flash_runtime_ready() {
+  "${PYTHON_BIN}" -c 'import flash_attn' >/dev/null 2>&1
+}
+runtime_ready() {
+  project_runtime_ready && flash_runtime_ready
+}
+
+runtime_changed=0
+if runtime_ready; then
+  log "Reusing the existing Python/CUDA runtime"
+elif [[ "${INSTALL_DEPS}" == "1" ]]; then
+  runtime_changed=1
+  if ! project_runtime_ready; then
+    log "Installing missing project Python dependencies"
+    "${PYTHON_BIN}" -m pip install -U pip setuptools wheel packaging ninja
+    "${PYTHON_BIN}" -m pip install -e . --no-deps
+    "${PYTHON_BIN}" -m pip install \
+      'gymnasium>=0.26,<=0.29.1' gin-config wandb einops tqdm lz4 termcolor rich \
+      huggingface_hub datasets ratarmountcore accelerate orjson requests tabulate psutil \
+      'websockets==12.0' \
+      'poke-env @ git+https://github.com/UT-Austin-RPL/poke-env.git' \
+      'amago @ git+https://github.com/UT-Austin-RPL/amago@v3.4.0'
+  fi
+  if ! flash_runtime_ready; then
+    [[ "${INSTALL_FLASH_ATTN:-1}" == "1" ]] \
+      || die "flash_attn is missing and INSTALL_FLASH_ATTN=0"
+    command -v nvcc >/dev/null \
+      || die "flash_attn is missing and nvcc is unavailable; use a CUDA development image"
+    log "Installing ${FLASH_ATTN_SPEC:-flash-attn}; this may compile CUDA kernels once"
+    MAX_JOBS="${MAX_JOBS:-4}" "${PYTHON_BIN}" -m pip install --no-build-isolation \
+      "${FLASH_ATTN_SPEC:-flash-attn}"
+  fi
+else
+  die "Python dependencies are incomplete and INSTALL_DEPS=0"
 fi
 
 check_runtime
-"${PYTHON_BIN}" - <<'PY'
-import amago
-import flash_attn
-import gin
-import gymnasium
-import lz4
-import wandb
-import metamon
-print("Required Python imports succeeded")
-PY
-
-"${PYTHON_BIN}" - <<'PY'
+runtime_ready || die "Required Python imports still fail after dependency setup"
+if [[ ! -f "${RUNTIME_MARKER}" || "${runtime_changed}" == "1" ]]; then
+  "${PYTHON_BIN}" - <<'PY'
 import torch
 from flash_attn import flash_attn_qkvpacked_func, flash_attn_with_kvcache
 
@@ -206,30 +240,33 @@ assert cached_out.shape == q.shape and torch.isfinite(cached_out).all()
 torch.cuda.synchronize()
 print("FlashAttention training and KV-cache smoke tests succeeded")
 PY
+  write_marker "${RUNTIME_MARKER}" "Snorlax Python runtime and FlashAttention smoke test v1"
+fi
 
 if [[ "${WANDB_MODE}" == "online" && -z "${WANDB_API_KEY:-}" ]]; then
   die "WANDB_API_KEY is required when WANDB_MODE=online"
 fi
-if [[ "${WANDB_MODE}" == "online" ]]; then
-  "${PYTHON_BIN}" - <<'PY'
-import os
-import wandb
+engine_ready() {
+  [[ -s "${METAMON_PKMN_ENGINE}" ]] || return 1
+  local probe
+  probe="$(cd metamon/env/vectorized && echo '{"cmd":"close"}' | node battle_host_engine.js 2>&1 >/dev/null || true)"
+  grep -q 'HIGH-SPEED NATIVE ZIG ENGINE ACTIVE' <<<"${probe}"
+}
 
-if not wandb.login(key=os.environ["WANDB_API_KEY"], relogin=True):
-    raise SystemExit("Weights & Biases login failed")
-print("Weights & Biases login succeeded")
-PY
+if engine_ready; then
+  log "Reusing the verified native Zig battle engine"
+else
+  log "Building and verifying the native Zig battle engine"
+  bash scripts/setup_pkmn_engine.sh
+  engine_ready || die "battle_host_engine.js did not activate the native Zig engine"
 fi
+write_marker "${ENGINE_MARKER}" "Native Zig battle engine v1"
 
-log "Building and verifying the native Zig battle engine"
-bash scripts/setup_pkmn_engine.sh
-[[ -s "${METAMON_PKMN_ENGINE}" ]] || die "Zig addon was not created: ${METAMON_PKMN_ENGINE}"
-ZIG_PROBE="$(cd metamon/env/vectorized && echo '{"cmd":"close"}' | node battle_host_engine.js 2>&1 >/dev/null || true)"
-grep -q 'HIGH-SPEED NATIVE ZIG ENGINE ACTIVE' <<<"${ZIG_PROBE}" \
-  || die "battle_host_engine.js did not activate the native Zig engine"
-
-log "Assembling and validating epoch 475"
-if [[ ! -s "${RAW_WEIGHTS}" ]]; then
+if [[ -s "${ONLINE_WEIGHTS}" ]]; then
+  log "Reusing the converted epoch-475 online policy"
+else
+  log "Assembling and validating epoch 475"
+  if [[ ! -s "${RAW_WEIGHTS}" ]]; then
   mapfile -t PARTS < <(find "${REPO_DIR}/policy" -maxdepth 1 -type f \
     -name 'policy_epoch_475.pt.part-*' | sort)
   [[ "${#PARTS[@]}" -eq 3 ]] || die "Expected exactly 3 epoch-475 shards; found ${#PARTS[@]}"
@@ -244,12 +281,12 @@ if [[ ! -s "${RAW_WEIGHTS}" ]]; then
   actual="$(sha256sum "${tmp_weights}" | awk '{print $1}')"
   [[ "${actual}" == "${expected}" ]] || die "Epoch-475 SHA-256 mismatch: ${actual} != ${expected}"
   mv "${tmp_weights}" "${RAW_WEIGHTS}"
-fi
+  fi
 
-"${PYTHON_BIN}" -m metamon.rl.taurosv1b_kl export-online \
-  --input "${RAW_WEIGHTS}" --output "${ONLINE_WEIGHTS}"
+  "${PYTHON_BIN}" -m metamon.rl.taurosv1b_kl export-online \
+    --input "${RAW_WEIGHTS}" --output "${ONLINE_WEIGHTS}"
 
-"${PYTHON_BIN}" - "${ONLINE_WEIGHTS}" <<'PY'
+  "${PYTHON_BIN}" - "${ONLINE_WEIGHTS}" <<'PY'
 import sys
 import torch
 
@@ -262,11 +299,19 @@ n = sum(v.numel() for v in state.values())
 assert n == 34_766_593, f"Expected 34,766,593 parameters, found {n:,}"
 print(f"Validated epoch-475 online policy: {len(state)} keys, {n:,} elements")
 PY
+fi
 
-log "Creating the 807-team expert set without deduplication"
 GOOD_TEAMS_DIR="${GOOD_TEAMS_DIR:-${REPO_DIR}/teams_replay/good_teams}"
 export GOOD_TEAMS_DIR EXPERT_DIR
-"${PYTHON_BIN}" - <<'PY'
+expert_count=0
+if [[ -f "${EXPERT_DIR}/index.csv" ]]; then
+  expert_count="$(( $(wc -l <"${EXPERT_DIR}/index.csv") - 1 ))"
+fi
+if [[ "${expert_count}" == "807" ]]; then
+  log "Reusing the existing 807-team expert set"
+else
+  log "Creating the 807-team expert set without deduplication"
+  "${PYTHON_BIN}" - <<'PY'
 import os
 import re
 import shutil
@@ -295,6 +340,7 @@ with (target / "index.csv").open("w", encoding="utf-8") as f:
     f.writelines(f"{name}\n" for name in names)
 print(f"Wrote {len(names)} entries to {target}; duplicate content was preserved")
 PY
+fi
 
 if [[ "${TRAIN_VARIANT}" == "snorlax_v1" ]]; then
   log "Using committed SnorlaxV1 run, dataset, team, and opponent configs"
@@ -350,6 +396,11 @@ if [[ "${TRAIN_VARIANT}" == "snorlax_v1" ]]; then
   GOOD_REPLAYS_DIR="${GOOD_REPLAYS_DIR:-}"
   export GOOD_REPLAYS_DIR
   [[ -n "${GOOD_REPLAYS_DIR}" ]] || die "GOOD_REPLAYS_DIR is required for snorlax_v1"
+  if [[ ! -d "${GOOD_REPLAYS_DIR}/gen1ou" ]] \
+      || ! find "${GOOD_REPLAYS_DIR}/gen1ou" -maxdepth 1 -type f \
+        \( -name '*.json' -o -name '*.json.lz4' \) -print -quit | grep -q .; then
+    bash "${SCRIPT_DIR}/prepare_snorlax_strong_replays.sh"
+  fi
   [[ -d "${GOOD_REPLAYS_DIR}/gen1ou" ]] \
     || die "GOOD_REPLAYS_DIR must contain gen1ou/: ${GOOD_REPLAYS_DIR}"
   [[ "${ONLINE_WEIGHT}" == "0.50" ]] || die "snorlax_v1 requires ONLINE_WEIGHT=0.50"
@@ -357,15 +408,17 @@ if [[ "${TRAIN_VARIANT}" == "snorlax_v1" ]]; then
   [[ "${GRAD_ACCUM}" == "1" ]] || die "snorlax_v1 requires GRAD_ACCUM=1"
   [[ "${BATCH_SIZE_PER_GPU}" == "14" ]] || die "snorlax_v1 requires batch size 14"
   [[ "${DLOADER_WORKERS}" == "0" ]] || die "snorlax_v1 requires DLOADER_WORKERS=0 for deterministic sampling"
-  "${PYTHON_BIN}" - <<'PY'
+  if [[ ! -f "${ASSETS_MARKER}" ]]; then
+    "${PYTHON_BIN}" - <<'PY'
 import json
 import os
+from itertools import islice
 from pathlib import Path
 
 import lz4.frame
 
 root = Path(os.environ["GOOD_REPLAYS_DIR"]) / "gen1ou"
-files = sorted(list(root.glob("*.json")) + list(root.glob("*.json.lz4")))
+files = list(islice((p for p in root.iterdir() if p.name.endswith((".json", ".json.lz4"))), 32))
 if not files:
     raise SystemExit(
         f"GOOD_REPLAYS_DIR/gen1ou contains no parsed .json or .json.lz4 trajectories: {root}"
@@ -395,8 +448,9 @@ for path in files[:32]:
         raise SystemExit(
             f"Malformed curated trajectory {path}: states={len(states)}, actions={len(actions)}"
         )
-print(f"Found {len(files)} curated trajectories; structurally checked {min(len(files), 32)}")
+print(f"Structurally checked {len(files)} curated strong-model trajectories")
 PY
+  fi
 else
   DATASET_CONFIG_VALUE="online_selfplay.yaml"
   TRAIN_TEAM_SET_VALUE="smallg1onlinev1a_expert"
@@ -448,8 +502,26 @@ dloader_workers: ${DLOADER_WORKERS}
 YAML
 fi
 
-log "Downloading offline data, usage statistics, hl_05_26 teams, and opponent weights"
-"${PYTHON_BIN}" - <<'PY'
+offline_assets_ready() {
+  [[ -s "${ONLINE_WEIGHTS}" && -f "${EXPERT_DIR}/index.csv" ]] || return 1
+  [[ -d "${CACHE_DIR}/parsed-replays/gen1ou" ]] || return 1
+  [[ -s "${CACHE_DIR}/self-play/pac-tauros/gen1ou.tar" ]] || return 1
+  [[ -s "${CACHE_DIR}/self-play/pac-exploratory/gen1ou.tar" ]] || return 1
+  [[ -d "${CACHE_DIR}/teams/hl_05_26/gen1ou" ]] || return 1
+  [[ -d "${CACHE_DIR}/usage-stats/movesets_data/gen1" ]] || return 1
+  [[ -d "${CACHE_DIR}/usage-stats/checks_data/gen1" ]] || return 1
+  [[ -d "${GOOD_REPLAYS_DIR:-/nonexistent}/gen1ou" ]] || return 1
+  [[ -d "${CACHE_DIR}/pretrained_models" ]] || return 1
+  local public_checkpoint_files
+  public_checkpoint_files="$(find "${CACHE_DIR}/pretrained_models" -type f -size +1M 2>/dev/null | wc -l)"
+  (( public_checkpoint_files >= 13 ))
+}
+
+if [[ "${TRAIN_VARIANT}" == "snorlax_v1" ]] && offline_assets_ready; then
+  log "Reusing complete offline datasets, team data, and opponent weights"
+else
+  log "Completing missing offline data, usage statistics, teams, and opponent weights"
+  "${PYTHON_BIN}" - <<'PY'
 import os
 from pathlib import Path
 
@@ -495,6 +567,11 @@ for model_name, epochs in public.items():
             raise FileNotFoundError(f"Failed to fetch {model_name}@{epoch}: {path}")
 print("All datasets, 807 expert teams, and public opponents are ready")
 PY
+fi
+if [[ "${TRAIN_VARIANT}" == "snorlax_v1" ]]; then
+  offline_assets_ready || die "Offline provisioning completed but required artifacts are still missing"
+  write_marker "${ASSETS_MARKER}" "Snorlax offline datasets, teams, and opponents v1"
+fi
 
 FROZEN="${SAVE_DIR}/epoch475_frozen/ckpts/policy_weights/policy_epoch_475.pt"
 LATEST="${SAVE_DIR}/${RUN_NAME}/ckpts/latest/policy.pt"

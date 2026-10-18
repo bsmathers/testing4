@@ -38,11 +38,16 @@ ALLOW_LOW_VRAM="${ALLOW_LOW_VRAM:-0}"
 [[ "${MIN_VRAM_MIB}" =~ ^[1-9][0-9]*$ ]] || die "MIN_VRAM_MIB must be a positive integer"
 [[ -d /workspace && -w /workspace ]] || die "/workspace must exist and be writable"
 
-if [[ "$(id -u)" -eq 0 ]] && command -v apt-get >/dev/null; then
-  log "Installing bootstrap tools"
+missing_bootstrap=()
+for command_name in git curl; do
+  command -v "${command_name}" >/dev/null || missing_bootstrap+=("${command_name}")
+done
+if (( ${#missing_bootstrap[@]} > 0 )); then
+  [[ "$(id -u)" -eq 0 ]] && command -v apt-get >/dev/null \
+    || die "Missing bootstrap commands: ${missing_bootstrap[*]}"
+  log "Installing missing bootstrap tools: ${missing_bootstrap[*]}"
   apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    git curl ca-certificates build-essential xz-utils
+  DEBIAN_FRONTEND=noninteractive apt-get install -y git curl ca-certificates
 fi
 
 for command_name in git curl "${PYTHON_BIN}" nvidia-smi; do
@@ -86,32 +91,6 @@ fi
 
 [[ -f "${REPO_DIR}/scripts/train_snorlax_v1.sh" ]] \
   || die "Training launcher is missing from ${REPO_DIR}"
-export GOOD_REPLAYS_DIR PYTHON_BIN
-bash "${REPO_DIR}/scripts/prepare_snorlax_strong_replays.sh"
-[[ -d "${GOOD_REPLAYS_DIR}/gen1ou" ]] \
-  || die "Strong-model replay preparation did not create ${GOOD_REPLAYS_DIR}/gen1ou"
-
-log "Checking the CUDA PyTorch runtime"
-"${PYTHON_BIN}" - <<'PY'
-import sys
-import torch
-
-print(f"Python: {sys.version.split()[0]}")
-print(f"Torch: {torch.__version__}; compiled CUDA: {torch.version.cuda}")
-if not torch.cuda.is_available():
-    raise SystemExit("CUDA is not available to PyTorch")
-print(f"CUDA device: {torch.cuda.get_device_name(0)}")
-PY
-
-if ! "${PYTHON_BIN}" -c 'import flash_attn' >/dev/null 2>&1; then
-  [[ "${INSTALL_FLASH_ATTN}" == "1" ]] \
-    || die "flash_attn is missing and INSTALL_FLASH_ATTN=0"
-  command -v nvcc >/dev/null \
-    || die "flash_attn is missing and nvcc is unavailable. Use a CUDA development image."
-  log "Installing ${FLASH_ATTN_SPEC}; this may compile native CUDA kernels"
-  "${PYTHON_BIN}" -m pip install -U pip setuptools wheel packaging ninja
-  MAX_JOBS="${MAX_JOBS:-4}" "${PYTHON_BIN}" -m pip install --no-build-isolation "${FLASH_ATTN_SPEC}"
-fi
 
 if [[ "${WANDB_MODE:-online}" == "online" && -z "${WANDB_API_KEY:-}" ]]; then
   die "WANDB_API_KEY is required when WANDB_MODE=online; set WANDB_MODE=offline to run without it"

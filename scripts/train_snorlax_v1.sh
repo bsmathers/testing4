@@ -55,6 +55,5 @@ export VALIDATION_TIMESTEPS=1000
 export METAMON_ACTOR_ONLY_COLLECTION=1
 
 export GOOD_REPLAYS_DIR="${GOOD_REPLAYS_DIR:-/workspace/good_replays}"
-bash "${SCRIPT_DIR}/prepare_snorlax_strong_replays.sh"
 
 exec bash "${SCRIPT_DIR}/train_smallg1onlinev1a_vast.sh"
