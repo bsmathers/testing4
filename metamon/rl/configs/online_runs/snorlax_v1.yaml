@@ -12,10 +12,10 @@ val_team_set: metamon/rl/configs/team_sets/snorlax_v1.yaml
 
 dset_max_size: 5000
 dset_min_size: 4999
-initial_online_weight: 0.50
+initial_online_weight: 0.0
 online_weight: 0.50
 online_anneal_start_epoch: 0
-online_anneal_end_epoch: 0
+online_anneal_end_epoch: 100
 
 learning_rate: 1.0e-4
 lr_warmup_epochs: 0
