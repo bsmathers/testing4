@@ -579,12 +579,46 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         )
         os.replace(temporary, marker)
 
+    def _write_behavior_policy(self) -> str:
+        """Publish the Schedule-Free y iterate used for PPO data collection.
+
+        Schedule-Free evaluates gradients at y but validation/checkpoints at the
+        averaged x iterate. In on-policy RL the rollout distribution is part of
+        the objective, so collectors must use y as well; otherwise the very first
+        PPO ratio after collection already includes an optimizer-internal x->y
+        policy change. This conversion is reversible and does not advance the
+        optimizer.
+        """
+        path = os.environ.get("SNORLAX_BEHAVIOR_WEIGHTS")
+        if not path:
+            latest = Path(os.environ["SNORLAX_LATEST_WEIGHTS"])
+            path = str(latest.with_name("behavior_policy.pt"))
+        temporary = path + ".tmp"
+
+        # Persistent collection boundaries leave the optimizer in eval/x mode.
+        # Be defensive on manual entry points so the saved artifact is always y.
+        self.optimizer.eval()
+        self.optimizer.train()
+        try:
+            if self.accelerator.is_main_process:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                torch.save(self.policy.state_dict(), temporary)
+                os.replace(temporary, path)
+            self.accelerator.wait_for_everyone()
+        finally:
+            # Restore x for validation/checkpoint semantics and so repeated calls
+            # are idempotent.
+            self.optimizer.eval()
+        return path
+
     def _external_collect_phase(self, epoch: int) -> dict[str, int | float] | None:
         """Run direct collector subprocesses, matching the fast pre-warm design."""
         buffer_dir = Path(os.environ["SNORLAX_BUFFER_DIR"])
         replay_dir = buffer_dir / "gen1ou"
         log_dir = Path(os.environ["SNORLAX_LOG_DIR"])
-        latest = os.environ["SNORLAX_LATEST_WEIGHTS"]
+        behavior_weights = os.environ.get(
+            "SNORLAX_BEHAVIOR_WEIGHTS", os.environ["SNORLAX_LATEST_WEIGHTS"]
+        )
         target = int(os.environ.get("GAMES_PER_LEARNER_EPOCH", "2000"))
         removed_unresolved = self._purge_unresolved_online_replays(replay_dir)
         if removed_unresolved:
@@ -643,7 +677,7 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                     "--n_workers", str(workers),
                     "--save_dir", save_dir,
                     "--buffer_dir", str(buffer_dir),
-                    "--base_weights", latest,
+                    "--base_weights", behavior_weights,
                     "--epochs", "1000000",
                     "--seed", str(1000 + epoch * processes + idx),
                     "--mixed_precision", collector_mp,
@@ -765,6 +799,11 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         for epoch in range(start_epoch, self.epochs):
             self.epoch = epoch
             self.policy_aclr.eval()
+            behavior_path = self._write_behavior_policy()
+            print(
+                f"[PersistentCycle] behavior policy epoch={epoch} {behavior_path}",
+                flush=True,
+            )
             collection_log = self._external_collect_phase(epoch)
             self.accelerator.wait_for_everyone()
 
