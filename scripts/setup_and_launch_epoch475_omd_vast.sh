@@ -102,15 +102,20 @@ run_log="${PERSIST_ROOT}/logs/vast-bootstrap-and-training.log"
 log "Launching commit ${commit}; progress will also be written to ${run_log}"
 
 export REPO_DIR PERSIST_ROOT GOOD_REPLAYS_DIR PYTHON_BIN
-if (( cpu_count >= 64 && vram_mib >= 30000 )); then
+if (( cpu_count >= 384 && vram_mib >= 30000 )); then
   # Parsing two battle POVs and building observations are Python-bound. Use
-  # several independent coordinators on large hosts instead of making two
-  # coordinators manage ever-larger lane batches. The 5090 has ample memory for
-  # these actor-only bf16 policies and their compact 33-step KV caches.
-  # Twelve coordinators use more of the large host. Persistent workers
+  # many independent coordinators on the 512-thread target instead of making a
+  # few coordinators manage ever-larger lane batches. The 5090 has ample active-
+  # collection memory for actor-only bf16 policies and compact 33-step caches.
+  # Persistent workers
   # release their GPU policies/caches during learning and remain warm only when
   # conservative GPU/RAM headroom checks pass.
-  default_collector_processes=12
+  default_collector_processes=24
+  default_lanes=64
+  default_collector_workers=8
+  default_partial_hidden_chunk=64
+elif (( cpu_count >= 64 && vram_mib >= 30000 )); then
+  default_collector_processes=8
   default_lanes=64
   default_collector_workers=8
   default_partial_hidden_chunk=64
