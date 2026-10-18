@@ -163,7 +163,7 @@ def simulator_transitions() -> None:
     with tempfile.TemporaryDirectory(prefix="snorlax-simulator-smoke-") as tmp:
         trajectory_root = Path(tmp)
         for eval_side in (0, 1):
-            resets_before_side = total_done + total_truncated
+            done_before_side = total_done
             lanes = 4
             opponent = _CountingOpponent(lanes, seed=97531 + eval_side)
             side_root = trajectory_root / f"side-{eval_side}"
@@ -209,10 +209,10 @@ def simulator_transitions() -> None:
                     total_done += int(np.asarray(terminated, dtype=bool).sum())
                     total_truncated += int(np.asarray(truncated, dtype=bool).sum())
                 total_partial += opponent.partial_batches
-                completed_this_side = (
-                    total_done + total_truncated - resets_before_side
-                )
-                if opponent.reset_count != completed_this_side:
+                # Time-limit lanes are reported as both terminated and
+                # truncated so learning cannot bootstrap across the reset.
+                # Therefore terminated alone is the completed-lane count.
+                if opponent.reset_count != total_done - done_before_side:
                     raise RuntimeError("opponent reset count disagrees with completed lanes")
             finally:
                 env.close()
