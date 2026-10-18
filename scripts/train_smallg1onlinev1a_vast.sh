@@ -762,6 +762,8 @@ start_collectors() {
   local seed_base="$1" phase="$2" i seed
   local -a collector_prefix
   local collector_mp="${COLLECTOR_DTYPE}"
+  local collector_weights="${LATEST}"
+  [[ -s "${BEHAVIOR}" ]] && collector_weights="${BEHAVIOR}"
   COLLECTOR_PIDS=()
   log "Starting ${COLLECTOR_PROCESSES} collector process(es), ${LANES} lanes each, ${COLLECTOR_WORKERS} simulator workers each"
   collector_prefix=(env)
@@ -782,8 +784,7 @@ start_collectors() {
       --run_config "${RUN_CONFIG}" --mode collect \
       --run_name "${RUN_NAME}" --lanes "${LANES}" --n_workers "${COLLECTOR_WORKERS}" \
       --save_dir "${SAVE_DIR}" --buffer_dir "${BUFFER_DIR}" \
-      --base_weights "$([[ -s "${BEHAVIOR}" ]] && printf '%s' "${BEHAVIOR}" || printf '%s' "${LATEST}")" \
-      --epochs 1000000 --seed "${seed}" \
+      --base_weights "${collector_weights}" --epochs 1000000 --seed "${seed}" \
       --mixed_precision "${collector_mp}" \
       > >(tee -a "${LOG_DIR}/collector-${phase}-${i}.log") 2>&1 &
     COLLECTOR_PIDS+=("$!")
