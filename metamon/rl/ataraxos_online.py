@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import time
 
 import amago
 import lz4.frame
@@ -400,8 +401,18 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             target = target.env
         if not hasattr(target, "record_policy_metadata"):
             raise RuntimeError("Ataraxos collection env cannot record policy metadata")
+        profile = os.environ.get("METAMON_COLLECT_PROFILE") == "1"
+        profile_interval = max(
+            1, int(os.environ.get("METAMON_COLLECT_PROFILE_INTERVAL", "100"))
+        )
+        profile_times = {name: 0.0 for name in ("hook", "policy_gpu", "metadata", "env_step", "next_obs")}
+        profile_steps = 0
         for _ in range(timesteps):
+            started = time.perf_counter()
             self.on_interact_step(obs)
+            if profile:
+                profile_times["hook"] += time.perf_counter() - started
+                started = time.perf_counter()
             with torch.inference_mode(), self.caster():
                 actions, hidden_state, behavior_lp, behavior_v = policy.get_actions_with_metadata(
                     obs=obs, rl2s=rl2s, time_idxs=tids,
@@ -421,12 +432,21 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                 dim=-1,
             ).cpu().numpy()
             host_actions = host[:, 0].astype(np.int64, copy=False)
+            if profile:
+                profile_times["policy_gpu"] += time.perf_counter() - started
+                started = time.perf_counter()
             target.record_policy_metadata(
                 host[:, 1 : 1 + action_dim],
                 host[:, 1 + action_dim],
                 host[:, 2 + action_dim :].astype(bool, copy=False),
             )
+            if profile:
+                profile_times["metadata"] += time.perf_counter() - started
+                started = time.perf_counter()
             *_, terminated, truncated, _ = envs.step(host_actions)
+            if profile:
+                profile_times["env_step"] += time.perf_counter() - started
+                started = time.perf_counter()
             done = terminated | truncated
             if done.ndim == 2:
                 done = done.squeeze(1)
@@ -436,6 +456,18 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                 episodes_finished += int(done.sum())
             obs, rl2s, tids = get_t()
             hidden_state = policy.traj_encoder.reset_hidden_state(hidden_state, done)
+            if profile:
+                profile_times["next_obs"] += time.perf_counter() - started
+                profile_steps += 1
+                if profile_steps % profile_interval == 0:
+                    total = sum(profile_times.values())
+                    fields = " ".join(
+                        f"{name}={seconds / profile_steps * 1000:.1f}ms/{100.0 * seconds / total:.0f}%"
+                        for name, seconds in profile_times.items()
+                    )
+                    print(f"[CollectorBoundary] steps={profile_steps} {fields}", flush=True)
+                    if hasattr(target, "profile_report"):
+                        print(f"[VectorBoundary]\n{target.profile_report()}", flush=True)
             if render:
                 envs.render()
             if episodes is not None and episodes_finished >= episodes:
