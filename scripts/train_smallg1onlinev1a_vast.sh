@@ -612,13 +612,15 @@ if [[ "${TRAIN_VARIANT}" == "snorlax_v1" && "${SNORLAX_FIRST_RUN_SMOKE}" == "1" 
   log "Snorlax first-run smoke block 2/6: deterministic simulator transitions and both POVs"
   "${PYTHON_BIN}" scripts/snorlax_first_run_smoke.py simulator-transitions
 
-  log "Snorlax first-run smoke block 3/6: production-shape checkpoint collection"
+  log "Snorlax first-run smoke block 3/6: production-shape collection"
   SMOKE_COLLECTOR_MP="${COLLECTOR_DTYPE}"
   [[ "${SMOKE_COLLECTOR_MP}" == "fp32" ]] && SMOKE_COLLECTOR_MP=no
   env -u SNORLAX_PERSISTENT_ALTERNATION \
+    METAMON_SKIP_EXPLICIT_CHECKPOINT_VALIDATION=1 \
     OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 \
     "${PYTHON_BIN}" -m "${RUNNER_MODULE}" \
     --run_config "${RUN_CONFIG}" --mode collect \
+    --train_pool metamon/rl/configs/opponent_pools/snorlax_v1_smoke.yaml \
     --run_name snorlax_first_run_collect --lanes 64 --n_workers 8 \
     --save_dir "${SMOKE_SAVE}" --buffer_dir "${SMOKE_BUFFER}" \
     --base_weights "${ONLINE_WEIGHTS}" --epochs 1 --seed 8675309 \

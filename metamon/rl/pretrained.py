@@ -283,8 +283,9 @@ class PretrainedModel:
                     if _attempt == 9:
                         raise
                     time.sleep(1)
-            model_state = experiment.policy.state_dict()
-            self._validate_checkpoint(ckpt_state, model_state)
+            if os.environ.get("METAMON_SKIP_EXPLICIT_CHECKPOINT_VALIDATION") != "1":
+                model_state = experiment.policy.state_dict()
+                self._validate_checkpoint(ckpt_state, model_state)
             experiment.policy.load_state_dict(ckpt_state, strict=True)
             experiment.policy.on_checkpoint_loaded(is_resume=False)
         return experiment

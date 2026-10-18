@@ -1,0 +1,13 @@
+# Minimal fixed opponent for the one-time functional smoke collector. The full
+# league is exercised by normal collection; rotating through it here only
+# rebuilds large policies without adding interface coverage.
+defaults:
+  team_set: snorlax_v1_expert
+  battle_backend: metamon
+  checkpoints: [475]
+  temperatures: [1.0]
+  num_agents: 1
+
+agents:
+  Epoch475Smoke:
+    model_name: Epoch475Frozen
