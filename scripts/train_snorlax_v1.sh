@@ -2,8 +2,8 @@
 set -Eeuo pipefail
 
 # Canonical SnorlaxV1 training entry point. SnorlaxV1 is the Ataraxos-inspired
-# schedule-free continuation of Epoch475, with a 5k replay FIFO and a fixed
-# 50/50 online/offline learner mixture from the first epoch.
+# schedule-free continuation of Epoch475, with a 5k replay FIFO and the
+# intended 0% -> 50% online-mixture ramp over the first 100 learner epochs.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PERSIST_ROOT="${PERSIST_ROOT:-/workspace/snorlax-v1-v2}"
@@ -12,7 +12,7 @@ if [[ -n "${PERSIST_ROOT}" ]]; then
   marker="${PERSIST_ROOT}/SNORLAX_V1_EXPERIMENT"
   old_marker='SnorlaxV1; replay schema v2; schedule-free r99 beta0.8'
   previous_marker='SnorlaxV1; replay schema v3; schedule-free r99 beta0.8'
-  expected_marker='SnorlaxV1-v2; schema v3; mix50; advq0to25; schedule-free r99 beta0.8'
+  expected_marker='SnorlaxV1-v2; schema v3; onlineramp0to50; advq0to25; criticwarmup100k; schedule-free r99 beta0.8'
   if [[ -d "${PERSIST_ROOT}/online_buffer/gen1ou" ]] \
       && find "${PERSIST_ROOT}/online_buffer/gen1ou" -type f \
         \( -name '*.json' -o -name '*.json.lz4' \) -print -quit | grep -q . \
