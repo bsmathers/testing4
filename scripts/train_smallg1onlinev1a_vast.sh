@@ -43,7 +43,8 @@ COLLECTOR_DTYPE="${COLLECTOR_DTYPE:-}"
 ONLINE_FIFO_SIZE="${ONLINE_FIFO_SIZE:-300000}"
 VALIDATION_INTERVAL="${VALIDATION_INTERVAL:-0}"
 VALIDATION_TIMESTEPS="${VALIDATION_TIMESTEPS:-1000}"
-SNORLAX_FIRST_RUN_SMOKE="${SNORLAX_FIRST_RUN_SMOKE:-1}"
+# SNORLAX_FIRST_RUN_SMOKE is intentionally disabled; the full smoke block
+# remains commented out near the launch section for manual debugging.
 if [[ -z "${COLLECTOR_DTYPE}" ]]; then
   if [[ "${COLLECTOR_DEVICE}" == "gpu" ]]; then
     COLLECTOR_DTYPE=bf16
