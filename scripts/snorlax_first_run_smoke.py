@@ -256,6 +256,7 @@ def validate_buffer(root: Path) -> None:
             f"collector produced {len(files)} replay(s); at least two are required"
         )
 
+    wins = losses = unresolved = 0
     for path in files:
         payload = _read(path)
         states = payload.get("states")
@@ -263,8 +264,8 @@ def validate_buffer(root: Path) -> None:
         log_probs = payload.get("behavior_log_probs")
         values = payload.get("behavior_values")
         legal = payload.get("behavior_legal_masks")
-        if payload.get("ataraxos_collector_version") != 2:
-            raise RuntimeError(f"{path.name}: collector schema is not version 2")
+        if payload.get("ataraxos_collector_version") != 3:
+            raise RuntimeError(f"{path.name}: collector schema is not version 3")
         if not isinstance(states, list) or len(states) < 2:
             raise RuntimeError(f"{path.name}: invalid state sequence")
         action_steps = len(states) - 1
@@ -284,8 +285,16 @@ def validate_buffer(root: Path) -> None:
                 f"{action_steps}, got {bad}"
             )
         final = states[-1]
-        if bool(final.get("battle_won")) and bool(final.get("battle_lost")):
+        won = bool(final.get("battle_won"))
+        lost = bool(final.get("battle_lost"))
+        if won and lost:
             raise RuntimeError(f"{path.name}: impossible win-and-loss outcome")
+        if won:
+            wins += 1
+        elif lost:
+            losses += 1
+        else:
+            unresolved += 1
         logp = np.asarray(log_probs, dtype=np.float32)
         mask = np.asarray(legal, dtype=bool)
         value = np.asarray(values, dtype=np.float32)
@@ -345,8 +354,21 @@ def validate_buffer(root: Path) -> None:
             raise RuntimeError(
                 f"learner outcome target has the wrong POV sign for {Path(filename).name}"
             )
+    decisive = wins + losses
+    if decisive < 16:
+        raise RuntimeError(
+            "collector smoke produced too few decisive games to validate outcomes: "
+            f"wins={wins}, losses={losses}, unresolved={unresolved}"
+        )
+    if wins == 0 or losses == 0:
+        raise RuntimeError(
+            "collector smoke has a one-sided outcome collapse: "
+            f"wins={wins}, losses={losses}, unresolved={unresolved}"
+        )
     print(
-        f"PASS: {len(files)} schema-v2 trajectories passed structural and learner parsing checks",
+        f"PASS: {len(files)} schema-v3 trajectories passed structural, outcome, "
+        f"and learner parsing checks (wins={wins}, losses={losses}, "
+        f"unresolved={unresolved})",
         flush=True,
     )
 

@@ -994,9 +994,9 @@ class VectorizedShowdownEnv(gym.Env):
                 output_json["behavior_log_probs"] = self._traj_behavior_log_probs[i]
                 output_json["behavior_values"] = self._traj_behavior_values[i]
                 output_json["behavior_legal_masks"] = self._traj_behavior_legal[i]
-                # Version 2 guarantees lane-preserving AMAGO action encoding
-                # and one act/observe transition per opponent decision.
-                output_json["ataraxos_collector_version"] = 2
+                # Version 3 additionally guarantees that native-engine
+                # terminal outcomes come from the authoritative engine Result.
+                output_json["ataraxos_collector_version"] = 3
             path = os.path.join(self.save_trajectories_to, filename)
             temp_path = path + ".tmp"
             with lz4.frame.open(temp_path, "wb") as f:

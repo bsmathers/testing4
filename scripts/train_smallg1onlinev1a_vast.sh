@@ -592,15 +592,15 @@ fi
 # marker is published only after collection, replay parsing, and a learner
 # optimizer update all succeed. A failed or interrupted smoke test therefore
 # runs again on the next launch instead of blessing a partial setup.
-SNORLAX_SMOKE_MARKER="${PROVISION_DIR}/snorlax-first-run-smoke-v2.done"
+SNORLAX_SMOKE_MARKER="${PROVISION_DIR}/snorlax-first-run-smoke-v3.done"
 if [[ "${TRAIN_VARIANT}" == "snorlax_v1" && "${SNORLAX_FIRST_RUN_SMOKE}" == "1" \
     && ! -f "${SNORLAX_SMOKE_MARKER}" ]]; then
-  SMOKE_ROOT="$(mktemp -d "${PROVISION_DIR}/snorlax-first-run-smoke-v2.XXXXXX")"
+  SMOKE_ROOT="$(mktemp -d "${PROVISION_DIR}/snorlax-first-run-smoke-v3.XXXXXX")"
   SMOKE_SAVE="${SMOKE_ROOT}/checkpoints"
   SMOKE_BUFFER="${SMOKE_ROOT}/online_buffer"
   cleanup_first_run_smoke() {
     case "${SMOKE_ROOT}" in
-      "${PROVISION_DIR}"/snorlax-first-run-smoke-v2.*) rm -rf -- "${SMOKE_ROOT}" ;;
+      "${PROVISION_DIR}"/snorlax-first-run-smoke-v3.*) rm -rf -- "${SMOKE_ROOT}" ;;
       *) die "Refusing to clean unexpected smoke-test directory: ${SMOKE_ROOT}" ;;
     esac
   }
@@ -626,7 +626,7 @@ if [[ "${TRAIN_VARIANT}" == "snorlax_v1" && "${SNORLAX_FIRST_RUN_SMOKE}" == "1" 
     --run_name snorlax_first_run_collect --lanes 64 --n_workers 8 \
     --save_dir "${SMOKE_SAVE}" --buffer_dir "${SMOKE_BUFFER}" \
     --base_weights "${ONLINE_WEIGHTS}" --epochs 1 --seed 8675309 \
-    --train_timesteps_per_epoch 96 --dset_max_size 512 --dset_min_size 1 \
+    --train_timesteps_per_epoch 256 --dset_max_size 512 --dset_min_size 1 \
     --val_interval 0 --val_timesteps 1 --mixed_precision "${SMOKE_COLLECTOR_MP}"
 
   log "Snorlax first-run smoke block 4/6: trajectory schema and learner adapter"
@@ -670,7 +670,7 @@ if [[ "${TRAIN_VARIANT}" == "snorlax_v1" && "${SNORLAX_FIRST_RUN_SMOKE}" == "1" 
   cleanup_first_run_smoke
   trap - EXIT
   write_marker "${SNORLAX_SMOKE_MARKER}" \
-    "Snorlax production collection, transition invariants, retention, and resumed learner v2"
+    "Snorlax production collection, native outcomes, retention, and resumed learner v3"
   log "Snorlax first-run smoke test passed; normal startup may proceed"
 elif [[ "${TRAIN_VARIANT}" == "snorlax_v1" && -f "${SNORLAX_SMOKE_MARKER}" ]]; then
   log "Reusing the completed Snorlax first-run smoke-test marker"
@@ -688,13 +688,13 @@ fi
 
 # Full optimizer states do not embed the collector implementation version. Do
 # not silently resume a Snorlax learner created before the lane/RL2 fixes.
-ROLLOUT_SCHEMA_MARKER="${PROVISION_DIR}/snorlax-rollout-schema-v2.done"
+ROLLOUT_SCHEMA_MARKER="${PROVISION_DIR}/snorlax-rollout-schema-v3.done"
 if [[ "${TRAIN_VARIANT}" == "snorlax_v1" ]]; then
   if [[ -n "${RESUME_EPOCH}" && ! -f "${ROLLOUT_SCHEMA_MARKER}" ]]; then
-    die "Existing Snorlax training state predates rollout schema v2; start with a fresh PERSIST_ROOT"
+    die "Existing Snorlax training state predates rollout schema v3; start with a fresh PERSIST_ROOT"
   fi
   if [[ ! -f "${ROLLOUT_SCHEMA_MARKER}" ]]; then
-    write_marker "${ROLLOUT_SCHEMA_MARKER}" "Snorlax lane/action-aligned rollout schema v2"
+    write_marker "${ROLLOUT_SCHEMA_MARKER}" "Snorlax native-outcome and lane/action rollout schema v3"
   fi
 fi
 
@@ -786,6 +786,41 @@ fifo_count() {
   find "${BUFFER_DIR}/gen1ou" -type f \( -name '*.json' -o -name '*.json.lz4' \) | wc -l
 }
 
+quarantine_stale_snorlax_fifo() {
+  local schema rejected_root
+  [[ "${TRAIN_VARIANT}" == "snorlax_v1" ]] || return
+  schema="$(BUFFER_DIR="${BUFFER_DIR}" "${PYTHON_BIN}" - <<'PY'
+import json
+import os
+from pathlib import Path
+
+import lz4.frame
+
+root = Path(os.environ["BUFFER_DIR"]) / "gen1ou"
+files = sorted(list(root.glob("*.json")) + list(root.glob("*.json.lz4")))
+if not files:
+    print("empty")
+else:
+    path = files[0]
+    if path.name.endswith(".lz4"):
+        with lz4.frame.open(path, "rb") as f:
+            payload = json.loads(f.read().decode("utf-8"))
+    else:
+        with path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+    print(payload.get("ataraxos_collector_version", "missing"))
+PY
+)"
+  [[ "${schema}" == "empty" || "${schema}" == "3" ]] && return
+  [[ -z "${RESUME_EPOCH}" ]] || die \
+    "Existing learner state depends on rollout schema ${schema}; use a fresh PERSIST_ROOT"
+  rejected_root="${PERSIST_ROOT}/rejected_online_buffer_schema_${schema}_$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "${rejected_root}"
+  mv "${BUFFER_DIR}/gen1ou" "${rejected_root}/gen1ou"
+  mkdir -p "${BUFFER_DIR}/gen1ou"
+  log "Quarantined incompatible pre-training FIFO schema ${schema} at ${rejected_root}"
+}
+
 snapshot_fifo_names() {
   local output="$1"
   find "${BUFFER_DIR}/gen1ou" -type f \
@@ -803,6 +838,7 @@ new_fifo_count() {
   rm -f -- "${current_names}"
 }
 
+quarantine_stale_snorlax_fifo
 current="$(fifo_count)"
 if (( current < PREFILL_FILES )); then
   prefill_start_count="${current}"
@@ -865,9 +901,9 @@ for path in files:
     missing = required.difference(payload)
     if missing:
         raise SystemExit(f"{path.name} predates SnorlaxV1 metadata; use a fresh PERSIST_ROOT")
-    if payload.get("ataraxos_collector_version") != 2:
+    if payload.get("ataraxos_collector_version") != 3:
         raise SystemExit(
-            f"{path.name} predates the lane/action alignment fixes; "
+            f"{path.name} predates the native outcome and lane/action fixes; "
             "use a fresh online buffer"
         )
     states = payload.get("states")

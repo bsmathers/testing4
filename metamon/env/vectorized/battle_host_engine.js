@@ -198,7 +198,7 @@ class ShowdownLane {
 // Fast Native @pkmn/engine Lane (Gen 1)
 // ---------------------------------------------------------------------------
 
-function createEngineRequest(engineBattle, gen, sideId, res) {
+function createEngineRequest(engineBattle, gen, sideId, playerName, res) {
   const isP1 = sideId === "p1";
   const playerChoiceType = isP1 ? res.p1 : res.p2;
   const side = engineBattle.side(sideId);
@@ -229,7 +229,7 @@ function createEngineRequest(engineBattle, gen, sideId, res) {
     });
   }
 
-  const sideObj = { name: sideId, id: sideId, pokemon: pokemonList };
+  const sideObj = { name: playerName, id: sideId, pokemon: pokemonList };
 
   if (playerChoiceType === "pass" || !playerChoiceType) {
     if (res.type) return null;
@@ -272,17 +272,24 @@ class EngineLane {
     this.logParser = null;
     this.epoch = 0;
     this.pendingChoices = { p1: null, p2: null };
+    this.playerNames = { p1: "p1", p2: "p2" };
+    this.sentBattleHeader = false;
   }
 
   start(spec, p1spec, p2spec, epoch) {
     this.epoch = epoch;
     this.pendingChoices = { p1: null, p2: null };
+    this.sentBattleHeader = false;
 
     try {
       const { Battle, Log, Lookup, Info } = pkmnEngine;
 
       const p1Team = Showdown.Teams.unpack(p1spec.team);
       const p2Team = Showdown.Teams.unpack(p2spec.team);
+      this.playerNames = {
+        p1: String(p1spec.name || "p1"),
+        p2: String(p2spec.name || "p2"),
+      };
 
       let seed = [1, 2, 3, 4];
       if (spec.seed && Array.isArray(spec.seed)) {
@@ -290,8 +297,8 @@ class EngineLane {
       }
 
       this.battle = Battle.create(gen1, {
-        p1: { name: "p1", team: p1Team },
-        p2: { name: "p2", team: p2Team },
+        p1: { name: this.playerNames.p1, team: p1Team },
+        p2: { name: this.playerNames.p2, team: p2Team },
         seed: seed,
         showdown: true,
         log: true,
@@ -300,7 +307,10 @@ class EngineLane {
       this.logParser = new Log(
         gen1,
         Lookup.get(gen1),
-        new Info(gen1, { p1: { name: "p1", team: p1Team }, p2: { name: "p2", team: p2Team } })
+        new Info(gen1, {
+          p1: { name: this.playerNames.p1, team: p1Team },
+          p2: { name: this.playerNames.p2, team: p2Team },
+        })
       );
 
       const res0 = this.battle.update(undefined, undefined);
@@ -313,27 +323,48 @@ class EngineLane {
 
   _emitTurn(res) {
     try {
-      const logLines = Array.from(this.logParser.parse(this.battle.log)).map(stringifyProtocolLine);
-      const reqP1 = createEngineRequest(this.battle, gen1, "p1", res);
-      const reqP2 = createEngineRequest(this.battle, gen1, "p2", res);
+      // The engine Result is authoritative and is always from p1's
+      // perspective.  Do not infer the winner from Side fields: @pkmn/engine
+      // Side objects have no `fainted` property, so that inference appended a
+      // bogus tie. Strip any terminal record decoded from the binary log and
+      // append exactly one unambiguous record from Result below.
+      const logLines = Array.from(this.logParser.parse(this.battle.log))
+        .map(stringifyProtocolLine)
+        .filter(line => line !== "|tie" && !line.startsWith("|win|"));
+      const reqP1 = createEngineRequest(
+        this.battle, gen1, "p1", this.playerNames.p1, res
+      );
+      const reqP2 = createEngineRequest(
+        this.battle, gen1, "p2", this.playerNames.p2, res
+      );
+
+      // @pkmn/engine's compact battle log omits the simulator's player
+      // declarations.  Metamon's replay parser needs those declarations to
+      // map a later winner name back to Player 1/2.  Emit them once per battle
+      // on both POV streams before any state/request traffic.
+      const headerLines = this.sentBattleHeader ? [] : [
+        `|player|p1|${this.playerNames.p1}`,
+        `|player|p2|${this.playerNames.p2}`,
+      ];
+      this.sentBattleHeader = true;
 
       // Format p1 chunk
-      const p1Parts = [];
+      const p1Parts = [...headerLines];
       if (reqP1) p1Parts.push(`|request|${JSON.stringify(reqP1)}`);
       p1Parts.push(...logLines);
 
       // Format p2 chunk
-      const p2Parts = [];
+      const p2Parts = [...headerLines];
       if (reqP2) p2Parts.push(`|request|${JSON.stringify(reqP2)}`);
       p2Parts.push(...logLines);
 
       // Check battle conclusion
       if (res.type) {
-        const side0Fainted = this.battle.side("p1").fainted;
-        const side1Fainted = this.battle.side("p2").fainted;
-        let endLine = "|tie";
-        if (side0Fainted && !side1Fainted) endLine = "|win|p2";
-        else if (side1Fainted && !side0Fainted) endLine = "|win|p1";
+        let endLine;
+        if (res.type === "win") endLine = `|win|${this.playerNames.p1}`;
+        else if (res.type === "lose") endLine = `|win|${this.playerNames.p2}`;
+        else if (res.type === "tie") endLine = "|tie";
+        else throw new Error(`native engine returned terminal result ${res.type}`);
 
         p1Parts.push(endLine);
         p2Parts.push(endLine);
@@ -447,6 +478,8 @@ class EngineLane {
     this.battle = null;
     this.logParser = null;
     this.pendingChoices = { p1: null, p2: null };
+    this.playerNames = { p1: "p1", p2: "p2" };
+    this.sentBattleHeader = false;
   }
 }
 

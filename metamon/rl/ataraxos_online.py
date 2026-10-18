@@ -171,9 +171,9 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
                 else:
                     with open(filename, "rb") as f:
                         payload = orjson.loads(f.read())
-                if payload.get("ataraxos_collector_version") != 2:
+                if payload.get("ataraxos_collector_version") != 3:
                     raise ValueError(
-                        "replay predates the lane/action alignment fixes"
+                        "replay predates the native outcome and lane/action fixes"
                     )
                 v = np.asarray(payload["behavior_values"], dtype=np.float32)
                 states = payload["states"]
