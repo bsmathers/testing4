@@ -15,8 +15,10 @@ It is a one-shot remote training run, not a short local experiment.
 - Use clipped PPO, behavior-policy reverse KL, a decaying uniform-policy magnet,
   and outcome-value regression online. Advantage filtering starts disabled and
   ramps over epochs 0-100 to retain the top 75% of online positions by absolute
-  advantage (25th-percentile cutoff); the absolute floor ramps from 0 to 0.01.
-  The myopic reference policy is uniform over legal actions.
+  advantage (25th-percentile cutoff). Snorlax intentionally omits Ataraxos's
+  additional 0.01 absolute-advantage floor so the final gate really retains at
+  least 75% of online states. The myopic reference policy is uniform over legal
+  actions.
 - Use observed-action cross entropy and outcome-value regression offline.
   Pac-exploratory action labels receive weight 0.25; their value labels retain
   full weight.
