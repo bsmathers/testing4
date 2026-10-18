@@ -617,10 +617,12 @@ if [[ "${TRAIN_VARIANT}" == "snorlax_v1" && "${SNORLAX_FIRST_RUN_SMOKE}" == "1" 
   [[ "${SMOKE_COLLECTOR_MP}" == "fp32" ]] && SMOKE_COLLECTOR_MP=no
   env -u SNORLAX_PERSISTENT_ALTERNATION \
     METAMON_SKIP_EXPLICIT_CHECKPOINT_VALIDATION=1 \
+    TORCH_COMPILE_DISABLE=1 TORCHDYNAMO_DISABLE=1 \
     OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 \
     "${PYTHON_BIN}" -m "${RUNNER_MODULE}" \
     --run_config "${RUN_CONFIG}" --mode collect \
     --train_pool metamon/rl/configs/opponent_pools/snorlax_v1_smoke.yaml \
+    --train_team_set snorlax_v1_expert \
     --run_name snorlax_first_run_collect --lanes 64 --n_workers 8 \
     --save_dir "${SMOKE_SAVE}" --buffer_dir "${SMOKE_BUFFER}" \
     --base_weights "${ONLINE_WEIGHTS}" --epochs 1 --seed 8675309 \
@@ -634,6 +636,7 @@ if [[ "${TRAIN_VARIANT}" == "snorlax_v1" && "${SNORLAX_FIRST_RUN_SMOKE}" == "1" 
   log "Snorlax first-run smoke block 5/6: five strict mixed-data optimizer updates and full checkpoint"
   env -u SNORLAX_PERSISTENT_ALTERNATION \
     METAMON_STRICT_NUMERICS=1 METAMON_STRICT_BATCH_CHECKS=1 \
+    TORCH_COMPILE_DISABLE=1 TORCHDYNAMO_DISABLE=1 \
     "${PYTHON_BIN}" -m "${RUNNER_MODULE}" \
     --run_config "${RUN_CONFIG}" --mode learn \
     --run_name snorlax_first_run_learn --lanes 4 --n_workers 1 \
@@ -649,6 +652,7 @@ if [[ "${TRAIN_VARIANT}" == "snorlax_v1" && "${SNORLAX_FIRST_RUN_SMOKE}" == "1" 
   log "Snorlax first-run smoke block 6/6: full-state resume and five more finite updates"
   env -u SNORLAX_PERSISTENT_ALTERNATION \
     METAMON_STRICT_NUMERICS=1 METAMON_STRICT_BATCH_CHECKS=1 \
+    TORCH_COMPILE_DISABLE=1 TORCHDYNAMO_DISABLE=1 \
     "${PYTHON_BIN}" -m "${RUNNER_MODULE}" \
     --run_config "${RUN_CONFIG}" --mode learn \
     --run_name snorlax_first_run_learn --lanes 4 --n_workers 1 \
