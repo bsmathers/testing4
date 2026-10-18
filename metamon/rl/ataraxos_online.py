@@ -114,7 +114,7 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
     _ADV_QUANTILE_START = 0.0
     _ADV_QUANTILE_END = 0.25
     _ADV_FLOOR_START = 0.0
-    _ADV_FLOOR_END = 0.01
+    _ADV_FLOOR_END = 0.0
     _ADV_RAMP_END_EPOCH = 100
 
     def __init__(self, *, fifo, offline, **kwargs):
