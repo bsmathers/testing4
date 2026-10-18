@@ -818,6 +818,7 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             # the standard AMAGO output before collection can begin.
             expected_actions = (self.parallel_actors, 1, 1)
             expected_logp = (self.parallel_actors, self.policy.action_dim)
+            expected_values = (self.parallel_actors, 1)
             if tuple(actions.shape) != expected_actions:
                 raise RuntimeError(
                     f"collector actions have shape {tuple(actions.shape)}, "
@@ -828,10 +829,10 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                     f"collector behavior logits have shape {tuple(behavior_lp.shape)}, "
                     f"expected {expected_logp}"
                 )
-            if tuple(behavior_v.shape) != expected_actions:
+            if tuple(behavior_v.shape) != expected_values:
                 raise RuntimeError(
                     f"collector values have shape {tuple(behavior_v.shape)}, "
-                    f"expected {expected_actions}"
+                    f"expected {expected_values}"
                 )
             # Collection needs these four small GPU results on the host. Packing
             # them into one transfer avoids four separate CUDA synchronizations
