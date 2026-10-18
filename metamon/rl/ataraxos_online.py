@@ -103,7 +103,7 @@ class TaggedDataset(RLDataset):
             )
             data.obs[keys.ADVANTAGE] = torch.zeros(T, 1)
             data.obs[keys.VALUE_TARGET] = torch.zeros(T, 1)
-        threshold = 0.01 if self.owner is None else self.owner.adv_threshold
+        threshold = 0.0 if self.owner is None else self.owner.adv_threshold
         data.obs[keys.ADV_THRESHOLD] = torch.full((T, 1), float(threshold))
         return data
 
