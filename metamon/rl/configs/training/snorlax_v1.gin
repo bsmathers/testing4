@@ -1,4 +1,5 @@
 import amago.agent
+import amago.nets.traj_encoders
 import metamon.rl.ataraxos_agent
 
 MetamonAMAGOExperiment.agent_type = @ataraxos_agent.AtaraxosAgent
@@ -17,6 +18,13 @@ MetamonAMAGOExperiment.l2_coeff = 0.0
 MetamonAMAGOExperiment.learning_rate = 1e-4
 MetamonAMAGOExperiment.grad_clip = 0.267
 MetamonAMAGOExperiment.lr_warmup_steps = 0
+
+# PPO behavior probabilities are collected with the model in eval mode. Disable
+# encoder/transformer dropout during Snorlax learning so an unchanged policy
+# reproduces the same distribution and ratio=1 before parameter updates.
+MetamonGroupedTstepEncoderV2.dropout = 0.0
+traj_encoders.TformerTrajEncoder.dropout_ff = 0.0
+traj_encoders.TformerTrajEncoder.dropout_emb = 0.0
 
 ataraxos_agent.AtaraxosAgent.clip_range = 0.2
 ataraxos_agent.AtaraxosAgent.behavior_kl_coef = 0.1
