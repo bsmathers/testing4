@@ -852,7 +852,15 @@ new_fifo_count() {
 
 quarantine_stale_snorlax_fifo
 current="$(fifo_count)"
-if (( current < PREFILL_FILES )); then
+DEFER_SNORLAX_REFILL=0
+if [[ "${TRAIN_VARIANT}" == "snorlax_v1" && -n "${RESUME_EPOCH}" \
+    && "${ALTERNATE_COLLECT_LEARN}" == "1" \
+    && "${SNORLAX_PERSISTENT_ALTERNATION:-1}" == "1" \
+    && "${current}" -lt "${PREFILL_FILES}" ]]; then
+  DEFER_SNORLAX_REFILL=1
+  log "Deferring resumed FIFO refill to the persistent learner so collection uses reconstructed Schedule-Free y weights"
+fi
+if (( current < PREFILL_FILES && DEFER_SNORLAX_REFILL == 0 )); then
   prefill_start_count="${current}"
   prefill_start_seconds="$(date +%s)"
   log "Prefilling online FIFO: ${current}/${PREFILL_FILES}"
@@ -889,7 +897,8 @@ fi
 
 if [[ "${TRAIN_VARIANT}" == "snorlax_v1" ]]; then
   log "Validating exact behavior metadata in the SnorlaxV1 FIFO"
-  BUFFER_DIR="${BUFFER_DIR}" "${PYTHON_BIN}" - <<'PY'
+  BUFFER_DIR="${BUFFER_DIR}" DEFER_SNORLAX_REFILL="${DEFER_SNORLAX_REFILL}" \
+    "${PYTHON_BIN}" - <<'PY'
 import json
 import os
 from pathlib import Path
@@ -899,8 +908,11 @@ import numpy as np
 
 root = Path(os.environ["BUFFER_DIR"]) / "gen1ou"
 files = sorted(list(root.glob("*.json")) + list(root.glob("*.json.lz4")))
-if len(files) < 5000:
-    raise SystemExit(f"SnorlaxV1 FIFO requires at least 5000 games; found {len(files)}")
+required_min = 0 if os.environ.get("DEFER_SNORLAX_REFILL") == "1" else 5000
+if len(files) < required_min:
+    raise SystemExit(
+        f"SnorlaxV1 FIFO requires at least {required_min} games; found {len(files)}"
+    )
 required = {"behavior_log_probs", "behavior_values", "behavior_legal_masks"}
 wins = losses = unresolved = 0
 for path in files:
