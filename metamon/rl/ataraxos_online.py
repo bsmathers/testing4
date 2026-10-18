@@ -349,7 +349,8 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             "--log",
         ]
         print(f"[PersistentCycle] validation epoch={epoch}", flush=True)
-        with (log_dir / "validation.log").open("a", encoding="utf-8") as stream:
+        validation_log = log_dir / "validation.log"
+        with validation_log.open("a", encoding="utf-8") as stream:
             result = subprocess.run(
                 command,
                 env=child_env,
@@ -358,8 +359,14 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                 check=False,
             )
         if result.returncode:
-            raise RuntimeError(
-                f"validation epoch {epoch} exited with status {result.returncode}"
+            # Validation is observability, not training state. The policy and
+            # full optimizer checkpoint have already been published atomically;
+            # do not terminate a long training run because an evaluator failed.
+            print(
+                f"[PersistentCycle] WARNING validation epoch={epoch} exited "
+                f"with status {result.returncode}; training will continue; "
+                f"inspect {validation_log}",
+                flush=True,
             )
 
     def learn(self):
@@ -722,7 +729,13 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             loss = self.policy_aclr(batch, log_step=log_step)
             if events:
                 events[1].record()
-            metrics = {"Loss": loss} | self.policy.update_info
+            reported_loss = loss
+            if log_step:
+                reported_loss = loss.detach() + (
+                    self.policy.update_info["Ataraxos/L2SP Penalty"]
+                    * self.policy.update_info["Ataraxos/L2SP Coef"]
+                )
+            metrics = {"Loss": reported_loss} | self.policy.update_info
             self.accelerator.backward(loss)
             if events:
                 events[2].record()
