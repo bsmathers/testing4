@@ -529,17 +529,14 @@ fi
 # after the complete LZ4 frame has been read, so an interrupted decompression
 # cannot be mistaken for a completed dataset on restart.
 direct_hf_download() {
-  local url="$1" destination="$2" partial auth_args=()
+  local url="$1" destination="$2" partial
   [[ -s "${destination}" ]] && return 0
   mkdir -p "$(dirname "${destination}")"
   partial="${destination}.partial"
-  if [[ -n "${HF_TOKEN:-}" ]]; then
-    auth_args=(-H "Authorization: Bearer ${HF_TOKEN}")
-  fi
   log "Direct HTTP download: ${url}"
-  curl --fail --location --show-error \
+  curl --fail --location --show-error --progress-bar \
     --retry 20 --retry-all-errors --retry-delay 5 --connect-timeout 30 \
-    --continue-at - "${auth_args[@]}" \
+    --speed-time 120 --speed-limit 1024 --continue-at - \
     --output "${partial}" "${url}"
   mv -f "${partial}" "${destination}"
 }
