@@ -346,6 +346,82 @@ class OpponentPoolConfig:
         name, merged = self.rng.choice(population)
         return sample_policy_from_merged(name, merged, rng=self.rng)
 
+    def stratified_opponents(
+        self,
+        count: int,
+        *,
+        phase: int = 0,
+        seed: int = 0,
+    ) -> List[PolicySpec]:
+        """Return a low-discrepancy batch of opponent specs.
+
+        Pool rows encode sampling weight through duplication. Independent random
+        draws are a poor fit for short vectorized collector rounds because one
+        sampled row is shared by every lane in a collector. Systematic sampling
+        over the row-mass CDF gives each round the intended mixture up to the
+        unavoidable one-collector rounding error, while rotating the offset by
+        ``phase`` balances that rounding error across rounds.
+
+        Checkpoint / temperature / team-set choices inside each selected row are
+        still sampled, but from deterministic per-row RNG streams so the schedule
+        is reproducible and different collectors do not share RNG state.
+        """
+        if count <= 0:
+            raise ValueError(f"count must be positive, got {count}")
+        self._maybe_refresh_discovered(force=True)
+        population = self.agents
+        if not population:
+            raise RuntimeError(
+                "Opponent pool is empty: no static agents and discover agents have "
+                "not found any checkpoints yet."
+            )
+
+        n_rows = len(population)
+        # One point in each of ``count`` equal CDF strata. Advancing the offset
+        # by one pool row per phase makes cumulative allocations exact whenever
+        # count and n_rows have a short common period (e.g. Snorlax: 8 of 12
+        # rows -> every row appears exactly twice over each three-epoch block).
+        offset = (int(phase) % n_rows) / float(n_rows)
+        specs: List[PolicySpec] = []
+        for slot in range(count):
+            u = (offset + (slot + 0.5) / float(count)) % 1.0
+            row_index = min(int(u * n_rows), n_rows - 1)
+            name, merged = population[row_index]
+            stream_seed = (
+                int(seed)
+                + 1_000_003 * int(phase)
+                + 9_176 * row_index
+                + 37 * slot
+            )
+            specs.append(
+                sample_policy_from_merged(
+                    name, merged, rng=random.Random(stream_seed)
+                )
+            )
+        return specs
+
+    @classmethod
+    def from_policy_spec(
+        cls,
+        spec: PolicySpec,
+        *,
+        battle_format: str,
+    ) -> "OpponentPoolConfig":
+        """Build a single-spec pool that always returns ``spec``."""
+        merged = {
+            "model_name": spec.model_name,
+            "checkpoints": [spec.checkpoint],
+            "temperatures": [spec.temperature],
+            "team_set": [spec.team_set],
+            "battle_backend": spec.battle_backend,
+            "num_agents": 1,
+        }
+        return cls(
+            agents=[(spec.name, merged)],
+            battle_format=battle_format,
+            rng=random.Random(0),
+        )
+
     def team_set_for(self, team_set_name: str) -> TeamSet:
         if team_set_name not in self._team_cache:
             self._team_cache[team_set_name] = get_metamon_teams(
