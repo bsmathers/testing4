@@ -76,4 +76,11 @@ export METAMON_ACTOR_ONLY_COLLECTION=1
 
 export GOOD_REPLAYS_DIR="${GOOD_REPLAYS_DIR:-/workspace/good_replays}"
 
+# Completed full-state checkpoints imply that provisioning already succeeded.
+# On restart, bypass the generic first-run provisioner entirely.
+state_root="${PERSIST_ROOT}/checkpoints/${RUN_NAME}/ckpts/training_states"
+if [[ -d "${state_root}" ]]     && find "${state_root}" -mindepth 1 -maxdepth 1 -type d       -name "${RUN_NAME}_epoch_*" -print -quit 2>/dev/null | grep -q .; then
+  exec bash "${SCRIPT_DIR}/resume_snorlax_v1_vast.sh"
+fi
+
 exec bash "${SCRIPT_DIR}/train_smallg1onlinev1a_vast.sh"
