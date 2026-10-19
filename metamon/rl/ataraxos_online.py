@@ -910,18 +910,28 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
     ) -> int:
         """How many league rows each collector process plays at once.
 
-        One opponent per process meant a single-process host spent an entire
-        epoch against one league row. Split each process's lanes into groups
-        that each face their own opponent, enough to cover the league every
-        epoch, while keeping at least ``SNORLAX_MIN_LANES_PER_OPPONENT`` lanes
-        per group so opponent inference stays batched.
+        Every extra group costs one more serialized opponent forward pass per
+        environment step plus one more opponent build per round, so groups are
+        used only where they are needed. With at least half the league's rows
+        worth of processes (e.g. 8 processes for 12 rows) the rotating
+        stratified schedule already covers every row within a few epochs, so
+        each process keeps a single opponent (the pre-group code path). Smaller
+        hosts split lanes until about half the league is covered per epoch,
+        keeping at least ``SNORLAX_MIN_LANES_PER_OPPONENT`` (default 32) lanes
+        per group. ``SNORLAX_OPPONENT_GROUPS_PER_COLLECTOR`` overrides this.
         """
         raw = os.environ.get("SNORLAX_OPPONENT_GROUPS_PER_COLLECTOR")
+        processes = max(int(processes), 1)
         if raw:
             groups = int(raw)
+        elif 2 * processes >= int(pool_rows):
+            groups = 1
         else:
-            min_lanes = max(1, int(os.environ.get("SNORLAX_MIN_LANES_PER_OPPONENT", "16")))
-            needed = -(-int(pool_rows) // max(int(processes), 1))
+            min_lanes = max(
+                1, int(os.environ.get("SNORLAX_MIN_LANES_PER_OPPONENT", "32"))
+            )
+            target_slots = -(-int(pool_rows) // 2)
+            needed = -(-target_slots // processes)
             groups = min(needed, max(1, int(lanes) // min_lanes))
         return max(1, min(int(groups), int(lanes)))
 
