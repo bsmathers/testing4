@@ -152,8 +152,10 @@ export REPO_DIR PERSIST_ROOT GOOD_REPLAYS_DIR PYTHON_BIN
 # Collector topology is selected here and is authoritative. Inherited shell
 # values cannot silently override the machine-specific preset.
 if [[ "${cpu_model}" == *"EPYC 7642"* && "${gpu_name}" == *"5090"* ]] \
-    && (( cpu_count >= 48 && ram_mib >= 60000 )); then
+    && (( cpu_count >= 44 && ram_mib >= 60000 )); then
   # Vast EPYC 7642 profile with 48 allocated CPUs and about 64 GiB RAM.
+  # Vast currently encodes the advertised 48-vCPU allocation as a 46.08-CPU
+  # CFS quota (4608000/100000), so allow the small provider-side quota haircut.
   # Each collector has one Python coordinator plus seven single-threaded Node
   # simulator workers: 6 * (1 + 7) = 48 CPU-bound processes. Six actor-only
   # BF16 policies and 384 lanes fit comfortably on a 32 GiB RTX 5090, while
