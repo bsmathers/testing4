@@ -3,6 +3,7 @@ import json
 import datetime
 import shutil
 import tarfile
+import time
 from collections import defaultdict
 
 from huggingface_hub import hf_hub_download
@@ -93,6 +94,37 @@ LATEST_RAW_REPLAY_REVISION = "v6"
 LATEST_PARSED_REPLAY_REVISION = "v6"
 LATEST_TEAMS_REVISION = "v5"
 LATEST_USAGE_STATS_REVISION = "v5"
+
+
+def _hf_hub_download_with_retry(*, label: str, attempts: int = 5, **kwargs):
+    """Download a Hugging Face asset with bounded retry/backoff.
+
+    Large Xet-backed files can occasionally fail during CAS reconstruction even
+    when the underlying data is healthy. Retrying the same hf_hub_download call
+    lets the Hub/Xet client reuse its partial cache instead of forcing the user
+    to restart the entire provisioning workflow.
+    """
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            print(f"Downloading {label} from Hugging Face (attempt {attempt}/{attempts})...", flush=True)
+            path = hf_hub_download(**kwargs)
+            print(f"Downloaded {label}: {path}", flush=True)
+            return path
+        except Exception as exc:
+            last_error = exc
+            if attempt == attempts:
+                break
+            delay = min(60, 5 * (2 ** (attempt - 1)))
+            print(
+                f"Download failed for {label}: {type(exc).__name__}: {exc}. "
+                f"Retrying in {delay}s...",
+                flush=True,
+            )
+            time.sleep(delay)
+    raise RuntimeError(
+        f"Failed to download {label} after {attempts} attempts"
+    ) from last_error
 
 
 def _update_version_reference(key: str, name: str, version: str):
@@ -321,7 +353,8 @@ def download_self_play_data(
             f"{subset!r} from LOCAL_ONLY_SELF_PLAY_SUBSETS."
         )
 
-    hf_hub_download(
+    _hf_hub_download_with_retry(
+        label=f"{subset}/{battle_format}.tar.lz4",
         cache_dir=self_play_dir,
         repo_id="jakegrigsby/metamon-parsed-pile",
         filename=f"{subset}/{battle_format}.tar.lz4",
@@ -334,7 +367,9 @@ def download_self_play_data(
     sqlite_index_path = os.path.join(self_play_dir, f"{battle_format}.tar.index.sqlite")
     if not os.path.exists(sqlite_index_path) or force_download:
         try:
-            hf_hub_download(
+            _hf_hub_download_with_retry(
+                label=f"{subset}/{battle_format}.tar.index.sqlite",
+                attempts=3,
                 cache_dir=self_play_dir,
                 repo_id="jakegrigsby/metamon-parsed-pile",
                 filename=f"{subset}/{battle_format}.tar.index.sqlite",
