@@ -68,7 +68,14 @@ if (( vram_mib < MIN_VRAM_MIB )); then
   fi
 fi
 
-cpu_count="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 0)"
+cpu_count="$("${PYTHON_BIN}" - <<'PY'
+import os
+try:
+    print(len(os.sched_getaffinity(0)))
+except AttributeError:
+    print(os.cpu_count() or 0)
+PY
+)"
 host_ram_mib="$(awk '/MemTotal:/ {print int($2 / 1024)}' /proc/meminfo 2>/dev/null || echo 0)"
 cgroup_ram_mib=0
 if [[ -r /sys/fs/cgroup/memory.max ]]; then
@@ -118,71 +125,59 @@ run_log="${PERSIST_ROOT}/logs/vast-bootstrap-and-training.log"
 log "Launching commit ${commit}; progress will also be written to ${run_log}"
 
 export REPO_DIR PERSIST_ROOT GOOD_REPLAYS_DIR PYTHON_BIN
-if (( cpu_count >= 64 && vram_mib >= 30000 )); then
-  # The vectorized simulator shards each collector across COLLECTOR_WORKERS
-  # independent Node/Showdown processes.  On a 64-core EPYC, 8 collectors x
-  # 8 workers creates 64 Node processes before counting the 8 Python
-  # coordinators, IPC relay threads, and the resident learner.  That topology
-  # is fast only when the host also has enough RAM and CPU headroom.
-  if (( ram_mib >= 60000 )); then
-    # High-RAM 64+ core host.
-    default_collector_processes=8
-    default_lanes=64
-    default_collector_workers=8
-    default_partial_hidden_chunk=64
-    default_dloader_workers=32
-    collector_preset="high-ram-8x64x8"
-  elif (( ram_mib >= 36000 )); then
-    # 40-48 GiB class hosts (for example EPYC 7742 + RTX 5090). Preserve the
-    # full 512 concurrent battles and eight Python batching coordinators, but
-    # halve simulator sharding: 32 Node workers total, 16 lanes per worker.
-    # This leaves physical-core headroom for Python observation construction,
-    # opponent batching, IPC, and the resident learner while greatly reducing
-    # duplicated Node/V8 state.
-    default_collector_processes=8
-    default_lanes=64
-    default_collector_workers=4
-    default_partial_hidden_chunk=64
-    default_dloader_workers=12
-    collector_preset="low-ram-epyc-8x64x4"
+
+# Collector topology is selected here and is authoritative. Inherited shell
+# values cannot silently override the machine-specific preset.
+if (( vram_mib >= 30000 && cpu_count >= 56 )); then
+  if (( ram_mib < 56000 )); then
+    # EPYC 7742 / 40-48 GiB / RTX 5090 class host:
+    # 512 battles, 32 Node workers total.
+    COLLECTOR_PROCESSES=8
+    LANES=64
+    COLLECTOR_WORKERS=4
+    METAMON_PARTIAL_HIDDEN_CHUNK=64
+    DLOADER_WORKERS=12
+    collector_preset="epyc-40gb-8x64x4"
   else
-    # Very memory-constrained large-CPU host.
-    default_collector_processes=4
-    default_lanes=64
-    default_collector_workers=4
-    default_partial_hidden_chunk=32
-    default_dloader_workers=8
-    collector_preset="very-low-ram-4x64x4"
+    # Large-memory 64+ CPU host:
+    # 512 battles, 64 Node workers total.
+    COLLECTOR_PROCESSES=8
+    LANES=64
+    COLLECTOR_WORKERS=8
+    METAMON_PARTIAL_HIDDEN_CHUNK=64
+    DLOADER_WORKERS=32
+    collector_preset="high-ram-8x64x8"
   fi
+elif (( vram_mib >= 30000 && cpu_count >= 32 )); then
+  COLLECTOR_PROCESSES=4
+  LANES=64
+  COLLECTOR_WORKERS=4
+  METAMON_PARTIAL_HIDDEN_CHUNK=32
+  DLOADER_WORKERS=8
+  collector_preset="mid-cpu-4x64x4"
 else
-  default_collector_processes=1
-  default_lanes=96
-  default_collector_workers=8
-  default_partial_hidden_chunk=8
-  default_dloader_workers=8
+  COLLECTOR_PROCESSES=1
+  LANES=96
+  COLLECTOR_WORKERS=8
+  METAMON_PARTIAL_HIDDEN_CHUNK=8
+  DLOADER_WORKERS=8
   collector_preset="fallback-1x96x8"
 fi
-export COLLECTOR_PROCESSES="${COLLECTOR_PROCESSES:-${default_collector_processes}}"
-export COLLECTOR_DEVICE="${COLLECTOR_DEVICE:-gpu}"
-if [[ -z "${COLLECTOR_DTYPE:-}" ]]; then
-  if [[ "${COLLECTOR_DEVICE}" == "cpu" ]]; then
-    COLLECTOR_DTYPE=fp32
-  else
-    COLLECTOR_DTYPE=bf16
-  fi
-fi
-export COLLECTOR_DTYPE
-export LANES="${LANES:-${default_lanes}}"
-export COLLECTOR_WORKERS="${COLLECTOR_WORKERS:-${default_collector_workers}}"
-export METAMON_PARTIAL_HIDDEN_CHUNK="${METAMON_PARTIAL_HIDDEN_CHUNK:-${default_partial_hidden_chunk}}"
-export DLOADER_WORKERS="${DLOADER_WORKERS:-${default_dloader_workers}}"
+COLLECTOR_DEVICE=gpu
+COLLECTOR_DTYPE=bf16
+
+export COLLECTOR_PROCESSES COLLECTOR_DEVICE COLLECTOR_DTYPE LANES
+export COLLECTOR_WORKERS METAMON_PARTIAL_HIDDEN_CHUNK DLOADER_WORKERS
 log "Collector preset ${collector_preset}: ${COLLECTOR_PROCESSES} processes x ${LANES} lanes x ${COLLECTOR_WORKERS} Showdown workers; DLOADER_WORKERS=${DLOADER_WORKERS}"
-export MIXED_PRECISION="${MIXED_PRECISION:-bf16}"
-export METAMON_LOG_INTERVAL="${METAMON_LOG_INTERVAL:-50}"
-export BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-14}"
-export GAMES_PER_LEARNER_EPOCH="${GAMES_PER_LEARNER_EPOCH:-2000}"
-export TOTAL_LEARNER_EPOCHS="${TOTAL_LEARNER_EPOCHS:-1000000000}"
-export ONLINE_FIFO_SIZE=5000
+
+MIXED_PRECISION=bf16
+METAMON_LOG_INTERVAL=50
+BATCH_SIZE_PER_GPU=14
+GAMES_PER_LEARNER_EPOCH=2000
+TOTAL_LEARNER_EPOCHS=1000000000
+ONLINE_FIFO_SIZE=5000
+export MIXED_PRECISION METAMON_LOG_INTERVAL BATCH_SIZE_PER_GPU
+export GAMES_PER_LEARNER_EPOCH TOTAL_LEARNER_EPOCHS ONLINE_FIFO_SIZE
 
 cd "${REPO_DIR}"
 bash scripts/train_snorlax_v1.sh 2>&1 | tee -a "${run_log}"
