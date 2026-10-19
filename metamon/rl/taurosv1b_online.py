@@ -783,6 +783,41 @@ def main() -> None:
             load_collection_policy_state(experiment.policy, released_state)
             print("Collector loaded released behavior policy.", flush=True)
 
+    exact_collect_target = os.environ.get("SNORLAX_COLLECT_GAME_TARGET")
+    if args.mode == "collect" and exact_collect_target is not None:
+        target_games = int(exact_collect_target)
+        if target_games <= 0:
+            raise ValueError("SNORLAX_COLLECT_GAME_TARGET must be positive")
+        quota_env = experiment.train_envs.env
+        while (
+            not hasattr(quota_env, "set_collection_game_target")
+            and hasattr(quota_env, "env")
+        ):
+            quota_env = quota_env.env
+        if not hasattr(quota_env, "set_collection_game_target"):
+            raise RuntimeError("collector env does not support exact game quotas")
+        quota_env.set_collection_game_target(target_games)
+        experiment.train_envs.reset()
+        experiment.policy_aclr.eval()
+        experiment.interact(
+            experiment.train_envs,
+            1_000_000,
+            hidden_state=None,
+            sample=experiment.sample_actions_train,
+            episodes=None,
+        )
+        saved = quota_env.collection_game_count()
+        if saved != target_games:
+            raise RuntimeError(
+                f"collector saved {saved} decisive games; expected {target_games}"
+            )
+        print(
+            f"Collector exact quota complete: {saved}/{target_games} decisive games",
+            flush=True,
+        )
+        if args.log:
+            wandb.finish()
+        return
     if args.validation_once:
         if args.validation_epoch is not None:
             experiment.epoch = args.validation_epoch

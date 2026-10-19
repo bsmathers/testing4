@@ -1,6 +1,6 @@
 from collections import Counter
 
-from metamon.rl.evaluate.common import PolicySpec
+from metamon.rl.evaluate.common import PolicySpec, stratified_choices
 from metamon.rl.evaluate.opponent_pool import OpponentPoolConfig
 
 
@@ -75,3 +75,41 @@ def test_single_spec_pool_is_exact():
     )
     pool = OpponentPoolConfig.from_policy_spec(spec, battle_format="gen1ou")
     assert [pool.sample_opponent() for _ in range(5)] == [spec] * 5
+
+
+def test_stratified_choices_balance_equal_weight_team_sets():
+    value = {"weighted": {"hl_05_26": 1, "snorlax_v1_expert": 1}}
+    for phase in range(8):
+        chosen = stratified_choices(value, 8, phase=phase)
+        assert Counter(chosen) == {
+            "hl_05_26": 4,
+            "snorlax_v1_expert": 4,
+        }
+        assert all(chosen[i] != chosen[i + 1] for i in range(len(chosen) - 1))
+
+
+def test_stratified_choices_cycle_plain_lists():
+    assert stratified_choices(["a", "b"], 6, phase=0) == [
+        "a", "b", "a", "b", "a", "b"
+    ]
+    assert stratified_choices(["a", "b"], 6, phase=1) == [
+        "b", "a", "b", "a", "b", "a"
+    ]
+
+def test_validation_style_schedule_covers_each_anchor_twice():
+    rows = [
+        ("TaurosV0", _row("TaurosV0", [62])),
+        ("Kakuna", _row("Kakuna", [34])),
+        ("Epoch475", _row("Epoch475Frozen", [475])),
+    ]
+    pool = OpponentPoolConfig(rows, battle_format="gen1ou")
+    specs = pool.stratified_opponents(6, phase=0, seed=91_337)
+    assert Counter(spec.model_name for spec in specs) == {
+        "TaurosV0": 2,
+        "Kakuna": 2,
+        "Epoch475Frozen": 2,
+    }
+    assert Counter(spec.team_set for spec in specs) == {
+        "hl_05_26": 3,
+        "snorlax_v1_expert": 3,
+    }

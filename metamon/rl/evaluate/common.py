@@ -270,6 +270,48 @@ def random_choice(value, rng: Optional[random.Random] = None):
     return generator.choice(expand_value_list(value))
 
 
+def stratified_choices(value, count: int, *, phase: int = 0) -> list:
+    """Choose ``count`` low-discrepancy values from a config choice.
+
+    Plain scalar/list/range values are cycled deterministically. Weighted
+    mappings use midpoint systematic sampling over their probability CDF,
+    which preserves configured mass without the high variance of ``count``
+    independent draws.
+    """
+    if count <= 0:
+        raise ValueError(f"count must be positive, got {count}")
+    if isinstance(value, dict) and "weighted" in value:
+        mapping = value["weighted"]
+        population = list(mapping.keys())
+        weights = [float(mapping[k]) for k in population]
+        if not population or any(w < 0.0 for w in weights):
+            raise ValueError("weighted choice requires nonnegative entries")
+        total = sum(weights)
+        if total <= 0.0:
+            raise ValueError("weighted choice requires positive total weight")
+        # Smooth weighted round-robin has the same low-discrepancy goal as CDF
+        # systematic sampling but spreads duplicate categories across adjacent
+        # collector slots. That avoids coupling one half of the collector pool
+        # to one team-set category when weights are 1:1.
+        rotate = int(phase) % len(population)
+        population = population[rotate:] + population[:rotate]
+        weights = weights[rotate:] + weights[:rotate]
+        current = [0.0] * len(population)
+        chosen = []
+        for _ in range(count):
+            for idx, weight in enumerate(weights):
+                current[idx] += weight
+            best = max(range(len(population)), key=lambda idx: current[idx])
+            chosen.append(population[best])
+            current[best] -= total
+        return chosen
+
+    options = expand_value_list(value)
+    if not options:
+        raise ValueError("choice has no options")
+    start = int(phase) % len(options)
+    return [options[(start + slot) % len(options)] for slot in range(count)]
+
 def parse_team_set_config(value: str):
     """Parse a CLI/config string into a :func:`random_choice`-compatible team-set value.
 

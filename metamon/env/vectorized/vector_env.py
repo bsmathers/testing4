@@ -342,11 +342,44 @@ class VectorizedShowdownEnv(gym.Env):
             self._player_team_cache[name] = get_metamon_teams(self.battle_format, name)
         return self._player_team_cache[name]
 
-    def _configure_player_team_for_reset(self) -> None:
-        """Redraw POV team set once per full env reset when a config is set."""
+    def _configure_player_team_for_reset(self, override: Optional[str] = None) -> None:
+        """Choose the POV team-set category for a full env reset.
+
+        ``override`` is used by stratified collection/validation so parallel
+        vector envs cover the configured team-set mixture deterministically.
+        Individual teams are still sampled independently by ``TeamSet.yield_team``
+        for every battle.
+        """
+        if override is not None:
+            from metamon.env import get_metamon_teams
+
+            name = str(override)
+            if name not in self._player_team_cache:
+                self._player_team_cache[name] = get_metamon_teams(
+                    self.battle_format, name
+                )
+            self.player_team_set = self._player_team_cache[name]
+            return
         if self._player_team_set_config is None:
             return
         self.player_team_set = self._sample_player_team_set()
+
+    def set_collection_game_target(self, target: int) -> None:
+        """Cap saved decisive training trajectories at exactly ``target``."""
+        target = int(target)
+        if target <= 0:
+            raise ValueError(f"collection game target must be positive, got {target}")
+        self._collection_game_target = target
+        self._collection_games_saved = 0
+
+    def collection_game_target_reached(self) -> bool:
+        target = getattr(self, "_collection_game_target", None)
+        if target is None:
+            return False
+        return int(getattr(self, "_collection_games_saved", 0)) >= int(target)
+
+    def collection_game_count(self) -> int:
+        return int(getattr(self, "_collection_games_saved", 0))
 
     def _start_lane(self, i: int) -> None:
         lane = self.lanes[i]
@@ -761,7 +794,7 @@ class VectorizedShowdownEnv(gym.Env):
             self._rng.seed(seed)
             np.random.seed(seed)
         options = options or {}
-        self._configure_player_team_for_reset()
+        self._configure_player_team_for_reset(options.get("player_team_set"))
         self._configure_opponent_for_reset(options.get("opponent"))
         self.opponent.reset_all()
         # ``_advance_lanes`` may need to take opponent-only actions while the
@@ -992,6 +1025,16 @@ class VectorizedShowdownEnv(gym.Env):
         save_training_trajectory = not (
             self._ataraxos_metadata_enabled and result == "UNRESOLVED"
         )
+        target = getattr(self, "_collection_game_target", None)
+        if (
+            save_training_trajectory
+            and target is not None
+            and int(getattr(self, "_collection_games_saved", 0)) >= int(target)
+        ):
+            # Several vector lanes can terminate on the same outer step. Cap
+            # writes here, rather than only stopping the interaction loop, so
+            # each collector contributes exactly its assigned decisive quota.
+            save_training_trajectory = False
         if self.save_trajectories_to is not None and save_training_trajectory:
             filename = (
                 f"metamon-{self.metamon_battle_format}-{battle_id}_Unrated_"
@@ -1020,6 +1063,10 @@ class VectorizedShowdownEnv(gym.Env):
             with lz4.frame.open(temp_path, "wb") as f:
                 f.write(orjson.dumps(output_json))
             os.rename(temp_path, path)
+            if target is not None and result in ("WIN", "LOSS"):
+                self._collection_games_saved = int(
+                    getattr(self, "_collection_games_saved", 0)
+                ) + 1
 
         if self.save_results_to is not None:
             with open(self.save_results_to, "a") as f:

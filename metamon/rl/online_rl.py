@@ -716,6 +716,12 @@ def _make_collect_train_env(
     from metamon.rl.evaluate.opponent_pool import OpponentPoolConfig
 
     team_set_config = parse_team_set_config(team_set_name)
+    fixed_player_team_set = os.environ.get("METAMON_FIXED_PLAYER_TEAM_SET")
+    if fixed_player_team_set:
+        # Parent Snorlax collection stratifies the trainee team-set category
+        # across collector processes. Keep this collector pinned to its assigned
+        # category while individual teams continue to resample every battle.
+        team_set_config = fixed_player_team_set
     # Probe one draw so env construction has a concrete TeamSet; the env redraws
     # from team_set_config on every full reset (once per AMAGO epoch).
     from metamon.rl.evaluate.common import random_choice
