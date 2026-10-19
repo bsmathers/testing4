@@ -482,6 +482,12 @@ def add_cli(parser: ArgumentParser) -> ArgumentParser:
         "continue to use --ckpt_interval.",
     )
     parser.add_argument(
+        "--validation_games",
+        type=int,
+        default=None,
+        help="For --validation_once, stop after this many completed battles instead of using only a fixed timestep budget.",
+    )
+    parser.add_argument(
         "--mixed_precision",
         choices=["no", "fp16", "bf16"],
         default="no",
@@ -565,6 +571,11 @@ def main() -> None:
         raise ValueError("--validation_epoch must be non-negative")
     if args.validation_once and args.val_timesteps <= 0:
         raise ValueError("--validation_once requires positive --val_timesteps")
+    if args.validation_games is not None:
+        if not args.validation_once:
+            raise ValueError("--validation_games requires --validation_once")
+        if args.validation_games <= 0:
+            raise ValueError("--validation_games must be positive")
 
     metamon.print_banner()
     os.environ.setdefault("METAMON_SAVE_DIR", os.path.abspath(args.save_dir))
@@ -728,7 +739,13 @@ def main() -> None:
         if policy_step is not None:
             experiment.grad_update_counter = int(policy_step.item())
         experiment.policy_aclr.eval()
-        experiment.evaluate_val()
+        if args.validation_games is not None:
+            evaluate_games = getattr(experiment, "evaluate_val_games", None)
+            if evaluate_games is None:
+                raise RuntimeError("this experiment does not support --validation_games")
+            evaluate_games(args.validation_games)
+        else:
+            experiment.evaluate_val()
         if args.log:
             wandb.finish()
         return
