@@ -134,10 +134,11 @@ if [[ "${cpu_model}" == *"EPYC 7742"* && "${gpu_name}" == *"5090"* ]]; then
   # MemTotal/cgroup reporting to choose a different topology.
   COLLECTOR_PROCESSES=8
   LANES=64
-  COLLECTOR_WORKERS=4
+  COLLECTOR_WORKERS=7
   METAMON_PARTIAL_HIDDEN_CHUNK=64
+  METAMON_FULL_BATCH_MAX_INACTIVE=8
   DLOADER_WORKERS=12
-  collector_preset="epyc-7742-5090-8x64x4"
+  collector_preset="epyc-7742-5090-8x64x7"
 elif (( vram_mib >= 30000 && cpu_count >= 56 )); then
   if (( ram_mib < 56000 )); then
     # EPYC 7742 / 40-48 GiB / RTX 5090 class host:
@@ -152,7 +153,7 @@ elif (( vram_mib >= 30000 && cpu_count >= 56 )); then
     collector_preset="epyc-40gb-8x64x7"
   else
     # Large-memory 64+ CPU host:
-    # 512 battles, 64 Node workers total.
+    # 512 battles, 56 Node workers total.
     COLLECTOR_PROCESSES=8
     LANES=64
     COLLECTOR_WORKERS=7
