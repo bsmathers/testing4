@@ -270,6 +270,46 @@ def random_choice(value, rng: Optional[random.Random] = None):
     return generator.choice(expand_value_list(value))
 
 
+def stratified_choices(value, count: int, *, phase: int = 0) -> list:
+    """Choose ``count`` low-discrepancy values from a config choice.
+
+    Plain scalar/list/range values are cycled deterministically. Weighted
+    mappings use midpoint systematic sampling over their probability CDF,
+    which preserves configured mass without the high variance of ``count``
+    independent draws.
+    """
+    if count <= 0:
+        raise ValueError(f"count must be positive, got {count}")
+    if isinstance(value, dict) and "weighted" in value:
+        mapping = value["weighted"]
+        population = list(mapping.keys())
+        weights = [float(mapping[k]) for k in population]
+        if not population or any(w < 0.0 for w in weights):
+            raise ValueError("weighted choice requires nonnegative entries")
+        total = sum(weights)
+        if total <= 0.0:
+            raise ValueError("weighted choice requires positive total weight")
+        cumulative = []
+        running = 0.0
+        for weight in weights:
+            running += weight / total
+            cumulative.append(running)
+        offset = (int(phase) % count) / float(count)
+        chosen = []
+        for slot in range(count):
+            u = (offset + (slot + 0.5) / float(count)) % 1.0
+            index = 0
+            while index < len(cumulative) - 1 and u >= cumulative[index]:
+                index += 1
+            chosen.append(population[index])
+        return chosen
+
+    options = expand_value_list(value)
+    if not options:
+        raise ValueError("choice has no options")
+    start = int(phase) % len(options)
+    return [options[(start + slot) % len(options)] for slot in range(count)]
+
 def parse_team_set_config(value: str):
     """Parse a CLI/config string into a :func:`random_choice`-compatible team-set value.
 
