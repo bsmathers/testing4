@@ -779,8 +779,20 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         return cpu_bottleneck, memory_bottleneck, summary
 
     @staticmethod
+    def _resolve_run_config_reference(run_config: str, value: str) -> Path:
+        path = Path(str(value))
+        if path.is_absolute():
+            return path
+        cwd_candidate = Path.cwd() / path
+        if cwd_candidate.exists():
+            return cwd_candidate
+        resolved_run = Path(run_config).resolve()
+        # <repo>/metamon/rl/configs/online_runs/<file>.yaml
+        return resolved_run.parents[4] / path
+
+    @classmethod
     def _stratified_collector_opponents(
-        *, run_config: str, epoch: int, processes: int
+        cls, *, run_config: str, epoch: int, processes: int
     ):
         """Choose one low-discrepancy opponent spec per collector process."""
         from metamon.rl.evaluate.opponent_pool import load_opponent_pool
@@ -791,24 +803,57 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             raise RuntimeError(
                 f"Snorlax run config {run_config} does not define train_pool"
             )
-        pool_path = Path(str(pool_value))
-        if not pool_path.is_absolute():
-            cwd_candidate = Path.cwd() / pool_path
-            if cwd_candidate.is_file():
-                pool_path = cwd_candidate
-            else:
-                # run_config normally lives at
-                # <repo>/metamon/rl/configs/online_runs/*.yaml.
-                resolved_run = Path(run_config).resolve()
-                repo_root = resolved_run.parents[4]
-                pool_path = repo_root / pool_path
+        pool_path = cls._resolve_run_config_reference(run_config, pool_value)
         if not pool_path.is_file():
             raise FileNotFoundError(f"opponent pool not found: {pool_path}")
         battle_format = str(config.get("battle_format", "gen1ou"))
         pool = load_opponent_pool(str(pool_path), battle_format=battle_format)
-        return pool.stratified_opponents(
-            processes, phase=epoch, seed=73_001
+        return pool.stratified_opponents(processes, phase=epoch, seed=73_001)
+
+    @classmethod
+    def _stratified_collector_player_team_sets(
+        cls, *, run_config: str, epoch: int, processes: int
+    ) -> list[str]:
+        """Balance the trainee team-set category across collector processes."""
+        from metamon.rl.evaluate.common import (
+            parse_team_set_config,
+            stratified_choices,
         )
+
+        config = v1b.legacy._load_run_config(run_config)
+        value = config.get("train_team_set")
+        if not value:
+            raise RuntimeError(
+                f"Snorlax run config {run_config} does not define train_team_set"
+            )
+        resolved = cls._resolve_run_config_reference(run_config, value)
+        parsed = parse_team_set_config(
+            str(resolved) if resolved.is_file() else str(value)
+        )
+        return [
+            str(x)
+            for x in stratified_choices(parsed, processes, phase=epoch)
+        ]
+
+    @staticmethod
+    def _split_game_quotas(target: int, processes: int) -> list[int]:
+        if target <= 0 or processes <= 0:
+            raise ValueError("target and processes must be positive")
+        base, extra = divmod(int(target), int(processes))
+        quotas = [base + (1 if idx < extra else 0) for idx in range(processes)]
+        if any(quota <= 0 for quota in quotas):
+            raise ValueError(
+                f"target {target} is too small for {processes} collector processes"
+            )
+        return quotas
+
+    @staticmethod
+    def _collection_target(buffer_dir: Path) -> int:
+        replay_dir = buffer_dir / "gen1ou"
+        target = int(os.environ.get("GAMES_PER_LEARNER_EPOCH", "2000"))
+        min_fifo = int(os.environ.get("ONLINE_FIFO_SIZE", "5000"))
+        current_fifo = len(AtaraxosExperiment._replay_names(replay_dir))
+        return max(target, max(min_fifo - current_fifo, 0))
 
     def _launch_collector_children(
         self,
@@ -825,19 +870,26 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         run_config: str,
         module: str,
         save_dir: str,
+        game_quotas: list[int],
         gated: bool,
     ) -> dict:
-        """Launch collectors, optionally stopping after full initialization."""
+        """Launch collectors with fixed opponent/team assignments and exact quotas."""
+        if len(game_quotas) != processes or sum(game_quotas) <= 0:
+            raise ValueError("invalid per-collector game quota schedule")
         opponent_specs = self._stratified_collector_opponents(
+            run_config=run_config, epoch=epoch, processes=processes
+        )
+        player_team_sets = self._stratified_collector_player_team_sets(
             run_config=run_config, epoch=epoch, processes=processes
         )
         schedule = " | ".join(
             f"{idx}:{spec.model_name}@{spec.checkpoint} "
-            f"T={spec.temperature:g} team={spec.team_set}"
+            f"T={spec.temperature:g} opp_team={spec.team_set} "
+            f"player_team={player_team_sets[idx]} quota={game_quotas[idx]}"
             for idx, spec in enumerate(opponent_specs)
         )
         print(
-            f"[PersistentCycle] opponent schedule epoch={epoch}: {schedule}",
+            f"[PersistentCycle] collector schedule epoch={epoch}: {schedule}",
             flush=True,
         )
         start_marker = log_dir / f".collector-start-{epoch}"
@@ -856,6 +908,8 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             child_env.update(
                 METAMON_RUN_MODE="collect",
                 SNORLAX_FIXED_BASE_WEIGHTS="1",
+                SNORLAX_COLLECT_GAME_TARGET=str(game_quotas[idx]),
+                METAMON_FIXED_PLAYER_TEAM_SET=player_team_sets[idx],
                 OMP_NUM_THREADS="1",
                 MKL_NUM_THREADS="1",
                 OPENBLAS_NUM_THREADS="1",
@@ -910,6 +964,8 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             "epoch": epoch,
             "processes": processes,
             "children": children,
+            "game_quotas": list(game_quotas),
+            "target": sum(game_quotas),
             "start_marker": start_marker if gated else None,
             "ready_markers": ready_markers if gated else [],
             "launched": time.monotonic(),
@@ -937,7 +993,7 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         self._prewarmed_collectors = None
 
     def _prewarm_external_collectors(self, epoch: int, behavior_weights: str) -> None:
-        """Initialize the next rollout pool while the checkpoint is written."""
+        """Initialize the next exact-quota rollout pool while checkpointing."""
         existing = getattr(self, "_prewarmed_collectors", None)
         if existing is not None and existing["epoch"] == epoch:
             return
@@ -947,6 +1003,9 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             configured,
             int(getattr(self, "_collector_process_limit", configured)),
         )
+        buffer_dir = Path(os.environ["SNORLAX_BUFFER_DIR"])
+        target = self._collection_target(buffer_dir)
+        quotas = self._split_game_quotas(target, processes)
         dtype = os.environ.get("COLLECTOR_DTYPE", "bf16")
         state = self._launch_collector_children(
             epoch=epoch,
@@ -956,27 +1015,27 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             workers=int(os.environ.get("COLLECTOR_WORKERS", "8")),
             collector_mp="no" if dtype == "fp32" else dtype,
             behavior_weights=behavior_weights,
-            buffer_dir=Path(os.environ["SNORLAX_BUFFER_DIR"]),
+            buffer_dir=buffer_dir,
             log_dir=Path(os.environ["SNORLAX_LOG_DIR"]),
             run_config=os.environ["SNORLAX_RUN_CONFIG"],
             module=os.environ.get("RUNNER_MODULE", "metamon.rl.ataraxos_online"),
             save_dir=os.environ["METAMON_SAVE_DIR"],
+            game_quotas=quotas,
             gated=True,
         )
         self._prewarmed_collectors = state
         print(
             f"[PersistentCycle] prewarming collection epoch={epoch} "
-            f"processes={processes}",
+            f"processes={processes} quotas={quotas}",
             flush=True,
         )
 
     def _external_collect_phase(self, epoch: int) -> dict[str, int | float] | None:
-        """Run direct collector subprocesses, matching the fast pre-warm design."""
+        """Collect an exact, equally weighted decisive-game quota per process."""
         buffer_dir = Path(os.environ["SNORLAX_BUFFER_DIR"])
         replay_dir = buffer_dir / "gen1ou"
         log_dir = Path(os.environ["SNORLAX_LOG_DIR"])
         behavior_weights = self._behavior_policy_path()
-        target = int(os.environ.get("GAMES_PER_LEARNER_EPOCH", "2000"))
         removed_unresolved = self._purge_unresolved_online_replays(replay_dir)
         if removed_unresolved:
             print(
@@ -984,26 +1043,13 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                 "schema-v3 replay(s) from the FIFO",
                 flush=True,
             )
-        min_fifo = int(os.environ.get("ONLINE_FIFO_SIZE", "5000"))
-        current_fifo = len(self._replay_names(replay_dir))
-        target = max(target, max(min_fifo - current_fifo, 0))
+        target = self._collection_target(buffer_dir)
         configured_processes = int(os.environ.get("COLLECTOR_PROCESSES", "8"))
         processes = min(
             configured_processes,
             int(getattr(self, "_collector_process_limit", configured_processes)),
         )
-        min_processes = min(
-            processes,
-            max(
-                1,
-                int(
-                    os.environ.get(
-                        "SNORLAX_MIN_COLLECTOR_PROCESSES", str(processes)
-                    )
-                ),
-            ),
-        )
-        resource_guard = os.environ.get("SNORLAX_RESOURCE_GUARD", "0") == "1"
+        quotas = self._split_game_quotas(target, processes)
         poll_seconds = max(
             0.5, float(os.environ.get("SNORLAX_COLLECT_POLL_SECONDS", "2"))
         )
@@ -1039,23 +1085,26 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         print(
             f"[PersistentCycle] collect epoch={epoch} target={target} "
             f"processes={processes} lanes={lanes} workers={workers} "
-            f"inference={compile_mode}",
+            f"quotas={quotas} inference={compile_mode}",
             flush=True,
         )
         launch_state = getattr(self, "_prewarmed_collectors", None)
-        if (
-            launch_state is not None
-            and launch_state["epoch"] == epoch
-            and any(child.poll() is not None for child, _ in launch_state["children"])
+        if launch_state is not None and (
+            launch_state["epoch"] != epoch
+            or launch_state.get("target") != target
+            or any(
+                child.poll() is not None
+                for child, _ in launch_state["children"]
+            )
         ):
             print(
-                f"[PersistentCycle] prewarm epoch={epoch} exited early; "
-                "falling back to a fresh collector pool",
+                f"[PersistentCycle] prewarm epoch={epoch} unusable; "
+                "launching a fresh exact-quota collector pool",
                 flush=True,
             )
             self._cleanup_prewarmed_collectors()
             launch_state = None
-        if launch_state is not None and launch_state["epoch"] == epoch:
+        if launch_state is not None:
             children = launch_state["children"]
             ready_markers = launch_state["ready_markers"]
             start_marker = launch_state["start_marker"]
@@ -1068,8 +1117,6 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             )
             self._prewarmed_collectors = None
         else:
-            if launch_state is not None:
-                self._cleanup_prewarmed_collectors()
             launch_state = self._launch_collector_children(
                 epoch=epoch,
                 processes=processes,
@@ -1083,30 +1130,28 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                 run_config=run_config,
                 module=module,
                 save_dir=save_dir,
+                game_quotas=quotas,
                 gated=False,
             )
             children = launch_state["children"]
             ready_markers = []
             start_marker = None
+        collection_started = time.monotonic()
         try:
-            fresh = 0
-            collection_started = time.monotonic()
             if start_marker is not None:
                 start_marker.touch()
             previous_fresh = 0
             previous_poll = collection_started
             last_progress = collection_started - progress_seconds
             first_replay_reported = False
-            pressure_streak = 0
-            last_reduction = collection_started
-            while fresh < target:
+            while True:
                 time.sleep(poll_seconds)
-                for child, _stream in children:
-                    status = child.poll()
-                    if status is not None:
+                statuses = [child.poll() for child, _ in children]
+                for idx, status in enumerate(statuses):
+                    if status is not None and status != 0:
                         raise RuntimeError(
-                            f"collector exited with status {status}; inspect "
-                            f"{log_dir}/collector-epoch-{epoch}-*.log"
+                            f"collector {idx} exited with status {status}; inspect "
+                            f"{log_dir}/collector-epoch-{epoch}-{idx}.log"
                         )
                 fresh = len(self._replay_names(replay_dir) - baseline)
                 now = time.monotonic()
@@ -1127,10 +1172,16 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                     if eta_rate > 0.0
                     else float("inf")
                 )
-                eta_text = f"{eta_minutes:.1f}m" if np.isfinite(eta_minutes) else "--"
-                if now - last_progress >= progress_seconds or fresh >= target:
+                eta_text = (
+                    f"{max(eta_minutes, 0.0):.1f}m"
+                    if np.isfinite(eta_minutes)
+                    else "--"
+                )
+                active = sum(status is None for status in statuses)
+                if now - last_progress >= progress_seconds or active == 0:
                     print(
                         f"[PersistentCycle] collect epoch={epoch} {fresh}/{target} "
+                        f"active={active}/{processes} "
                         f"recent={recent_rate:.0f} games/min "
                         f"avg={average_rate:.0f} eta={eta_text}",
                         flush=True,
@@ -1138,57 +1189,8 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                     last_progress = now
                 previous_fresh = fresh
                 previous_poll = now
-                if (
-                    resource_guard
-                    and fresh < target
-                    and len(children) > min_processes
-                    and now - collection_started >= 45.0
-                    and now - last_reduction >= 60.0
-                ):
-                    cpu_bound, memory_bound, pressure = (
-                        self._collector_resource_pressure()
-                    )
-                    if cpu_bound or memory_bound:
-                        pressure_streak += 1
-                        if pressure_streak == 1:
-                            print(
-                                "[PersistentCycle] resource guard: observing "
-                                f"pressure ({pressure}); waiting for 3 sustained "
-                                "samples before reducing collectors",
-                                flush=True,
-                            )
-                    else:
-                        pressure_streak = 0
-                    # Sustained CPU contention avoids reacting to normal startup
-                    # bursts. Critically high RAM gets one immediate downshift so
-                    # the kernel does not have to choose a victim first.
-                    memory_critical = memory_bound and (
-                        self._memory_usage_fraction() >= 0.95
-                    )
-                    if pressure_streak >= 3 or memory_critical:
-                        child, stream = children.pop()
-                        child.terminate()
-                        try:
-                            child.wait(timeout=20)
-                        except subprocess.TimeoutExpired:
-                            child.kill()
-                            child.wait(timeout=10)
-                        stream.close()
-                        self._collector_process_limit = len(children)
-                        causes = []
-                        if cpu_bound:
-                            causes.append("CPU")
-                        if memory_bound:
-                            causes.append("RAM")
-                        print(
-                            "[PersistentCycle] resource guard: sustained "
-                            f"{'/'.join(causes)} pressure ({pressure}); reducing "
-                            f"collectors {len(children) + 1}->{len(children)} "
-                            f"for this and future phases (floor={min_processes})",
-                            flush=True,
-                        )
-                        pressure_streak = 0
-                        last_reduction = now
+                if active == 0:
+                    break
         finally:
             for child, _stream in children:
                 if child.poll() is None:
@@ -1205,27 +1207,33 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             for ready_marker in ready_markers:
                 ready_marker.unlink(missing_ok=True)
         fresh_names = self._replay_names(replay_dir) - baseline
+        if len(fresh_names) != target:
+            raise RuntimeError(
+                f"exact-quota collection produced {len(fresh_names)} replays; "
+                f"expected exactly {target}. Refusing a biased collection round."
+            )
         metrics = self._count_collection_outcomes(replay_dir, fresh_names)
+        if metrics["Unresolved"] != 0 or metrics["Games"] != target:
+            raise RuntimeError(
+                f"exact-quota collection outcome mismatch: {metrics}"
+            )
         self._write_collection_outcome_report(epoch, metrics)
         print(
             f"[PersistentCycle] outcomes epoch={epoch} "
             f"wins={metrics['Wins']} losses={metrics['Losses']} "
-            f"unresolved={metrics['Unresolved']} "
             f"win_rate={metrics['Win Rate']:.4f}",
             flush=True,
         )
         elapsed = max(time.monotonic() - collection_started, 1e-6)
         print(
             f"[PersistentCycle] collection timing epoch={epoch} "
-            f"elapsed={elapsed:.1f}s rate={len(fresh_names) * 60.0 / elapsed:.0f} "
-            "games/min",
+            f"elapsed={elapsed:.1f}s rate={target * 60.0 / elapsed:.0f} games/min",
             flush=True,
         )
         self._mark_collection_ready(epoch)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         return metrics
-
     def evaluate_val_games(self, target_games: int) -> None:
         """Evaluate until at least target_games battles have completed."""
         if target_games <= 0:
