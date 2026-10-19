@@ -151,9 +151,11 @@ export REPO_DIR PERSIST_ROOT GOOD_REPLAYS_DIR PYTHON_BIN
 
 # Collector topology is selected here and is authoritative. Inherited shell
 # values cannot silently override the machine-specific preset.
-if [[ "${cpu_model}" == *"EPYC 7642"* && "${gpu_name}" == *"5090"* ]] \
-    && (( cpu_count >= 44 && ram_mib >= 60000 )); then
-  # Vast EPYC 7642 profile with 48 allocated CPUs and about 64 GiB RAM.
+if [[ "${gpu_name}" == *"5090"* ]] \
+    && (( cpu_count >= 44 && cpu_count < 56 && ram_mib >= 60000 )); then
+  # Vast RTX 5090 profile with an advertised 48 allocated CPUs. Do not match
+  # the CPU marketing string: Vast guests can expose a host/virtual CPU name
+  # that differs from the listing even when quota and affinity are identical.
   # Vast currently encodes the advertised 48-vCPU allocation as a 46.08-CPU
   # CFS quota (4608000/100000), so allow the small provider-side quota haircut.
   # Eight collectors preserve the measured 512-lane inference width. Five
@@ -175,7 +177,7 @@ if [[ "${cpu_model}" == *"EPYC 7642"* && "${gpu_name}" == *"5090"* ]] \
   SNORLAX_MIN_COLLECTOR_PROCESSES=4
   SNORLAX_CPU_PSI_LIMIT=25
   SNORLAX_MEMORY_USAGE_LIMIT=0.90
-  collector_preset="epyc-7642-48cpu-5090-8x64x5"
+  collector_preset="48cpu-5090-8x64x5"
 elif [[ "${cpu_model}" == *"EPYC 7742"* && "${gpu_name}" == *"5090"* ]]; then
   # Exact production host requested for this run. Do not trust virtualized
   # MemTotal/cgroup reporting to choose a different topology.
@@ -239,6 +241,10 @@ export METAMON_COLLECT_PROFILE METAMON_COLLECT_PROFILE_INTERVAL METAMON_VEC_PROF
 export SNORLAX_RESOURCE_GUARD SNORLAX_MIN_COLLECTOR_PROCESSES
 export SNORLAX_CPU_PSI_LIMIT SNORLAX_MEMORY_USAGE_LIMIT
 log "Collector preset ${collector_preset}: ${COLLECTOR_PROCESSES} processes x ${LANES} lanes x ${COLLECTOR_WORKERS} Showdown workers; DLOADER_WORKERS=${DLOADER_WORKERS}"
+if [[ "${collector_preset}" == "48cpu-5090-8x64x5" ]]; then
+  [[ "${COLLECTOR_PROCESSES}:${LANES}:${COLLECTOR_WORKERS}:${METAMON_FULL_BATCH_MAX_INACTIVE}" == "8:64:5:32" ]] \
+    || die "The 48-CPU RTX 5090 collector profile was altered before launch"
+fi
 if [[ "${SNORLAX_RESOURCE_GUARD}" == "1" ]]; then
   log "Collector resource guard: CPU PSI >= ${SNORLAX_CPU_PSI_LIMIT}% or sustained RAM pressure >= ${SNORLAX_MEMORY_USAGE_LIMIT}; one-process downshifts, floor=${SNORLAX_MIN_COLLECTOR_PROCESSES}"
 fi
