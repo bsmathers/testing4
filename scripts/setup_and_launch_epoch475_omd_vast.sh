@@ -68,7 +68,7 @@ if (( vram_mib < MIN_VRAM_MIB )); then
   fi
 fi
 
-cpu_count="$("${PYTHON_BIN}" - <<'PY'
+affinity_cpu_count="$("${PYTHON_BIN}" - <<'PY'
 import os
 try:
     print(len(os.sched_getaffinity(0)))
@@ -76,6 +76,28 @@ except AttributeError:
     print(os.cpu_count() or 0)
 PY
 )"
+cpu_quota_count=0
+if [[ -r /sys/fs/cgroup/cpu.max ]]; then
+  read -r cpu_quota cpu_period < /sys/fs/cgroup/cpu.max
+  if [[ "${cpu_quota}" =~ ^[0-9]+$ && "${cpu_period}" =~ ^[0-9]+$ ]] \
+      && (( cpu_period > 0 )); then
+    cpu_quota_count=$(( cpu_quota / cpu_period ))
+    (( cpu_quota_count > 0 )) || cpu_quota_count=1
+  fi
+elif [[ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us \
+     && -r /sys/fs/cgroup/cpu/cpu.cfs_period_us ]]; then
+  cpu_quota="$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us)"
+  cpu_period="$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us)"
+  if [[ "${cpu_quota}" =~ ^[0-9]+$ && "${cpu_period}" =~ ^[0-9]+$ ]] \
+      && (( cpu_period > 0 )); then
+    cpu_quota_count=$(( cpu_quota / cpu_period ))
+    (( cpu_quota_count > 0 )) || cpu_quota_count=1
+  fi
+fi
+cpu_count="${affinity_cpu_count}"
+if (( cpu_quota_count > 0 && cpu_quota_count < cpu_count )); then
+  cpu_count="${cpu_quota_count}"
+fi
 host_ram_mib="$(awk '/MemTotal:/ {print int($2 / 1024)}' /proc/meminfo 2>/dev/null || echo 0)"
 cpu_model="$(awk -F: '/model name/ {gsub(/^[ \t]+/, "", $2); print $2; exit}' /proc/cpuinfo 2>/dev/null || true)"
 cgroup_ram_mib=0
@@ -95,7 +117,7 @@ if (( cgroup_ram_mib > 0 && (ram_mib == 0 || cgroup_ram_mib < ram_mib) )); then
   ram_mib="${cgroup_ram_mib}"
 fi
 disk_free_gib="$(df -Pk /workspace | awk 'NR==2 {print int($4 / 1024 / 1024)}')"
-log "Host: ${cpu_model:-unknown}; ${cpu_count} usable CPUs; effective RAM ${ram_mib} MiB (host=${host_ram_mib}, cgroup=${cgroup_ram_mib:-0}); ${disk_free_gib} GiB free in /workspace"
+log "Host: ${cpu_model:-unknown}; ${cpu_count} usable CPUs (affinity=${affinity_cpu_count}, quota=${cpu_quota_count:-0}); effective RAM ${ram_mib} MiB (host=${host_ram_mib}, cgroup=${cgroup_ram_mib:-0}); ${disk_free_gib} GiB free in /workspace"
 (( cpu_count >= 16 )) || warn "Fewer than 16 CPU cores may bottleneck the 96-lane collector"
 (( ram_mib >= 60000 )) || warn "Less than 64 GiB effective RAM may constrain replay loading and compilation"
 (( disk_free_gib >= 250 )) || warn "Less than 250 GiB free; verify replay and retained-checkpoint growth during training"
@@ -129,7 +151,25 @@ export REPO_DIR PERSIST_ROOT GOOD_REPLAYS_DIR PYTHON_BIN
 
 # Collector topology is selected here and is authoritative. Inherited shell
 # values cannot silently override the machine-specific preset.
-if [[ "${cpu_model}" == *"EPYC 7742"* && "${gpu_name}" == *"5090"* ]]; then
+if [[ "${cpu_model}" == *"EPYC 7642"* && "${gpu_name}" == *"5090"* ]] \
+    && (( cpu_count >= 48 && ram_mib >= 60000 )); then
+  # Vast EPYC 7642 profile with 48 allocated CPUs and about 64 GiB RAM.
+  # Each collector has one Python coordinator plus seven single-threaded Node
+  # simulator workers: 6 * (1 + 7) = 48 CPU-bound processes. Six actor-only
+  # BF16 policies and 384 lanes fit comfortably on a 32 GiB RTX 5090, while
+  # retaining fewer copies than the proven 64-core 8x64x7 profile.
+  COLLECTOR_PROCESSES=6
+  LANES=64
+  COLLECTOR_WORKERS=7
+  METAMON_PARTIAL_HIDDEN_CHUNK=64
+  METAMON_FULL_BATCH_MAX_INACTIVE=8
+  DLOADER_WORKERS=12
+  SNORLAX_RESOURCE_GUARD=1
+  SNORLAX_MIN_COLLECTOR_PROCESSES=4
+  SNORLAX_CPU_PSI_LIMIT=25
+  SNORLAX_MEMORY_USAGE_LIMIT=0.90
+  collector_preset="epyc-7642-48cpu-64gb-5090-6x64x7"
+elif [[ "${cpu_model}" == *"EPYC 7742"* && "${gpu_name}" == *"5090"* ]]; then
   # Exact production host requested for this run. Do not trust virtualized
   # MemTotal/cgroup reporting to choose a different topology.
   COLLECTOR_PROCESSES=8
@@ -181,10 +221,19 @@ else
 fi
 COLLECTOR_DEVICE=gpu
 COLLECTOR_DTYPE=bf16
+SNORLAX_RESOURCE_GUARD="${SNORLAX_RESOURCE_GUARD:-0}"
+SNORLAX_MIN_COLLECTOR_PROCESSES="${SNORLAX_MIN_COLLECTOR_PROCESSES:-${COLLECTOR_PROCESSES}}"
+SNORLAX_CPU_PSI_LIMIT="${SNORLAX_CPU_PSI_LIMIT:-25}"
+SNORLAX_MEMORY_USAGE_LIMIT="${SNORLAX_MEMORY_USAGE_LIMIT:-0.90}"
 
 export COLLECTOR_PROCESSES COLLECTOR_DEVICE COLLECTOR_DTYPE LANES
 export COLLECTOR_WORKERS METAMON_PARTIAL_HIDDEN_CHUNK METAMON_FULL_BATCH_MAX_INACTIVE DLOADER_WORKERS
+export SNORLAX_RESOURCE_GUARD SNORLAX_MIN_COLLECTOR_PROCESSES
+export SNORLAX_CPU_PSI_LIMIT SNORLAX_MEMORY_USAGE_LIMIT
 log "Collector preset ${collector_preset}: ${COLLECTOR_PROCESSES} processes x ${LANES} lanes x ${COLLECTOR_WORKERS} Showdown workers; DLOADER_WORKERS=${DLOADER_WORKERS}"
+if [[ "${SNORLAX_RESOURCE_GUARD}" == "1" ]]; then
+  log "Collector resource guard: CPU PSI >= ${SNORLAX_CPU_PSI_LIMIT}% or sustained RAM pressure >= ${SNORLAX_MEMORY_USAGE_LIMIT}; one-process downshifts, floor=${SNORLAX_MIN_COLLECTOR_PROCESSES}"
+fi
 
 MIXED_PRECISION=bf16
 METAMON_LOG_INTERVAL=50

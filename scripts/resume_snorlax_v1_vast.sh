@@ -95,17 +95,21 @@ if [[ "${WANDB_MODE}" == "online" && -z "${WANDB_API_KEY:-}" ]]; then
   die "WANDB_API_KEY is required when WANDB_MODE=online"
 fi
 
-# These are fixed by the Snorlax recipe. Collector topology values are already
-# selected by the canonical hardware launcher and intentionally are not
-# user-overridable here.
-export COLLECTOR_PROCESSES=8
-export COLLECTOR_DEVICE=gpu
-export COLLECTOR_DTYPE=bf16
-export LANES=64
-export COLLECTOR_WORKERS=7
-export DLOADER_WORKERS=12
-export METAMON_PARTIAL_HIDDEN_CHUNK=64
-export METAMON_FULL_BATCH_MAX_INACTIVE=8
+# The canonical hardware launcher selects an authoritative machine profile.
+# Preserve it across this fast-resume boundary; the old unconditional 8x64x7
+# assignments silently replaced the 48-CPU preset with a 64-CPU topology.
+export COLLECTOR_PROCESSES="${COLLECTOR_PROCESSES:-8}"
+export COLLECTOR_DEVICE="${COLLECTOR_DEVICE:-gpu}"
+export COLLECTOR_DTYPE="${COLLECTOR_DTYPE:-bf16}"
+export LANES="${LANES:-64}"
+export COLLECTOR_WORKERS="${COLLECTOR_WORKERS:-7}"
+export DLOADER_WORKERS="${DLOADER_WORKERS:-12}"
+export METAMON_PARTIAL_HIDDEN_CHUNK="${METAMON_PARTIAL_HIDDEN_CHUNK:-64}"
+export METAMON_FULL_BATCH_MAX_INACTIVE="${METAMON_FULL_BATCH_MAX_INACTIVE:-8}"
+export SNORLAX_RESOURCE_GUARD="${SNORLAX_RESOURCE_GUARD:-1}"
+export SNORLAX_MIN_COLLECTOR_PROCESSES="${SNORLAX_MIN_COLLECTOR_PROCESSES:-4}"
+export SNORLAX_CPU_PSI_LIMIT="${SNORLAX_CPU_PSI_LIMIT:-25}"
+export SNORLAX_MEMORY_USAGE_LIMIT="${SNORLAX_MEMORY_USAGE_LIMIT:-0.90}"
 export MIXED_PRECISION=bf16
 export METAMON_LOG_INTERVAL=50
 export BATCH_SIZE_PER_GPU=14
@@ -150,6 +154,9 @@ fi
 cd "${REPO_DIR}"
 log "FAST RESUME: epoch ${RESUME_EPOCH}; skipping provisioning and dataset/runtime rechecks"
 log "Collector topology: ${COLLECTOR_PROCESSES} processes x ${LANES} lanes x ${COLLECTOR_WORKERS} Showdown workers; DLOADER_WORKERS=${DLOADER_WORKERS}"
+if [[ "${SNORLAX_RESOURCE_GUARD}" == "1" ]]; then
+  log "Collector resource guard enabled; one-process downshifts to floor ${SNORLAX_MIN_COLLECTOR_PROCESSES}"
+fi
 
 set +e
 "${PYTHON_BIN}" -m "${RUNNER_MODULE}"   --run_config "${RUN_CONFIG}" --mode learn   --run_name "${RUN_NAME}" --lanes "${LANES}" --n_workers "${COLLECTOR_WORKERS}"   --save_dir "${SAVE_DIR}" --buffer_dir "${BUFFER_DIR}" --log   --epochs "${TOTAL_LEARNER_EPOCHS}" --ckpt_interval 1 --full_state_ckpt_interval 1   --mixed_precision "${MIXED_PRECISION}" --dloader_workers "${DLOADER_WORKERS}"   --resume_training_state --resume_epoch "${RESUME_EPOCH}"   2>&1 | tee -a "${LOG_DIR}/learner.log"

@@ -614,6 +614,86 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             self.optimizer.eval()
         return path
 
+    @staticmethod
+    def _pressure_avg10(resource: str) -> float:
+        """Read cgroup PSI when available, falling back to host PSI."""
+        paths = (
+            Path("/sys/fs/cgroup") / f"{resource}.pressure",
+            Path("/proc/pressure") / resource,
+        )
+        for path in paths:
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            for line in lines:
+                fields = line.split()
+                if not fields or fields[0] != "some":
+                    continue
+                for field in fields[1:]:
+                    if field.startswith("avg10="):
+                        try:
+                            return float(field.split("=", 1)[1])
+                        except ValueError:
+                            break
+        return 0.0
+
+    @staticmethod
+    def _memory_usage_fraction() -> float:
+        """Return cgroup memory use, with host memory as a fallback."""
+        try:
+            current = int(
+                Path("/sys/fs/cgroup/memory.current")
+                .read_text(encoding="utf-8")
+                .strip()
+            )
+            raw_limit = (
+                Path("/sys/fs/cgroup/memory.max")
+                .read_text(encoding="utf-8")
+                .strip()
+            )
+            if raw_limit != "max":
+                limit = int(raw_limit)
+                if limit > 0:
+                    return current / limit
+        except (OSError, ValueError):
+            pass
+        try:
+            fields = {}
+            for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+                name, separator, value = line.partition(":")
+                if separator:
+                    fields[name] = int(value.strip().split()[0])
+            total = fields.get("MemTotal", 0)
+            available = fields.get("MemAvailable", 0)
+            if total > 0:
+                return 1.0 - available / total
+        except (OSError, ValueError, IndexError):
+            pass
+        return 0.0
+
+    @classmethod
+    def _collector_resource_pressure(cls) -> tuple[bool, bool, str]:
+        cpu_psi = cls._pressure_avg10("cpu")
+        memory_psi = cls._pressure_avg10("memory")
+        memory_used = cls._memory_usage_fraction()
+        cpu_limit = float(os.environ.get("SNORLAX_CPU_PSI_LIMIT", "25"))
+        memory_limit = float(
+            os.environ.get("SNORLAX_MEMORY_USAGE_LIMIT", "0.90")
+        )
+        cpu_bottleneck = cpu_psi >= cpu_limit
+        memory_bottleneck = memory_used >= max(memory_limit + 0.05, 0.95) or (
+            memory_used >= memory_limit and memory_psi >= 1.0
+        ) or (
+            memory_used >= max(memory_limit - 0.10, 0.0) and memory_psi >= 5.0
+        )
+        summary = (
+            f"cpu_psi10={cpu_psi:.1f}% "
+            f"memory_used={100.0 * memory_used:.1f}% "
+            f"memory_psi10={memory_psi:.1f}%"
+        )
+        return cpu_bottleneck, memory_bottleneck, summary
+
     def _external_collect_phase(self, epoch: int) -> dict[str, int | float] | None:
         """Run direct collector subprocesses, matching the fast pre-warm design."""
         buffer_dir = Path(os.environ["SNORLAX_BUFFER_DIR"])
@@ -631,7 +711,23 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         min_fifo = int(os.environ.get("ONLINE_FIFO_SIZE", "5000"))
         current_fifo = len(self._replay_names(replay_dir))
         target = max(target, max(min_fifo - current_fifo, 0))
-        processes = int(os.environ.get("COLLECTOR_PROCESSES", "8"))
+        configured_processes = int(os.environ.get("COLLECTOR_PROCESSES", "8"))
+        processes = min(
+            configured_processes,
+            int(getattr(self, "_collector_process_limit", configured_processes)),
+        )
+        min_processes = min(
+            processes,
+            max(
+                1,
+                int(
+                    os.environ.get(
+                        "SNORLAX_MIN_COLLECTOR_PROCESSES", str(processes)
+                    )
+                ),
+            ),
+        )
+        resource_guard = os.environ.get("SNORLAX_RESOURCE_GUARD", "0") == "1"
         lanes = int(os.environ.get("LANES", "64"))
         workers = int(os.environ.get("COLLECTOR_WORKERS", "8"))
         dtype = os.environ.get("COLLECTOR_DTYPE", "bf16")
@@ -680,7 +776,7 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                     "--buffer_dir", str(buffer_dir),
                     "--base_weights", behavior_weights,
                     "--epochs", "1000000",
-                    "--seed", str(1000 + epoch * processes + idx),
+                    "--seed", str(1000 + epoch * configured_processes + idx),
                     "--mixed_precision", collector_mp,
                 ]
                 children.append(
@@ -698,6 +794,8 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             collection_started = time.monotonic()
             previous_fresh = 0
             previous_poll = collection_started
+            pressure_streak = 0
+            last_reduction = collection_started
             while fresh < target:
                 time.sleep(10)
                 for child, _stream in children:
@@ -728,6 +826,57 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                 )
                 previous_fresh = fresh
                 previous_poll = now
+                if (
+                    resource_guard
+                    and fresh < target
+                    and len(children) > min_processes
+                    and now - collection_started >= 45.0
+                    and now - last_reduction >= 60.0
+                ):
+                    cpu_bound, memory_bound, pressure = (
+                        self._collector_resource_pressure()
+                    )
+                    if cpu_bound or memory_bound:
+                        pressure_streak += 1
+                        if pressure_streak == 1:
+                            print(
+                                "[PersistentCycle] resource guard: observing "
+                                f"pressure ({pressure}); waiting for 3 sustained "
+                                "samples before reducing collectors",
+                                flush=True,
+                            )
+                    else:
+                        pressure_streak = 0
+                    # Sustained CPU contention avoids reacting to normal startup
+                    # bursts. Critically high RAM gets one immediate downshift so
+                    # the kernel does not have to choose a victim first.
+                    memory_critical = memory_bound and (
+                        self._memory_usage_fraction() >= 0.95
+                    )
+                    if pressure_streak >= 3 or memory_critical:
+                        child, stream = children.pop()
+                        child.terminate()
+                        try:
+                            child.wait(timeout=20)
+                        except subprocess.TimeoutExpired:
+                            child.kill()
+                            child.wait(timeout=10)
+                        stream.close()
+                        self._collector_process_limit = len(children)
+                        causes = []
+                        if cpu_bound:
+                            causes.append("CPU")
+                        if memory_bound:
+                            causes.append("RAM")
+                        print(
+                            "[PersistentCycle] resource guard: sustained "
+                            f"{'/'.join(causes)} pressure ({pressure}); reducing "
+                            f"collectors {len(children) + 1}->{len(children)} "
+                            f"for this and future phases (floor={min_processes})",
+                            flush=True,
+                        )
+                        pressure_streak = 0
+                        last_reduction = now
         finally:
             for child, _stream in children:
                 if child.poll() is None:
