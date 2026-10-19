@@ -1768,6 +1768,14 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                 if save_on_done:
                     amago.utils.call_async_env(envs, "save_finished_trajs")
                 episodes_finished += int(done.sum())
+            if (
+                hasattr(target, "collection_game_target_reached")
+                and target.collection_game_target_reached()
+            ):
+                # The vector env caps trajectory writes exactly at the assigned
+                # decisive-game quota. Stop immediately instead of beginning
+                # another vector step whose games would be discarded.
+                break
             obs, rl2s, tids = get_t()
             hidden_state = policy.traj_encoder.reset_hidden_state(hidden_state, done)
             if profile:
