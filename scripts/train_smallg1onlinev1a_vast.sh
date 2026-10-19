@@ -45,6 +45,7 @@ VALIDATION_INTERVAL="${VALIDATION_INTERVAL:-0}"
 VALIDATION_TIMESTEPS="${VALIDATION_TIMESTEPS:-1000}"
 # SNORLAX_FIRST_RUN_SMOKE is intentionally disabled; the full smoke block
 # remains commented out near the launch section for manual debugging.
+SNORLAX_FIRST_RUN_SMOKE="${SNORLAX_FIRST_RUN_SMOKE:-0}"
 if [[ -z "${COLLECTOR_DTYPE}" ]]; then
   if [[ "${COLLECTOR_DEVICE}" == "gpu" ]]; then
     COLLECTOR_DTYPE=bf16
@@ -100,6 +101,19 @@ export WANDB_TAGS="${WANDB_TAGS:-smallg1onlinev1a,gen1ou,epoch475,807-teams,vast
 export WANDB_MODE="${WANDB_MODE:-online}"
 export PYTHONUNBUFFERED=1
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# SnorlaxV1 downloads multi-GB Xet-backed self-play archives. Do not inherit
+# ad-hoc Xet settings from an interactive shell: disabling Xet makes these files
+# impossible to download, while fixed-concurrency overrides can cripple transfer
+# throughput. Use the Hub/Xet client's normal adaptive behavior.
+if [[ "${TRAIN_VARIANT}" == "snorlax_v1" ]]; then
+  unset HF_HUB_DISABLE_XET
+  unset HF_XET_FIXED_DOWNLOAD_CONCURRENCY
+  unset HF_XET_FIXED_UPLOAD_CONCURRENCY
+  unset HF_XET_CLIENT_ENABLE_ADAPTIVE_CONCURRENCY
+  unset HF_XET_CLIENT_RETRY_MAX_ATTEMPTS
+  unset HF_XET_CLIENT_RETRY_MAX_DURATION
+  unset HF_XET_CLIENT_READ_TIMEOUT
+fi
 export HF_XET_HIGH_PERFORMANCE=1
 export METAMON_ACTOR_ONLY_COLLECTION="${METAMON_ACTOR_ONLY_COLLECTION:-1}"
 export METAMON_COLLECTOR_DTYPE="${COLLECTOR_DTYPE}"
@@ -195,7 +209,7 @@ elif [[ "${INSTALL_DEPS}" == "1" ]]; then
     "${PYTHON_BIN}" -m pip install -e . --no-deps
     "${PYTHON_BIN}" -m pip install \
       'gymnasium>=0.26,<=0.29.1' gin-config wandb einops tqdm lz4 termcolor rich \
-      huggingface_hub datasets ratarmountcore accelerate orjson requests tabulate psutil \
+      huggingface_hub hf-xet datasets ratarmountcore accelerate orjson requests tabulate psutil \
       'websockets==12.0' \
       'poke-env @ git+https://github.com/UT-Austin-RPL/poke-env.git' \
       'amago @ git+https://github.com/UT-Austin-RPL/amago@v3.4.0'
