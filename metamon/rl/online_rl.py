@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import os
 import copy
+import json
 import random
 import collections
 from functools import partial
@@ -711,7 +712,8 @@ def _make_collect_train_env(
     team_set_name: str = DEFAULT_TRAIN_TEAM_SET,
     save_results_to: Optional[str] = None,
 ):
-    from metamon.rl.evaluate.common import parse_team_set_config
+    from metamon.rl.evaluate.common import PolicySpec, parse_team_set_config
+    from metamon.rl.evaluate.opponent_pool import OpponentPoolConfig
 
     team_set_config = parse_team_set_config(team_set_name)
     # Probe one draw so env construction has a concrete TeamSet; the env redraws
@@ -720,6 +722,38 @@ def _make_collect_train_env(
 
     probe_name = str(random_choice(team_set_config))
     team_set = get_metamon_teams(battle_format, probe_name)
+
+    # Short Snorlax collection phases otherwise make only one opponent-pool draw
+    # per collector, so thousands of battles can represent only a handful of
+    # independent opponent draws. The parent may assign an explicit stratified
+    # PolicySpec to each collector. Convert it to a one-row pool so the ordinary
+    # vectorized opponent implementation remains unchanged and all lanes can still
+    # share one efficiently batched opponent model.
+    fixed_opponent_json = os.environ.get("METAMON_FIXED_TRAIN_OPPONENT")
+    opponent_config = None
+    effective_opponent_path = opponent_config_path
+    if fixed_opponent_json:
+        raw_spec = json.loads(fixed_opponent_json)
+        expected = {
+            "name", "model_name", "checkpoint", "temperature",
+            "team_set", "battle_backend",
+        }
+        if set(raw_spec) != expected:
+            raise ValueError(
+                "METAMON_FIXED_TRAIN_OPPONENT has invalid fields: "
+                f"{sorted(raw_spec)}"
+            )
+        fixed_spec = PolicySpec(**raw_spec)
+        opponent_config = OpponentPoolConfig.from_policy_spec(
+            fixed_spec, battle_format=battle_format
+        )
+        effective_opponent_path = None
+        print(
+            "Collector fixed opponent: "
+            f"{fixed_spec.short_label} ({fixed_spec.model_name})",
+            flush=True,
+        )
+
     # Per-battle eval-side team/outcome CSV. Treat --save_results_to as a
     # directory and give each collector process its own file (keyed by seed) so
     # concurrent appends from many collectors never interleave.
@@ -735,7 +769,8 @@ def _make_collect_train_env(
         reward_function=reward_function,
         team_set=team_set,
         player_team_set_config=team_set_config,
-        opponent_config_path=opponent_config_path,
+        opponent_config_path=effective_opponent_path,
+        opponent_config=opponent_config,
         batched_envs=lanes,
         n_workers=n_workers,
         opponent_sample=True,

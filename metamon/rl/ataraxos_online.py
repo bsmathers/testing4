@@ -778,6 +778,38 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         )
         return cpu_bottleneck, memory_bottleneck, summary
 
+    @staticmethod
+    def _stratified_collector_opponents(
+        *, run_config: str, epoch: int, processes: int
+    ):
+        """Choose one low-discrepancy opponent spec per collector process."""
+        from metamon.rl.evaluate.opponent_pool import load_opponent_pool
+
+        config = v1b.legacy._load_run_config(run_config)
+        pool_value = config.get("train_pool")
+        if not pool_value:
+            raise RuntimeError(
+                f"Snorlax run config {run_config} does not define train_pool"
+            )
+        pool_path = Path(str(pool_value))
+        if not pool_path.is_absolute():
+            cwd_candidate = Path.cwd() / pool_path
+            if cwd_candidate.is_file():
+                pool_path = cwd_candidate
+            else:
+                # run_config normally lives at
+                # <repo>/metamon/rl/configs/online_runs/*.yaml.
+                resolved_run = Path(run_config).resolve()
+                repo_root = resolved_run.parents[4]
+                pool_path = repo_root / pool_path
+        if not pool_path.is_file():
+            raise FileNotFoundError(f"opponent pool not found: {pool_path}")
+        battle_format = str(config.get("battle_format", "gen1ou"))
+        pool = load_opponent_pool(str(pool_path), battle_format=battle_format)
+        return pool.stratified_opponents(
+            processes, phase=epoch, seed=73_001
+        )
+
     def _launch_collector_children(
         self,
         *,
@@ -796,6 +828,18 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         gated: bool,
     ) -> dict:
         """Launch collectors, optionally stopping after full initialization."""
+        opponent_specs = self._stratified_collector_opponents(
+            run_config=run_config, epoch=epoch, processes=processes
+        )
+        schedule = " | ".join(
+            f"{idx}:{spec.model_name}@{spec.checkpoint} "
+            f"T={spec.temperature:g} team={spec.team_set}"
+            for idx, spec in enumerate(opponent_specs)
+        )
+        print(
+            f"[PersistentCycle] opponent schedule epoch={epoch}: {schedule}",
+            flush=True,
+        )
         start_marker = log_dir / f".collector-start-{epoch}"
         ready_markers = [
             log_dir / f".collector-ready-{epoch}-{idx}" for idx in range(processes)
@@ -817,6 +861,17 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                 OPENBLAS_NUM_THREADS="1",
                 NUMEXPR_NUM_THREADS="1",
             )
+            spec = opponent_specs[idx]
+            child_env["METAMON_FIXED_TRAIN_OPPONENT"] = orjson.dumps(
+                {
+                    "name": spec.name,
+                    "model_name": spec.model_name,
+                    "checkpoint": spec.checkpoint,
+                    "temperature": spec.temperature,
+                    "team_set": spec.team_set,
+                    "battle_backend": spec.battle_backend,
+                }
+            ).decode("utf-8")
             if os.environ.get("METAMON_COLLECTOR_DISABLE_COMPILE", "0") == "1":
                 child_env["TORCHDYNAMO_DISABLE"] = "1"
             if gated:
