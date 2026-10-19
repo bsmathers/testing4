@@ -102,10 +102,12 @@ export WANDB_MODE="${WANDB_MODE:-online}"
 export PYTHONUNBUFFERED=1
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 if [[ "${TRAIN_VARIANT}" == "snorlax_v1" ]]; then
-  # Preserve the original known-good Hugging Face download path. Ignore stale
-  # ad-hoc Xet overrides from the parent shell and use the launcher's original
-  # high-performance setting.
-  unset HF_HUB_DISABLE_XET
+  # Snorlax provisioning deliberately does not use the hf-xet client. Large
+  # self-play archives are fetched below with plain resumable HTTPS via curl.
+  # Any remaining huggingface_hub downloads must use ordinary HTTP or fail
+  # loudly rather than silently starting Xet workers.
+  export HF_HUB_DISABLE_XET=1
+  unset HF_XET_HIGH_PERFORMANCE
   unset HF_XET_FIXED_DOWNLOAD_CONCURRENCY
   unset HF_XET_FIXED_UPLOAD_CONCURRENCY
   unset HF_XET_CACHE
@@ -113,8 +115,9 @@ if [[ "${TRAIN_VARIANT}" == "snorlax_v1" ]]; then
   unset HF_XET_CLIENT_RETRY_MAX_DURATION
   unset HF_XET_CLIENT_READ_TIMEOUT
   unset HF_XET_CLIENT_ENABLE_ADAPTIVE_CONCURRENCY
+else
+  export HF_XET_HIGH_PERFORMANCE=1
 fi
-export HF_XET_HIGH_PERFORMANCE=1
 export METAMON_ACTOR_ONLY_COLLECTION="${METAMON_ACTOR_ONLY_COLLECTION:-1}"
 export METAMON_COLLECTOR_DTYPE="${COLLECTOR_DTYPE}"
 
@@ -519,6 +522,78 @@ val_timesteps: 1000
 val_interval: 10
 dloader_workers: ${DLOADER_WORKERS}
 YAML
+fi
+
+# Snorlax's large self-play archives are intentionally downloaded with plain
+# HTTPS/curl, not huggingface_hub/hf-xet. The final .tar is published only
+# after the complete LZ4 frame has been read, so an interrupted decompression
+# cannot be mistaken for a completed dataset on restart.
+direct_hf_download() {
+  local url="$1" destination="$2" partial auth_args=()
+  [[ -s "${destination}" ]] && return 0
+  mkdir -p "$(dirname "${destination}")"
+  partial="${destination}.partial"
+  if [[ -n "${HF_TOKEN:-}" ]]; then
+    auth_args=(-H "Authorization: Bearer ${HF_TOKEN}")
+  fi
+  log "Direct HTTP download: ${url}"
+  curl --fail --location --show-error \
+    --retry 20 --retry-all-errors --retry-delay 5 --connect-timeout 30 \
+    --continue-at - "${auth_args[@]}" \
+    --output "${partial}" "${url}"
+  mv -f "${partial}" "${destination}"
+}
+
+prepare_snorlax_selfplay_direct() {
+  local subset="$1"
+  local root="${CACHE_DIR}/self-play/${subset}"
+  local lz4_path="${root}/gen1ou.tar.lz4"
+  local tar_path="${root}/gen1ou.tar"
+  local tar_partial="${tar_path}.partial"
+  local base_url="https://huggingface.co/datasets/jakegrigsby/metamon-parsed-pile/resolve/main/${subset}"
+
+  [[ -s "${tar_path}" ]] && return 0
+  mkdir -p "${root}"
+
+  direct_hf_download "${base_url}/gen1ou.tar.lz4?download=true" "${lz4_path}"
+
+  # The prebuilt ratarmount index is an optimization only. Fetch it directly
+  # too, but do not fail provisioning if it is unavailable.
+  if [[ ! -s "${root}/gen1ou.tar.index.sqlite" ]]; then
+    set +e
+    direct_hf_download \
+      "${base_url}/gen1ou.tar.index.sqlite?download=true" \
+      "${root}/gen1ou.tar.index.sqlite"
+    index_status=$?
+    set -e
+    if (( index_status != 0 )); then
+      rm -f "${root}/gen1ou.tar.index.sqlite.partial"
+      log "Prebuilt index unavailable for ${subset}; ratarmount will build it locally"
+    fi
+  fi
+
+  rm -f "${tar_partial}"
+  log "Decompressing ${subset}/gen1ou.tar.lz4 without Xet"
+  "${PYTHON_BIN}" - "${lz4_path}" "${tar_partial}" <<'PY'
+import sys
+import lz4.frame
+
+src, dst = sys.argv[1], sys.argv[2]
+with lz4.frame.open(src, "rb") as inp, open(dst, "wb") as out:
+    while True:
+        chunk = inp.read(64 * 1024 * 1024)
+        if not chunk:
+            break
+        out.write(chunk)
+PY
+  mv -f "${tar_partial}" "${tar_path}"
+  rm -f "${lz4_path}"
+  [[ -s "${tar_path}" ]] || die "Direct self-play download produced an empty tar: ${tar_path}"
+}
+
+if [[ "${TRAIN_VARIANT}" == "snorlax_v1" ]]; then
+  prepare_snorlax_selfplay_direct pac-tauros
+  prepare_snorlax_selfplay_direct pac-exploratory
 fi
 
 offline_assets_ready() {
