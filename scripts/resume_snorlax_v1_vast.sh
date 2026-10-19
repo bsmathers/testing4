@@ -22,7 +22,7 @@ BUFFER_DIR="${PERSIST_ROOT}/online_buffer"
 BOOTSTRAP_DIR="${PERSIST_ROOT}/bootstrap"
 LOG_DIR="${PERSIST_ROOT}/logs"
 ONLINE_WEIGHTS="${BOOTSTRAP_DIR}/policy_epoch_475_online.pt"
-RUN_CONFIG="metamon/rl/configs/online_runs/snorlax_v1.yaml"
+RUN_CONFIG="${REPO_DIR}/metamon/rl/configs/online_runs/snorlax_v1.yaml"
 
 CKPT_ROOT="${SAVE_DIR}/${RUN_NAME}/ckpts"
 STATE_ROOT="${CKPT_ROOT}/training_states"
@@ -40,7 +40,16 @@ RESUME_POLICY="${POLICY_ROOT}/policy_epoch_${RESUME_EPOCH}.pt"
 [[ -s "${RESUME_POLICY}" ]] || die "Checkpoint epoch ${RESUME_EPOCH} has no matching policy"
 [[ -s "${ONLINE_WEIGHTS}" ]] || die "Missing immutable Epoch475 anchor: ${ONLINE_WEIGHTS}"
 [[ -f "${RUN_CONFIG}" ]] || die "Missing Snorlax run config: ${RUN_CONFIG}"
+[[ -f "${PERSIST_ROOT}/provision/snorlax-rollout-schema-v3.done" ]]   || die "Resume state is missing the rollout-schema-v3 marker"
 mkdir -p "$(dirname "${LATEST}")" "${LOG_DIR}" "${BUFFER_DIR}/gen1ou"
+
+# This immutable league checkpoint is tiny to repair and avoids re-entering the
+# full provisioner merely because an auxiliary copy disappeared.
+FROZEN="${SAVE_DIR}/epoch475_frozen/ckpts/policy_weights/policy_epoch_475.pt"
+if [[ ! -s "${FROZEN}" ]]; then
+  mkdir -p "$(dirname "${FROZEN}")"
+  cp -f "${ONLINE_WEIGHTS}" "${FROZEN}"
+fi
 
 # Drop policy-only artifacts from interrupted future epochs. A full state is
 # the commit record; anything newer than it must not enter the opponent league.
