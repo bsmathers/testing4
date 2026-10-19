@@ -19,8 +19,10 @@ from metamon.env.wrappers import TeamSet
 from metamon.rl.evaluate.common import (
     PolicySpec,
     expand_agent_pool_entries,
+    expand_value_list,
     load_config,
     merge_defaults,
+    random_choice,
     sample_policy_from_merged,
 )
 
@@ -362,9 +364,10 @@ class OpponentPoolConfig:
         unavoidable one-collector rounding error, while rotating the offset by
         ``phase`` balances that rounding error across rounds.
 
-        Checkpoint / temperature / team-set choices inside each selected row are
-        still sampled, but from deterministic per-row RNG streams so the schedule
-        is reproducible and different collectors do not share RNG state.
+        List/range-valued checkpoint, temperature, and team-set choices are also
+        cycled across collector slots instead of drawn independently. Weighted
+        mappings keep their configured weighted sampler. The resulting schedule
+        is deterministic for a given phase and seed.
         """
         if count <= 0:
             raise ValueError(f"count must be positive, got {count}")
@@ -382,6 +385,19 @@ class OpponentPoolConfig:
         # count and n_rows have a short common period (e.g. Snorlax: 8 of 12
         # rows -> every row appears exactly twice over each three-epoch block).
         offset = (int(phase) % n_rows) / float(n_rows)
+        def cyclic_choice(value, index: int, rng: random.Random):
+            # Lists/ranges are common for checkpoint, temperature, and team
+            # choices. Cycle them instead of drawing independently so eight
+            # Snorlax collectors over four temperatures get exactly two of each
+            # (and two team sets get exactly four of each). Preserve weighted
+            # mappings with their ordinary weighted sampler.
+            if isinstance(value, dict) and "weighted" in value:
+                return random_choice(value, rng=rng)
+            options = expand_value_list(value)
+            if not options:
+                raise ValueError("opponent config choice has no options")
+            return options[index % len(options)]
+
         specs: List[PolicySpec] = []
         for slot in range(count):
             u = (offset + (slot + 0.5) / float(count)) % 1.0
@@ -393,9 +409,37 @@ class OpponentPoolConfig:
                 + 9_176 * row_index
                 + 37 * slot
             )
+            rng = random.Random(stream_seed)
+            model_name = merged.get("model_name", name)
+            checkpoint = cyclic_choice(
+                merged.get("checkpoints", merged.get("checkpoint", [None])),
+                int(phase) + row_index + slot,
+                rng,
+            )
+            temperature = float(
+                cyclic_choice(
+                    merged.get("temperatures", merged.get("temperature", [1.0])),
+                    int(phase) + slot,
+                    rng,
+                )
+            )
+            # Reverse the slot order relative to temperature so team assignment
+            # is balanced without coupling one team set to one temperature.
+            team_set = str(
+                cyclic_choice(
+                    merged.get("team_set", "competitive"),
+                    int(phase) + (count - 1 - slot),
+                    rng,
+                )
+            )
             specs.append(
-                sample_policy_from_merged(
-                    name, merged, rng=random.Random(stream_seed)
+                PolicySpec(
+                    name=name,
+                    model_name=model_name,
+                    checkpoint=checkpoint,
+                    temperature=temperature,
+                    team_set=team_set,
+                    battle_backend=str(merged.get("battle_backend", "metamon")),
                 )
             )
         return specs
