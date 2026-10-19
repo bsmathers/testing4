@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 # Destructively discard all generated SnorlaxV1 training state, then provision
 # and launch the regularized Epoch475 continuation in the foreground. Downloaded
-# offline datasets and compiler caches under PERSIST_ROOT/cache are preserved.
+# offline datasets are preserved, but generated compiler caches are discarded.
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 log() { printf '\n[%s] %s\n' "$(date '+%F %T')" "$*"; }
@@ -48,10 +48,12 @@ rm -rf -- \
   "${PERSIST_ROOT}/checkpoints" \
   "${PERSIST_ROOT}/bootstrap" \
   "${PERSIST_ROOT}/logs" \
-  "${PERSIST_ROOT}/provision"
+  "${PERSIST_ROOT}/provision" \
+  "${PERSIST_ROOT}/cache/torchinductor" \
+  "${PERSIST_ROOT}/cache/triton"
 
 # Force the recipe marker to be recreated for this clean run. Offline replay
-# archives, team caches, Hugging Face downloads, and compile caches remain.
+# archives, team caches, and Hugging Face downloads remain.
 rm -f -- "${PERSIST_ROOT}/SNORLAX_V1_EXPERIMENT"
 mkdir -p "${PERSIST_ROOT}"
 

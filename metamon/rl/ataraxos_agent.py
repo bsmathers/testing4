@@ -3,6 +3,15 @@
 The pretrained actor/backbone are retained.  A fresh scalar value head learns
 the zero-sum game outcome, avoiding the incompatible shaped-reward critics in
 the Epoch475 checkpoint.
+
+Two outcome heads share the trunk.  ``ataraxos_value`` estimates the value of
+the *current* policy and is trained only on online self-play/league games; it
+is the head the collector records and GAE/TD(lambda) bootstrap from.
+``ataraxos_offline_value`` regresses Monte Carlo outcomes of the offline
+corpora (human, pac-tauros, pac-exploratory, curated strong-model games).
+Those are values of different policies, so mixing them into the online head
+would bias the advantages; the offline head is an auxiliary representation
+loss only.
 """
 
 from __future__ import annotations
@@ -65,6 +74,9 @@ class AtaraxosAgent(MultiTaskAgent):
         self.ataraxos_value = nn.Linear(self.traj_encoder.emb_dim, 1)
         nn.init.zeros_(self.ataraxos_value.weight)
         nn.init.zeros_(self.ataraxos_value.bias)
+        self.ataraxos_offline_value = nn.Linear(self.traj_encoder.emb_dim, 1)
+        nn.init.zeros_(self.ataraxos_offline_value.weight)
+        nn.init.zeros_(self.ataraxos_offline_value.bias)
         self.clip_range = float(clip_range)
         self.behavior_kl_coef = float(behavior_kl_coef)
         self.value_coef = float(value_coef)
@@ -104,6 +116,7 @@ class AtaraxosAgent(MultiTaskAgent):
             self.traj_encoder,
             self.actor,
             self.ataraxos_value,
+            self.ataraxos_offline_value,
         )
         for parameter in self.parameters():
             parameter.requires_grad_(False)
@@ -119,6 +132,7 @@ class AtaraxosAgent(MultiTaskAgent):
             self.traj_encoder.parameters(),
             self.actor.parameters(),
             self.ataraxos_value.parameters(),
+            self.ataraxos_offline_value.parameters(),
         )
 
     def soft_sync_targets(self):
@@ -139,17 +153,36 @@ class AtaraxosAgent(MultiTaskAgent):
             "_ataraxos_step",
             "_ataraxos_online_mass",
         }
+        offline_names = {
+            "ataraxos_offline_value.weight",
+            "ataraxos_offline_value.bias",
+        }
         present = ataraxos_names.intersection(state_dict)
         if present and present != ataraxos_names:
             raise RuntimeError(
                 "Checkpoint has incomplete Ataraxos state: "
                 + ", ".join(sorted(ataraxos_names - present))
             )
+        offline_present = offline_names.intersection(state_dict)
+        if offline_present and offline_present != offline_names:
+            raise RuntimeError(
+                "Checkpoint has an incomplete offline outcome head: "
+                + ", ".join(sorted(offline_names - offline_present))
+            )
         # Complete absence is the one supported legacy case: the immutable
         # Epoch475 bootstrap predates the entire Ataraxos extension.
         if not present:
             for name in ataraxos_names:
                 state_dict[name] = current[name]
+        # Snorlax checkpoints written before the online/offline head split
+        # carry one outcome head. Start the offline head from it so both heads
+        # begin from the same calibrated estimate.
+        # Actor-only collection policies strip the offline head entirely, so
+        # only fill names this module still owns.
+        if not offline_present:
+            for name in offline_names.intersection(current):
+                source = name.replace("ataraxos_offline_value.", "ataraxos_value.")
+                state_dict[name] = state_dict.get(source, current[name])
         return super().load_state_dict(state_dict, strict=strict, **kwargs)
 
     @staticmethod
@@ -374,6 +407,9 @@ class AtaraxosAgent(MultiTaskAgent):
             s.detach() + value_backbone_scale * (s - s.detach())
         )
         values = torch.tanh(self.ataraxos_value(value_features))
+        offline_head_values = torch.tanh(
+            self.ataraxos_offline_value(value_features)
+        )
 
         T = batch.actions.shape[1]
         chosen = batch.actions.argmax(dim=-1)
@@ -446,8 +482,11 @@ class AtaraxosAgent(MultiTaskAgent):
             offline_actor_weight * offline_lp, offline_actions
         )
         outcome = batch.obs[keys.OUTCOME][:, :T].float()
+        # Offline corpora were played by other policies; their Monte Carlo
+        # outcomes train a separate head so they never enter the online
+        # critic that GAE bootstraps from.
         offline_value = _masked_mean(
-            (values[:, :T] - outcome).square(), offline_states
+            (offline_head_values[:, :T] - outcome).square(), offline_states
         )
 
         bootstrap_kl = torch.zeros((), device=probs.device)
@@ -533,6 +572,11 @@ class AtaraxosAgent(MultiTaskAgent):
                 "Ataraxos/Uniform KL": magnet_kl.detach(),
                 "Ataraxos/Value Loss": online_value.detach(),
                 "Ataraxos/Offline Value Loss": offline_value.detach(),
+                # Diagnostic only: how far the online critic's estimates sit
+                # from offline-corpus outcomes (no gradient).
+                "Ataraxos/Online Head Offline MSE": _masked_mean(
+                    (values[:, :T].detach() - outcome).square(), offline_states
+                ),
                 "Ataraxos/Offline CE": offline_ce.detach(),
                 "Ataraxos/Bootstrap KL": bootstrap_kl.detach(),
                 "Ataraxos/Bootstrap KL Coef": float(bootstrap_kl_coefficient),

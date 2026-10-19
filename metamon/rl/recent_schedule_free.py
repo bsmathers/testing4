@@ -28,6 +28,16 @@ class RecentScheduleFreeAdamW(torch.optim.Optimizer):
     ``beta`` is the x/z interpolation used to form the gradient-query point y;
     ``inner_momentum`` is ordinary AdamW first-moment momentum.  Learning rates
     remain entirely controlled through each parameter group's ``lr`` field.
+
+    ``max_horizon`` bounds how far the averaged iterate x may lag z.  The
+    polynomial weights w_t = t**r give an averaging coefficient of roughly
+    (r + 1) / t, i.e. an effective horizon of about t / (r + 1) updates that
+    keeps growing for the whole run.  For a non-stationary self-play objective
+    that makes x (and the behavior iterate y, which is mostly x) increasingly
+    sluggish.  With ``max_horizon = H > 0`` the coefficient is floored at
+    1 / H, so the average becomes a fixed-horizon EMA once t exceeds about
+    (r + 1) * H.  The x/y/z update algebra is valid for any coefficient in
+    (0, 1], so this changes only the averaging weights.  ``0`` disables it.
     """
 
     def __init__(
@@ -42,6 +52,7 @@ class RecentScheduleFreeAdamW(torch.optim.Optimizer):
         weight_decay: float = 0.0,
         r: float = 99.0,
         weight_lr_power: float = 0.0,
+        max_horizon: float = 0.0,
     ):
         if not 0.0 < beta < 1.0:
             raise ValueError("Schedule-Free beta must be in (0, 1)")
@@ -51,6 +62,8 @@ class RecentScheduleFreeAdamW(torch.optim.Optimizer):
             raise ValueError("beta2 must be in [0, 1)")
         if r < 0.0:
             raise ValueError("Schedule-Free r must be non-negative")
+        if max_horizon < 0.0 or (0.0 < max_horizon < 1.0):
+            raise ValueError("max_horizon must be 0 (disabled) or at least 1")
         defaults = dict(
             lr=float(lr),
             beta=float(beta),
@@ -60,6 +73,7 @@ class RecentScheduleFreeAdamW(torch.optim.Optimizer):
             weight_decay=float(weight_decay),
             r=float(r),
             weight_lr_power=float(weight_lr_power),
+            max_horizon=float(max_horizon),
             k=0,
             train_mode=False,
             lr_max=0.0,
@@ -94,9 +108,13 @@ class RecentScheduleFreeAdamW(torch.optim.Optimizer):
                     parameter.lerp_(state["z"], weight=1.0 - beta)
             group["train_mode"] = True
 
-    @staticmethod
-    def _average_coefficient(group: dict) -> float:
-        """Return w_t / sum_i w_i without overflowing for large ``r``."""
+    def _group_max_horizon(self, group: dict) -> float:
+        # Optimizer states saved before ``max_horizon`` existed restore param
+        # groups without the key; fall back to the constructor value.
+        return float(group.get("max_horizon", self.defaults.get("max_horizon", 0.0)))
+
+    def _average_coefficient(self, group: dict) -> float:
+        """Return w_t / sum_i w_i (floored at 1 / max_horizon when enabled)."""
         step = int(group["k"]) + 1
         lr = float(group["lr"])
         group["lr_max"] = max(float(group["lr_max"]), lr)
@@ -116,6 +134,9 @@ class RecentScheduleFreeAdamW(torch.optim.Optimizer):
             )
         group["log_weight_sum"] = log_sum
         coefficient = math.exp(log_weight - log_sum)
+        horizon = self._group_max_horizon(group)
+        if horizon > 0.0:
+            coefficient = max(coefficient, 1.0 / horizon)
         group["sf_ckp1"] = coefficient
         return coefficient
 

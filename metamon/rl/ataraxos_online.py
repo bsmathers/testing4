@@ -26,6 +26,117 @@ from metamon.rl.recent_schedule_free import RecentScheduleFreeAdamW
 from metamon.env.vectorized.amago_policy import normalize_discrete_policy_actions
 
 
+# Online FIFO replays are written once (atomic rename) and never modified, so
+# their outcome/advantage summary can be cached by path, size, and mtime. The
+# learner previously decoded every FIFO file three times per epoch (unresolved
+# purge, advantage threshold, outcome count); with ~2.5 epochs of residency
+# that was ~7 full decodes of every game. Now each file is decoded once.
+_FIFO_SUMMARY_CACHE: dict[str, tuple[tuple[int, int], dict]] = {}
+
+# GAE lambda used for the stored advantages (see parsed_replay_dset).
+_FIFO_GAE_LAMBDA = 0.5
+
+
+def _load_replay_payload(path: str) -> dict:
+    if path.endswith(".lz4"):
+        with lz4.frame.open(path, "rb") as stream:
+            return orjson.loads(stream.read())
+    with open(path, "rb") as stream:
+        return orjson.loads(stream.read())
+
+
+def _summarize_fifo_payload(payload: dict) -> dict:
+    """Outcome plus (when the metadata is valid) the full-game |advantage|."""
+    summary = {
+        "version": payload.get("ataraxos_collector_version"),
+        "won": False,
+        "lost": False,
+        "abs_adv": None,
+        "error": None,
+    }
+    final = payload["states"][-1]
+    won = bool(final.get("battle_won"))
+    lost = bool(final.get("battle_lost"))
+    summary["won"], summary["lost"] = won, lost
+    if won and lost:
+        summary["error"] = "final state is both won and lost"
+        return summary
+    if summary["version"] != 3:
+        summary["error"] = "replay predates the native outcome and lane/action fixes"
+        return summary
+    try:
+        v = np.asarray(payload["behavior_values"], dtype=np.float32)
+        states = payload["states"]
+        actions = payload["actions"]
+        logp = np.asarray(payload["behavior_log_probs"], dtype=np.float32)
+        legal = np.asarray(payload["behavior_legal_masks"], dtype=bool)
+        if v.ndim != 1 or v.size == 0:
+            raise ValueError("behavior_values must be a non-empty vector")
+        if not np.isfinite(v).all():
+            raise ValueError("behavior_values contain non-finite entries")
+        if np.any(np.abs(v) > 1.0001):
+            raise ValueError("behavior_values fall outside [-1, 1]")
+        if len(states) != v.size + 1 or len(actions) != len(states):
+            raise ValueError("behavior metadata is not trajectory-aligned")
+        if logp.ndim != 2 or logp.shape[0] != v.size:
+            raise ValueError("behavior_log_probs are not trajectory-aligned")
+        if legal.shape != logp.shape:
+            raise ValueError("behavior_legal_masks have the wrong shape")
+        if not np.isfinite(logp).all():
+            raise ValueError("behavior_log_probs contain non-finite entries")
+        probs = np.exp(logp)
+        if not np.allclose(probs.sum(-1), 1.0, atol=2e-3, rtol=0.0):
+            raise ValueError("behavior probabilities do not sum to one")
+        if np.any(probs[~legal] > 1e-8):
+            raise ValueError("behavior policy assigns mass to an illegal action")
+        chosen = np.asarray(actions[:-1])
+        if (
+            chosen.ndim != 1
+            or not np.issubdtype(chosen.dtype, np.integer)
+            or np.any(chosen < 0)
+            or np.any(chosen >= logp.shape[1])
+        ):
+            raise ValueError("recorded online actions are invalid")
+        if not legal[np.arange(v.size), chosen].all():
+            raise ValueError("recorded online action is illegal")
+    except (KeyError, ValueError, TypeError, IndexError) as exc:
+        summary["error"] = str(exc)
+        return summary
+    outcome = 1.0 if won else (-1.0 if lost else 0.0)
+    state_values = np.concatenate([v, np.zeros(1, dtype=np.float32)])
+    rewards = np.zeros(v.size, dtype=np.float32)
+    rewards[-1] = outcome
+    done = np.zeros(v.size, dtype=np.float32)
+    done[-1] = 1.0
+    delta = rewards + (1.0 - done) * state_values[1:] - state_values[:-1]
+    adv = np.empty_like(delta)
+    carry = 0.0
+    for t in range(delta.size - 1, -1, -1):
+        carry = float(delta[t]) + _FIFO_GAE_LAMBDA * (1.0 - float(done[t])) * carry
+        adv[t] = carry
+    summary["abs_adv"] = np.abs(adv).astype(np.float32)
+    return summary
+
+
+def _fifo_replay_summary(path) -> dict:
+    key = os.path.abspath(str(path))
+    stat = os.stat(key)
+    fingerprint = (int(stat.st_size), int(stat.st_mtime_ns))
+    cached = _FIFO_SUMMARY_CACHE.get(key)
+    if cached is not None and cached[0] == fingerprint:
+        return cached[1]
+    summary = _summarize_fifo_payload(_load_replay_payload(key))
+    _FIFO_SUMMARY_CACHE[key] = (fingerprint, summary)
+    return summary
+
+
+def _prune_fifo_summary_cache(live_paths) -> None:
+    live = {os.path.abspath(str(path)) for path in live_paths}
+    for key in list(_FIFO_SUMMARY_CACHE):
+        if key not in live:
+            del _FIFO_SUMMARY_CACHE[key]
+
+
 def _bucketed_length_collate(
     samples, *, max_seq_len: int, bucket_size: int = 128
 ):
@@ -61,6 +172,39 @@ def _bucketed_length_collate(
     batch.rews = pad_time(batch.rews, target_steps)
     batch.dones = pad_time(batch.dones, target_steps)
     batch.actions = pad_time(batch.actions, target_steps)
+    return batch
+
+
+class _OfflineWarmupWindows(torch.utils.data.Dataset):
+    """Random offline windows for the one-shot outcome-head warmup.
+
+    The learner mixture refuses to sample before the online FIFO is ready, but
+    the warmup runs before the first rollout exists. Draw directly from the
+    tagged offline pool with AMAGO's ordinary random-window slicing.
+    """
+
+    def __init__(self, mixture, *, max_seq_len: int, length: int):
+        self.mixture = mixture
+        self.max_seq_len = int(max_seq_len)
+        self.length = int(length)
+
+    def __len__(self) -> int:
+        return self.length
+
+    def __getitem__(self, index):
+        data = self.mixture.offline.sample_random_trajectory()
+        return data.random_slice(
+            length=self.max_seq_len,
+            padded_sampling=getattr(self.mixture, "padded_sampling", "none"),
+        )
+
+
+def _batch_to_device(batch, device):
+    batch.obs = {
+        key: value.to(device, non_blocking=True) for key, value in batch.obs.items()
+    }
+    for name in ("rl2s", "time_idxs", "rews", "dones", "actions"):
+        setattr(batch, name, getattr(batch, name).to(device, non_blocking=True))
     return batch
 
 
@@ -262,6 +406,16 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
         )
         dataset = self.fifo if after > before else self.offline
         self._sample_idx += 1
+        # Persistent loader workers hold a forked copy of the FIFO filename
+        # list, and ``ready_for_training`` reads its length. A worker forked
+        # while the FIFO was short (e.g. a resumed run whose buffer is refilled
+        # by the learner) would otherwise stay "not ready" forever, because
+        # the published manifest is only re-read inside ``random_sample``.
+        parsed_fifo = self.fifo.dataset.parsed_replay_dset
+        try:
+            parsed_fifo._refresh_live_manifest_if_changed()
+        except RuntimeError:
+            pass  # an empty manifest is reported by the readiness check below
         if not self.fifo.ready_for_training:
             raise RuntimeError("Ataraxos learner started before the 5,000-game FIFO was ready")
         self._sampling_metrics[dataset.dset_name] += 1
@@ -313,93 +467,14 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
         values = []
         wins = losses = unresolved = 0
         filenames = list(parsed.filenames)
+        max_seq_len = getattr(self, "max_seq_len", None)
         for filename in filenames:
             try:
-                if filename.endswith(".lz4"):
-                    with lz4.frame.open(filename, "rb") as f:
-                        payload = orjson.loads(f.read())
-                else:
-                    with open(filename, "rb") as f:
-                        payload = orjson.loads(f.read())
-                if payload.get("ataraxos_collector_version") != 3:
-                    raise ValueError(
-                        "replay predates the native outcome and lane/action fixes"
-                    )
-                v = np.asarray(payload["behavior_values"], dtype=np.float32)
-                states = payload["states"]
-                actions = payload["actions"]
-                logp = np.asarray(
-                    payload["behavior_log_probs"], dtype=np.float32
-                )
-                legal = np.asarray(
-                    payload["behavior_legal_masks"], dtype=bool
-                )
-                if v.ndim != 1 or v.size == 0:
-                    raise ValueError("behavior_values must be a non-empty vector")
-                if not np.isfinite(v).all():
-                    raise ValueError("behavior_values contain non-finite entries")
-                if np.any(np.abs(v) > 1.0001):
-                    raise ValueError("behavior_values fall outside [-1, 1]")
-                if len(states) != v.size + 1 or len(actions) != len(states):
-                    raise ValueError("behavior metadata is not trajectory-aligned")
-                if logp.ndim != 2 or logp.shape[0] != v.size:
-                    raise ValueError("behavior_log_probs are not trajectory-aligned")
-                if legal.shape != logp.shape:
-                    raise ValueError("behavior_legal_masks have the wrong shape")
-                if not np.isfinite(logp).all():
-                    raise ValueError("behavior_log_probs contain non-finite entries")
-                probs = np.exp(logp)
-                if not np.allclose(probs.sum(-1), 1.0, atol=2e-3, rtol=0.0):
-                    raise ValueError("behavior probabilities do not sum to one")
-                if np.any(probs[~legal] > 1e-8):
-                    raise ValueError("behavior policy assigns mass to an illegal action")
-                chosen = np.asarray(actions[:-1])
-                if (
-                    chosen.ndim != 1
-                    or not np.issubdtype(chosen.dtype, np.integer)
-                    or np.any(chosen < 0)
-                    or np.any(chosen >= logp.shape[1])
-                ):
-                    raise ValueError("recorded online actions are invalid")
-                if not legal[np.arange(v.size), chosen].all():
-                    raise ValueError("recorded online action is illegal")
-                state_values = np.concatenate([v, np.zeros(1, dtype=np.float32)])
-                final = states[-1]
-                won = bool(final.get("battle_won"))
-                lost = bool(final.get("battle_lost"))
-                if won and lost:
-                    raise ValueError("final state is both won and lost")
-                if won:
-                    wins += 1
-                    outcome = 1.0
-                elif lost:
-                    losses += 1
-                    outcome = -1.0
-                else:
-                    unresolved += 1
-                    outcome = 0.0
-                rewards = np.zeros(v.size, dtype=np.float32)
-                rewards[-1] = outcome
-                done = np.zeros(v.size, dtype=np.float32)
-                done[-1] = 1.0
-                delta = rewards + (1.0 - done) * state_values[1:] - state_values[:-1]
-                carry = 0.0
-                adv = np.empty_like(delta)
-                for t in range(delta.size - 1, -1, -1):
-                    carry = float(delta[t]) + 0.5 * (1.0 - float(done[t])) * carry
-                    adv[t] = carry
-                # Long online games are learned only through the exact-history
-                # prefix (see __getitem__). Compute the gate over the positions
-                # that can actually enter PPO so the requested quantile has its
-                # intended selected fraction.
-                eligible = adv
-                max_seq_len = getattr(self, "max_seq_len", None)
-                if max_seq_len is not None:
-                    eligible = eligible[: int(max_seq_len)]
-                values.extend(np.abs(eligible).tolist())
+                summary = _fifo_replay_summary(filename)
             except (
                 OSError,
                 KeyError,
+                IndexError,
                 ValueError,
                 TypeError,
                 orjson.JSONDecodeError,
@@ -407,12 +482,34 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
                 raise RuntimeError(
                     f"invalid online FIFO replay: {filename}: {exc}"
                 ) from exc
+            if summary["error"] is not None:
+                raise RuntimeError(
+                    f"invalid online FIFO replay: {filename}: {summary['error']}"
+                )
+            if summary["won"]:
+                wins += 1
+            elif summary["lost"]:
+                losses += 1
+            else:
+                unresolved += 1
+            # Long online games are learned only through the exact-history
+            # prefix (see __getitem__). Compute the gate over the positions
+            # that can actually enter PPO so the requested quantile has its
+            # intended selected fraction.
+            eligible = summary["abs_adv"]
+            if max_seq_len is not None:
+                eligible = eligible[: int(max_seq_len)]
+            values.append(eligible)
+        _prune_fifo_summary_cache(filenames)
         if unresolved:
             raise RuntimeError(
                 "Ataraxos FIFO contains unresolved trajectories without a valid "
                 f"terminal zero-sum target: {unresolved}"
             )
         if not values:
+            raise RuntimeError("could not compute Ataraxos advantage threshold from FIFO")
+        values = np.concatenate(values)
+        if values.size == 0:
             raise RuntimeError("could not compute Ataraxos advantage threshold from FIFO")
         decisive = wins + losses
         if decisive >= 100 and (wins == 0 or losses == 0):
@@ -426,7 +523,7 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
             raise ValueError(f"advantage-filter floor must be nonnegative, got {floor}")
         if quantile == 0.0 and floor == 0.0:
             return 0.0
-        return max(float(np.quantile(np.asarray(values), quantile)), float(floor))
+        return max(float(np.quantile(values, quantile)), float(floor))
 
 
 class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
@@ -443,6 +540,13 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
     _SF_BETA = 0.8
     _SF_R = 99.0
     _SF_INNER_MOMENTUM = 0.9
+    # Cap the Schedule-Free averaging horizon at about one learner epoch.
+    # Polynomial r=99 weights alone give a horizon of ~k/100 updates, which
+    # grows without bound (about 10 epochs by update 1M) and makes the
+    # behavior iterate y = 0.2 z + 0.8 x lag the learner further every epoch.
+    # The floor only binds after roughly (r + 1) * H = 100k updates, so the
+    # first 100 epochs are unchanged.
+    _SF_MAX_HORIZON = 1000.0
     _CHECKPOINT_MILESTONE_INTERVAL = 50
     _CHECKPOINT_MILESTONE_COUNT = 10
     # Keep the current epoch plus the previous 64 so every configured lineage
@@ -501,25 +605,11 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         FIFO safe to resume after upgrading.
         """
         removed = 0
-        for name in cls._replay_names(replay_dir):
+        names = cls._replay_names(replay_dir)
+        for name in names:
             path = replay_dir / name
             try:
-                if name.endswith(".lz4"):
-                    with lz4.frame.open(path, "rb") as stream:
-                        payload = orjson.loads(stream.read())
-                else:
-                    with path.open("rb") as stream:
-                        payload = orjson.loads(stream.read())
-                if payload.get("ataraxos_collector_version") != 3:
-                    continue
-                final = payload["states"][-1]
-                won = bool(final.get("battle_won"))
-                lost = bool(final.get("battle_lost"))
-                if won and lost:
-                    raise ValueError("final state is both won and lost")
-                if not won and not lost:
-                    path.unlink()
-                    removed += 1
+                summary = _fifo_replay_summary(path)
             except (
                 OSError,
                 IndexError,
@@ -531,6 +621,16 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                 raise RuntimeError(
                     f"cannot validate Snorlax FIFO outcome for {path}: {exc}"
                 ) from exc
+            if summary["version"] != 3:
+                continue
+            if summary["won"] and summary["lost"]:
+                raise RuntimeError(
+                    f"cannot validate Snorlax FIFO outcome for {path}: "
+                    "final state is both won and lost"
+                )
+            if not summary["won"] and not summary["lost"]:
+                path.unlink()
+                removed += 1
         return removed
 
     @classmethod
@@ -541,25 +641,11 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         for name in replay_names:
             path = replay_dir / name
             try:
-                if name.endswith(".lz4"):
-                    with lz4.frame.open(path, "rb") as stream:
-                        payload = orjson.loads(stream.read())
-                else:
-                    with path.open("rb") as stream:
-                        payload = orjson.loads(stream.read())
-                if payload.get("ataraxos_collector_version") != 3:
+                summary = _fifo_replay_summary(path)
+                if summary["version"] != 3:
                     raise ValueError("trajectory is not Snorlax collector schema v3")
-                final = payload["states"][-1]
-                won = bool(final.get("battle_won"))
-                lost = bool(final.get("battle_lost"))
-                if won and lost:
+                if summary["won"] and summary["lost"]:
                     raise ValueError("final state is both won and lost")
-                if won:
-                    wins += 1
-                elif lost:
-                    losses += 1
-                else:
-                    unresolved += 1
             except (
                 OSError,
                 IndexError,
@@ -571,6 +657,12 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                 raise RuntimeError(
                     f"cannot determine collection outcome for {path}: {exc}"
                 ) from exc
+            if summary["won"]:
+                wins += 1
+            elif summary["lost"]:
+                losses += 1
+            else:
+                unresolved += 1
         games = wins + losses + unresolved
         decisive = wins + losses
         return {
@@ -791,10 +883,51 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         return resolved_run.parents[4] / path
 
     @classmethod
+    def _collector_pool_rows(cls, *, run_config: str) -> int:
+        """Number of (discovered) league rows in the training pool."""
+        from metamon.rl.evaluate.opponent_pool import load_opponent_pool
+
+        config = v1b.legacy._load_run_config(run_config)
+        pool_path = cls._resolve_run_config_reference(run_config, config["train_pool"])
+        pool = load_opponent_pool(
+            str(pool_path), battle_format=str(config.get("battle_format", "gen1ou"))
+        )
+        pool._maybe_refresh_discovered(force=True)
+        return max(1, len(pool.agents))
+
+    @staticmethod
+    def _opponent_groups_per_collector(
+        *, processes: int, lanes: int, pool_rows: int
+    ) -> int:
+        """How many league rows each collector process plays at once.
+
+        One opponent per process meant a single-process host spent an entire
+        epoch against one league row. Split each process's lanes into groups
+        that each face their own opponent, enough to cover the league every
+        epoch, while keeping at least ``SNORLAX_MIN_LANES_PER_OPPONENT`` lanes
+        per group so opponent inference stays batched.
+        """
+        raw = os.environ.get("SNORLAX_OPPONENT_GROUPS_PER_COLLECTOR")
+        if raw:
+            groups = int(raw)
+        else:
+            min_lanes = max(1, int(os.environ.get("SNORLAX_MIN_LANES_PER_OPPONENT", "16")))
+            needed = -(-int(pool_rows) // max(int(processes), 1))
+            groups = min(needed, max(1, int(lanes) // min_lanes))
+        return max(1, min(int(groups), int(lanes)))
+
+    @staticmethod
+    def _lane_splits(lanes: int, groups: int) -> list[list[int]]:
+        return [
+            [int(i) for i in chunk]
+            for chunk in np.array_split(np.arange(int(lanes)), int(groups))
+        ]
+
+    @classmethod
     def _stratified_collector_opponents(
         cls, *, run_config: str, epoch: int, processes: int
     ):
-        """Choose one low-discrepancy opponent spec per collector process."""
+        """Choose ``processes`` low-discrepancy opponent specs (one per slot)."""
         from metamon.rl.evaluate.opponent_pool import load_opponent_pool
 
         config = v1b.legacy._load_run_config(run_config)
@@ -876,17 +1009,37 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         """Launch collectors with fixed opponent/team assignments and exact quotas."""
         if len(game_quotas) != processes or sum(game_quotas) <= 0:
             raise ValueError("invalid per-collector game quota schedule")
-        opponent_specs = self._stratified_collector_opponents(
-            run_config=run_config, epoch=epoch, processes=processes
+        groups_per = self._opponent_groups_per_collector(
+            processes=processes,
+            lanes=lanes,
+            pool_rows=self._collector_pool_rows(run_config=run_config),
         )
-        player_team_sets = self._stratified_collector_player_team_sets(
-            run_config=run_config, epoch=epoch, processes=processes
+        slots = processes * groups_per
+        slot_specs = self._stratified_collector_opponents(
+            run_config=run_config, epoch=epoch, processes=slots
         )
+        slot_teams = self._stratified_collector_player_team_sets(
+            run_config=run_config, epoch=epoch, processes=slots
+        )
+        lane_splits = self._lane_splits(lanes, groups_per)
+        # Interleave strata across processes (slot = idx + k * processes) so a
+        # process's groups come from different parts of the league CDF.
+        process_groups = [
+            [
+                (slot_specs[idx + k * processes], slot_teams[idx + k * processes], lane_splits[k])
+                for k in range(groups_per)
+            ]
+            for idx in range(processes)
+        ]
         schedule = " | ".join(
-            f"{idx}:{spec.model_name}@{spec.checkpoint} "
-            f"T={spec.temperature:g} opp_team={spec.team_set} "
-            f"player_team={player_team_sets[idx]} quota={game_quotas[idx]}"
-            for idx, spec in enumerate(opponent_specs)
+            f"{idx}: "
+            + ", ".join(
+                f"{spec.model_name}@{spec.checkpoint} T={spec.temperature:g} "
+                f"opp_team={spec.team_set} player_team={team} lanes={len(split)}"
+                for spec, team, split in groups
+            )
+            + f" quota={game_quotas[idx]}"
+            for idx, groups in enumerate(process_groups)
         )
         print(
             f"[PersistentCycle] collector schedule epoch={epoch}: {schedule}",
@@ -905,27 +1058,45 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             stream = log_path.open("a", encoding="utf-8", buffering=1)
             child_env = dict(os.environ)
             child_env.pop("SNORLAX_PERSISTENT_ALTERNATION", None)
+            child_env.pop("METAMON_FIXED_TRAIN_OPPONENT_GROUPS", None)
+            groups = process_groups[idx]
+            spec = groups[0][0]
             child_env.update(
                 METAMON_RUN_MODE="collect",
                 SNORLAX_FIXED_BASE_WEIGHTS="1",
                 SNORLAX_COLLECT_GAME_TARGET=str(game_quotas[idx]),
-                METAMON_FIXED_PLAYER_TEAM_SET=player_team_sets[idx],
+                METAMON_FIXED_PLAYER_TEAM_SET=str(groups[0][1]),
                 OMP_NUM_THREADS="1",
                 MKL_NUM_THREADS="1",
                 OPENBLAS_NUM_THREADS="1",
                 NUMEXPR_NUM_THREADS="1",
             )
-            spec = opponent_specs[idx]
-            child_env["METAMON_FIXED_TRAIN_OPPONENT"] = orjson.dumps(
-                {
-                    "name": spec.name,
-                    "model_name": spec.model_name,
-                    "checkpoint": spec.checkpoint,
-                    "temperature": spec.temperature,
-                    "team_set": spec.team_set,
-                    "battle_backend": spec.battle_backend,
+            def spec_fields(item):
+                return {
+                    "name": item.name,
+                    "model_name": item.model_name,
+                    "checkpoint": item.checkpoint,
+                    "temperature": item.temperature,
+                    "team_set": item.team_set,
+                    "battle_backend": item.battle_backend,
                 }
+
+            # The single fixed opponent still builds the env (first group);
+            # with several groups the collector then splits its lanes.
+            child_env["METAMON_FIXED_TRAIN_OPPONENT"] = orjson.dumps(
+                spec_fields(spec)
             ).decode("utf-8")
+            if len(groups) > 1:
+                child_env["METAMON_FIXED_TRAIN_OPPONENT_GROUPS"] = orjson.dumps(
+                    [
+                        {
+                            "opponent": spec_fields(group_spec),
+                            "player_team_set": str(group_team),
+                            "lanes": split,
+                        }
+                        for group_spec, group_team, split in groups
+                    ]
+                ).decode("utf-8")
             if os.environ.get("METAMON_COLLECTOR_DISABLE_COMPILE", "0") == "1":
                 child_env["TORCHDYNAMO_DISABLE"] = "1"
             if gated:
@@ -1236,16 +1407,16 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         return metrics
 
     def evaluate_val_games(self, target_games: int) -> None:
-        """Run a fixed stratified validation benchmark.
+        """Run a fixed four-block benchmark with exactly 50% TaurosV0 weight.
 
-        The old validator reset one 64-lane env once, so all ~250 games could
-        share a single randomly drawn opponent. Use six deterministic blocks
-        instead: the three frozen anchors each appear twice, opponent team-set
-        categories are balanced by ``stratified_opponents``, and the trainee
-        team-set categories are balanced independently.
+        ``AlreadyVectorizedEnv.reset`` discards Gym ``options``. Configure the
+        underlying vector env through its lane-group API before each ordinary
+        reset so the requested opponent and both team-set categories really do
+        reach the simulator. The four block weights are fixed at 25% each:
+        TaurosV0 on both team sets, Kakuna, and Epoch475.
         """
-        if target_games <= 0:
-            raise ValueError("target_games must be positive")
+        if target_games < 4:
+            raise ValueError("target_games must be at least four")
         from metamon.rl.evaluate.common import (
             parse_team_set_config,
             stratified_choices,
@@ -1269,12 +1440,38 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         pool = load_opponent_pool(
             str(val_pool_path), battle_format=battle_format
         )
-        blocks = min(6, int(target_games))
-        # phase=0 is intentional: this is a benchmark, not a training mixture.
-        # Keep exactly the same schedule at every validation epoch.
-        opponent_specs = pool.stratified_opponents(
-            blocks, phase=0, seed=91_337
-        )
+        candidates = pool.stratified_opponents(6, phase=0, seed=91_337)
+        by_model: dict[str, list] = {}
+        for spec in candidates:
+            by_model.setdefault(spec.model_name, []).append(spec)
+        expected_counts = {"TaurosV0": 2, "Kakuna": 2, "Epoch475Frozen": 2}
+        actual_counts = {
+            model: len(by_model.get(model, [])) for model in expected_counts
+        }
+        if actual_counts != expected_counts:
+            raise RuntimeError(
+                "Snorlax validation pool must provide two team-set variants for "
+                f"each fixed anchor; got {actual_counts}"
+            )
+
+        def variant(model: str, team_set: str):
+            matches = [
+                spec for spec in by_model[model] if spec.team_set == team_set
+            ]
+            if len(matches) != 1:
+                raise RuntimeError(
+                    f"validation needs exactly one {model}/{team_set} variant; "
+                    f"found {len(matches)}"
+                )
+            return matches[0]
+
+        opponent_specs = [
+            variant("TaurosV0", "hl_05_26"),
+            variant("TaurosV0", "snorlax_v1_expert"),
+            variant("Kakuna", "snorlax_v1_expert"),
+            variant("Epoch475Frozen", "hl_05_26"),
+        ]
+        blocks = len(opponent_specs)
         val_team_path = self._resolve_run_config_reference(
             run_config, val_team_value
         )
@@ -1287,7 +1484,16 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                 parsed_player_teams, blocks, phase=0
             )
         ]
-        quotas = self._split_game_quotas(target_games, blocks)
+        if target_games % 2:
+            raise ValueError("validation_games must be even for a half-Tauros pool")
+        tauros_games = target_games // 2
+        other_games = target_games - tauros_games
+        quotas = [
+            (tauros_games + 1) // 2,
+            tauros_games // 2,
+            (other_games + 1) // 2,
+            other_games // 2,
+        ]
 
         print(
             "[Validation] stratified schedule: "
@@ -1301,19 +1507,47 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         )
 
         amago.utils.call_async_env(self.val_envs, "resume_from_break")
+        group_env = self.val_envs
+        while (
+            not hasattr(group_env, "configure_lane_groups")
+            and hasattr(group_env, "env")
+        ):
+            group_env = group_env.env
+        if not hasattr(group_env, "configure_lane_groups"):
+            raise RuntimeError(
+                "validation env does not support fixed opponent lane groups"
+            )
+        lanes = list(range(int(group_env.batched_envs)))
         started = time.time()
-        weighted_metrics: dict[str, float] = {}
+        aggregate_win_numerator = 0.0
+        tauros_win_numerator = 0.0
+        aggregate_decisive_numerator = 0.0
+        aggregate_return_numerator = 0.0
+        metrics: dict[str, float | int] = {}
         actual_completed = 0
         try:
             for block_idx, (spec, player_team, quota) in enumerate(
                 zip(opponent_specs, player_teams, quotas)
             ):
-                self.val_envs.reset(
-                    options={
-                        "opponent": spec,
-                        "player_team_set": player_team,
-                    }
+                group_env.configure_lane_groups(
+                    [
+                        {
+                            "opponent": {
+                                "name": spec.name,
+                                "model_name": spec.model_name,
+                                "checkpoint": spec.checkpoint,
+                                "temperature": spec.temperature,
+                                "team_set": spec.team_set,
+                                "battle_backend": spec.battle_backend,
+                            },
+                            "lanes": lanes,
+                            "player_team_set": player_team,
+                        }
+                    ]
                 )
+                # The lane-group assignment persists through the AMAGO wrapper,
+                # whose reset method otherwise discards Gym reset options.
+                self.val_envs.reset()
                 _, (returns, specials) = self.interact(
                     self.val_envs,
                     100_000,
@@ -1335,54 +1569,68 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                 block_metrics = self.policy_metrics(
                     returns, specials=specials
                 )
-                for name, value in block_metrics.items():
-                    try:
-                        if torch.is_tensor(value):
-                            scalar = float(value.detach().cpu().item())
-                        else:
-                            scalar = float(value)
-                    except (TypeError, ValueError, RuntimeError):
-                        continue
-                    weighted_metrics[name] = (
-                        weighted_metrics.get(name, 0.0) + quota * scalar
-                    )
-                avg_return = block_metrics.get(
-                    "Average Total Return (Across All Env Names)"
+                def one_metric(fragment: str) -> float:
+                    values = [
+                        float(value.detach().cpu().item())
+                        if torch.is_tensor(value)
+                        else float(value)
+                        for name, value in block_metrics.items()
+                        if fragment in name
+                    ]
+                    if len(values) != 1:
+                        raise RuntimeError(
+                            f"validation block {block_idx} expected one "
+                            f"{fragment!r} metric, found {len(values)}"
+                        )
+                    return values[0]
+
+                win_rate = one_metric("Average Win Rate in ")
+                decisive_fraction = one_metric("Average Decisive Fraction in ")
+                avg_return = float(
+                    block_metrics["Average Total Return (Across All Env Names)"]
                 )
-                avg_text = ""
-                if avg_return is not None:
-                    try:
-                        avg_text = f" average_return={float(avg_return):.6f}"
-                    except (TypeError, ValueError):
-                        pass
+                label = (
+                    f"{spec.model_name}-ckpt{spec.checkpoint}-"
+                    f"opp-{spec.team_set}-player-{player_team}"
+                )
+                metrics[f"Win Rate vs {label}"] = win_rate
+                metrics[f"Decisive Fraction vs {label}"] = decisive_fraction
+                aggregate_win_numerator += quota * win_rate
+                if spec.model_name == "TaurosV0":
+                    tauros_win_numerator += quota * win_rate
+                aggregate_decisive_numerator += quota * decisive_fraction
+                aggregate_return_numerator += quota * avg_return
                 print(
                     f"[Validation] block={block_idx + 1}/{blocks} "
                     f"opponent={spec.model_name}@{spec.checkpoint} "
                     f"opp_team={spec.team_set} player_team={player_team} "
-                    f"completed={completed} target={quota}{avg_text}",
+                    f"completed={completed} target={quota} "
+                    f"win_rate={win_rate:.4f} "
+                    f"decisive={decisive_fraction:.4f} "
+                    f"average_return={avg_return:.6f}",
                     flush=True,
                 )
         finally:
+            group_env.configure_lane_groups(None)
             amago.utils.call_async_env(self.val_envs, "take_long_break")
 
-        metrics = {
-            name: total / float(target_games)
-            for name, total in weighted_metrics.items()
-        }
+        metrics["Average Validation Win Rate"] = (
+            aggregate_win_numerator / float(target_games)
+        )
+        metrics["TaurosV0 Validation Win Rate"] = (
+            tauros_win_numerator / float(tauros_games)
+        )
+        metrics["Average Validation Decisive Fraction"] = (
+            aggregate_decisive_numerator / float(target_games)
+        )
+        metrics["Average Total Return (Across Validation Pool)"] = (
+            aggregate_return_numerator / float(target_games)
+        )
+        metrics["TaurosV0 Pool Fraction"] = sum(quotas[:2]) / float(target_games)
         metrics["Completed Games"] = actual_completed
         metrics["Target Games"] = int(target_games)
         metrics["Validation Blocks"] = blocks
         metrics["Validation Seconds"] = time.time() - started
-        per_environment_win_rates = [
-            value
-            for name, value in metrics.items()
-            if name.startswith("Average Win Rate in ")
-        ]
-        if not per_environment_win_rates:
-            raise RuntimeError("validation produced no per-environment win rates")
-        # Each per-environment value above is already quota-weighted and divided
-        # by the total target, so their sum is the exact overall benchmark rate.
-        metrics["Average Validation Win Rate"] = sum(per_environment_win_rates)
         self.log(metrics, key="val")
         report_path = os.environ.get("SNORLAX_VALIDATION_REPORT")
         if report_path:
@@ -1398,12 +1646,12 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                 for name, value in sorted(win_metrics.items()):
                     stream.write(f"{name}: {value:.17g}\n")
             os.replace(temporary, report_path)
-        avg_return = metrics.get(
-            "Average Total Return (Across All Env Names)", float("nan")
-        )
+        avg_return = metrics["Average Total Return (Across Validation Pool)"]
         print(
             f"[Validation] completed_games={actual_completed} "
             f"target_games={target_games} blocks={blocks} "
+            f"tauros_fraction={metrics['TaurosV0 Pool Fraction']:.4f} "
+            f"win_rate={metrics['Average Validation Win Rate']:.4f} "
             f"average_return={avg_return:.6f} "
             f"seconds={metrics['Validation Seconds']:.1f}",
             flush=True,
@@ -1735,7 +1983,8 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                 "ataraxos_base_lr": self._GROUP_LRS["actor"],
             },
             {
-                "params": list(policy.ataraxos_value.parameters()),
+                "params": list(policy.ataraxos_value.parameters())
+                + list(policy.ataraxos_offline_value.parameters()),
                 "lr": self._GROUP_LRS["value"],
                 "ataraxos_name": "value",
                 "ataraxos_base_lr": self._GROUP_LRS["value"],
@@ -1756,7 +2005,13 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             # changing its weights when that schedule begins to decay.
             weight_lr_power=0.0,
             weight_decay=self.l2_coeff,
+            max_horizon=self._sf_max_horizon(),
         )
+
+    @classmethod
+    def _sf_max_horizon(cls) -> float:
+        raw = os.environ.get("SNORLAX_SF_MAX_HORIZON")
+        return float(cls._SF_MAX_HORIZON if raw is None else raw)
 
     def _lr_scale(self, step: int, group_name: str) -> float:
         if step <= self._LR_HOLD_STEPS:
@@ -1807,6 +2062,135 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                 flush=True,
             )
         return result
+
+    @torch.no_grad()
+    def _warmup_features(self, batch):
+        policy = self.policy
+        with self.caster():
+            o = policy.tstep_encoder(obs=batch.obs, rl2s=batch.rl2s)
+            s, _ = policy.traj_encoder(
+                seq=o, time_idxs=batch.time_idxs, hidden_state=None
+            )
+        steps = batch.actions.shape[1]
+        padded = (batch.rl2s[:, 1 : steps + 1] == policy.pad_val).all(
+            -1, keepdim=True
+        )
+        valid = ~padded
+        outcome = batch.obs[keys.OUTCOME][:, :steps].float()
+        return s[:, :steps].float(), outcome, valid
+
+    def run_value_warmup(self, output_path: str) -> dict[str, float]:
+        """Fit the fresh outcome heads on frozen Epoch475 features.
+
+        Epoch475 has no Ataraxos value head, so a zero-initialized head makes
+        every prefill ``behavior_value`` exactly 0. With GAE lambda 0.5 that
+        leaves PPO signal only on the last few actions of each prefill game and
+        decays the TD(lambda) targets of early states toward 0. Fitting the
+        heads first on offline Monte Carlo outcomes, with the trunk frozen and
+        no change to the actor, gives the prefill collector a calibrated
+        baseline. The online head then adapts to the current policy's own
+        returns; the offline head keeps tracking offline outcomes.
+
+        Only the two linear heads change; the optimizer and all step counters
+        are untouched, so the result is an ordinary fresh-start bootstrap.
+        """
+        if self._optimizer_update_step() != 0:
+            raise RuntimeError("value warmup is only valid before the first update")
+        steps = int(os.environ.get("SNORLAX_VALUE_WARMUP_STEPS", "2000"))
+        eval_batches = int(os.environ.get("SNORLAX_VALUE_WARMUP_EVAL_BATCHES", "50"))
+        batch_size = int(os.environ.get("SNORLAX_VALUE_WARMUP_BATCH", "32"))
+        lr = float(os.environ.get("SNORLAX_VALUE_WARMUP_LR", "1e-3"))
+        report_every = max(1, int(os.environ.get("SNORLAX_VALUE_WARMUP_REPORT", "100")))
+        if steps <= 0 or batch_size <= 0 or eval_batches <= 0:
+            raise ValueError("value warmup steps, batch, and eval batches must be positive")
+
+        policy = self.policy
+        policy.eval()
+        head = policy.ataraxos_value
+        workers = max(0, min(int(self.dloader_workers), 16))
+        loader = DataLoader(
+            _OfflineWarmupWindows(
+                self.dataset,
+                max_seq_len=int(self.max_seq_len),
+                length=(steps + eval_batches) * batch_size,
+            ),
+            batch_size=batch_size,
+            num_workers=workers,
+            collate_fn=partial(
+                _bucketed_length_collate,
+                max_seq_len=int(self.max_seq_len),
+                bucket_size=int(self.max_seq_len),
+            ),
+            pin_memory=torch.cuda.is_available(),
+        )
+        optimizer = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=0.0)
+        print(
+            f"[ValueWarmup] fitting outcome heads: steps={steps} batch={batch_size} "
+            f"lr={lr:g} workers={workers}",
+            flush=True,
+        )
+        started = time.time()
+        running = None
+        eval_sq = eval_const = eval_count = 0.0
+        eval_sum = 0.0
+        for index, batch in enumerate(loader):
+            batch = _batch_to_device(batch, self.DEVICE)
+            features, outcome, valid = self._warmup_features(batch)
+            mask = valid.float()
+            if index < steps:
+                prediction = torch.tanh(head(features))
+                loss = ((prediction - outcome).square() * mask).sum() / mask.sum().clamp(min=1.0)
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
+                value = float(loss.detach())
+                running = value if running is None else 0.98 * running + 0.02 * value
+                if (index + 1) % report_every == 0:
+                    print(
+                        f"[ValueWarmup] step={index + 1}/{steps} mse_ema={running:.4f} "
+                        f"elapsed={time.time() - started:.0f}s",
+                        flush=True,
+                    )
+                continue
+            # Held-out batches: compare against the best constant predictor.
+            with torch.no_grad():
+                prediction = torch.tanh(head(features))
+                eval_sq += float(((prediction - outcome).square() * mask).sum())
+                eval_sum += float((outcome * mask).sum())
+                eval_const += float((outcome.square() * mask).sum())
+                eval_count += float(mask.sum())
+        if eval_count <= 0:
+            raise RuntimeError("value warmup evaluation saw no valid offline states")
+        mean = eval_sum / eval_count
+        heldout_mse = eval_sq / eval_count
+        constant_mse = eval_const / eval_count - mean * mean
+        zero_mse = eval_const / eval_count
+        # The offline head starts from the same fit; it is trained separately
+        # from here on.
+        policy.ataraxos_offline_value.load_state_dict(head.state_dict())
+        temporary = output_path + ".tmp"
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        torch.save(policy.state_dict(), temporary)
+        os.replace(temporary, output_path)
+        metrics = {
+            "Heldout MSE": heldout_mse,
+            "Best Constant MSE": constant_mse,
+            "Zero Head MSE": zero_mse,
+            "Explained Variance": 1.0 - heldout_mse / max(constant_mse, 1e-12),
+            "Seconds": time.time() - started,
+        }
+        report = Path(output_path + ".report.txt")
+        report.write_text(
+            "".join(f"{name}: {value:.6g}\n" for name, value in metrics.items()),
+            encoding="utf-8",
+        )
+        print(
+            "[ValueWarmup] done "
+            + " ".join(f"{name.lower().replace(' ', '_')}={value:.4f}" for name, value in metrics.items())
+            + f" -> {output_path}",
+            flush=True,
+        )
+        return metrics
 
     def interact(self, envs, timesteps, hidden_state=None, render=False, save_on_done=False, episodes=None, sample=True):
         # This is the stock AMAGO loop with one deliberate addition before
@@ -2084,10 +2468,14 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             metrics["ScheduleFree/Query Drift Retention"] = 1.0 - (
                 self._SF_BETA / (self._SF_R + 2.0)
             )
+            metrics["ScheduleFree/Max Horizon"] = self._sf_max_horizon()
             for group in self.optimizer.param_groups:
                 metrics[
                     f"ScheduleFree/Average Coef/{group['ataraxos_name']}"
                 ] = group["sf_ckp1"]
+                metrics[
+                    f"ScheduleFree/Effective Horizon/{group['ataraxos_name']}"
+                ] = 1.0 / max(float(group["sf_ckp1"]), 1e-12)
         return metrics
 
     def _consume_learner_profile(self) -> dict[str, float]:

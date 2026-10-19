@@ -825,9 +825,47 @@ else
     # write, no complete state exists and the bootstrap must be restored.
     cp -f "${ONLINE_WEIGHTS}" "${POLICY_ROOT}/policy_epoch_0.pt"
   fi
-  cp -f "${ONLINE_WEIGHTS}" "${LATEST}"
-  LEARNER_RESUME_ARGS=(--base_weights "${ONLINE_WEIGHTS}")
-  log "Starting ${RUN_NAME} epoch 0 from cleaned epoch-475 weights"
+  FRESH_LEARNER_WEIGHTS="${ONLINE_WEIGHTS}"
+  if [[ "${TRAIN_VARIANT}" == "snorlax_v1" && "${SNORLAX_VALUE_WARMUP:-1}" == "1" ]]; then
+    # Epoch475 has no outcome head, so a zero head would make every prefill
+    # behavior value 0 and leave PPO signal only on the last few actions of
+    # each prefill game. Fit both outcome heads on frozen Epoch475 features
+    # from offline outcomes once, before any rollout exists. The actor and
+    # trunk are unchanged; the result is reused on every fresh restart.
+    VALUE_WARM_WEIGHTS="${BOOTSTRAP_DIR}/policy_epoch_475_value_warm.pt"
+    if [[ ! -s "${VALUE_WARM_WEIGHTS}" ]]; then
+      log "Fitting SnorlaxV1 outcome heads on frozen Epoch475 features"
+      warmup_buffer="${BOOTSTRAP_DIR}/value_warmup_buffer"
+      mkdir -p "${warmup_buffer}/gen1ou"
+      set +e
+      env -u SNORLAX_PERSISTENT_ALTERNATION \
+        WANDB_MODE=disabled \
+        SNORLAX_VALUE_WARMUP_OUTPUT="${VALUE_WARM_WEIGHTS}" \
+        "${PYTHON_BIN}" -m "${RUNNER_MODULE}" \
+        --run_config "${RUN_CONFIG}" --mode learn \
+        --run_name "${RUN_NAME}_value_warmup" --lanes 4 --n_workers 1 \
+        --save_dir "${BOOTSTRAP_DIR}/value_warmup_checkpoints" \
+        --buffer_dir "${warmup_buffer}" \
+        --base_weights "${ONLINE_WEIGHTS}" --epochs 1 \
+        --mixed_precision "${MIXED_PRECISION}" --dloader_workers "${DLOADER_WORKERS}" \
+        2>&1 | tee -a "${LOG_DIR}/value-warmup.log"
+      warmup_status="${PIPESTATUS[0]}"
+      set -e
+      (( warmup_status == 0 )) && [[ -s "${VALUE_WARM_WEIGHTS}" ]] \
+        || die "Outcome-head warmup failed; inspect ${LOG_DIR}/value-warmup.log"
+    else
+      log "Reusing fitted SnorlaxV1 outcome heads: ${VALUE_WARM_WEIGHTS}"
+    fi
+    [[ -s "${VALUE_WARM_WEIGHTS}.report.txt" ]] \
+      && sed 's/^/  value warmup: /' "${VALUE_WARM_WEIGHTS}.report.txt"
+    FRESH_LEARNER_WEIGHTS="${VALUE_WARM_WEIGHTS}"
+    # Prefill collectors read BEHAVIOR; the fresh learner starts from the same
+    # file so recorded behavior values match the learner's initial heads.
+    cp -f "${FRESH_LEARNER_WEIGHTS}" "${BEHAVIOR}"
+  fi
+  cp -f "${FRESH_LEARNER_WEIGHTS}" "${LATEST}"
+  LEARNER_RESUME_ARGS=(--base_weights "${FRESH_LEARNER_WEIGHTS}")
+  log "Starting ${RUN_NAME} epoch 0 from ${FRESH_LEARNER_WEIGHTS}"
 fi
 
 COLLECTOR_PIDS=()
@@ -1150,7 +1188,7 @@ if [[ "${ALTERNATE_COLLECT_LEARN}" == "1" ]]; then
     if (( completed_epoch >= 0 )); then
       cycle_resume=(--resume_training_state --resume_epoch "${completed_epoch}")
     else
-      cycle_resume=(--base_weights "${ONLINE_WEIGHTS}")
+      cycle_resume=(--base_weights "${FRESH_LEARNER_WEIGHTS:-${ONLINE_WEIGHTS}}")
     fi
     log "Learn phase: epoch ${next_epoch}, 1000 updates, collectors stopped"
     set +e

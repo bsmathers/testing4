@@ -19,6 +19,7 @@ module is left available for historical reproducibility of existing runs.
 from __future__ import annotations
 
 import collections
+import json
 import os
 import time
 from argparse import ArgumentParser
@@ -723,6 +724,23 @@ def main() -> None:
         experiment.load_checkpoint_from_path(ckpt_path, is_accelerate_state=False)
         print(f"Loaded initial weights: {ckpt_path}")
 
+    value_warmup_output = os.environ.get("SNORLAX_VALUE_WARMUP_OUTPUT")
+    if value_warmup_output:
+        # One-shot Snorlax bootstrap step: fit the fresh outcome heads on the
+        # frozen base policy before any rollout is collected, publish the
+        # result, and exit without entering the learner loop.
+        if args.mode != "learn" or args.resume_training_state:
+            raise ValueError(
+                "SNORLAX_VALUE_WARMUP_OUTPUT requires a fresh --mode learn start"
+            )
+        runner = getattr(experiment, "run_value_warmup", None)
+        if runner is None:
+            raise RuntimeError("this experiment does not support value warmup")
+        runner(value_warmup_output)
+        if args.log:
+            wandb.finish()
+        return
+
     if args.mode == "collect" and os.environ.get(
         "METAMON_ACTOR_ONLY_COLLECTION", "1"
     ) == "1":
@@ -797,6 +815,32 @@ def main() -> None:
         if not hasattr(quota_env, "set_collection_game_target"):
             raise RuntimeError("collector env does not support exact game quotas")
         quota_env.set_collection_game_target(target_games)
+        lane_groups_json = os.environ.get("METAMON_FIXED_TRAIN_OPPONENT_GROUPS")
+        if lane_groups_json:
+            # The parent assigned several league rows to this collector; give
+            # each its own lane group instead of one opponent for every lane.
+            group_env = experiment.train_envs.env
+            while (
+                not hasattr(group_env, "configure_lane_groups")
+                and hasattr(group_env, "env")
+            ):
+                group_env = group_env.env
+            if not hasattr(group_env, "configure_lane_groups"):
+                raise RuntimeError("collector env does not support opponent lane groups")
+            lane_groups = json.loads(lane_groups_json)
+            group_env.configure_lane_groups(lane_groups)
+            print(
+                "Collector opponent lane groups: "
+                + " | ".join(
+                    f"{group['opponent']['model_name']}@{group['opponent']['checkpoint']} "
+                    f"T={group['opponent']['temperature']:g} "
+                    f"opp_team={group['opponent']['team_set']} "
+                    f"player_team={group.get('player_team_set')} "
+                    f"lanes={len(group['lanes'])}"
+                    for group in lane_groups
+                ),
+                flush=True,
+            )
         experiment.train_envs.reset()
         experiment.policy_aclr.eval()
         experiment.interact(

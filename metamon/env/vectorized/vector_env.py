@@ -132,6 +132,15 @@ class VectorizedShowdownEnv(gym.Env):
         self.opponent_action_space = opponent_action_space
         self.eval_reward_function = eval_reward_function
         self.opponent_reward_function = opponent_reward_function
+        # Optional per-lane opponent overrides installed by
+        # ``configure_lane_groups``; ``None`` means every lane uses the shared
+        # attributes above.
+        self._lane_group_config: Optional[List[dict]] = None
+        self._lane_opp_action_spaces: Optional[List[ActionSpace]] = None
+        self._lane_opp_reward_functions: Optional[List[Optional[RewardFunction]]] = None
+        self._lane_opp_team_sets: Optional[List[Any]] = None
+        self._lane_opp_names: Optional[List[str]] = None
+        self._lane_player_team_sets: Optional[List[Any]] = None
         self.metamon_action_space = eval_action_space
         self.metamon_obs_space = eval_obs_space
 
@@ -322,10 +331,134 @@ class VectorizedShowdownEnv(gym.Env):
             copy.deepcopy(self.opponent_obs_space) for _ in range(self.batched_envs)
         ]
 
+    def _clear_lane_overrides(self) -> None:
+        self._lane_opp_action_spaces = None
+        self._lane_opp_reward_functions = None
+        self._lane_opp_team_sets = None
+        self._lane_opp_names = None
+        self._lane_player_team_sets = None
+
+    def _opp_action_space_for(self, i: int) -> ActionSpace:
+        spaces = self._lane_opp_action_spaces
+        return self.opponent_action_space if spaces is None else spaces[i]
+
+    def _opp_reward_function_for(self, i: int) -> Optional[RewardFunction]:
+        functions = self._lane_opp_reward_functions
+        return self.opponent_reward_function if functions is None else functions[i]
+
+    def _opp_team_set_for(self, i: int):
+        teams = self._lane_opp_team_sets
+        return self.opponent_team_set if teams is None else teams[i]
+
+    def _opp_name_for(self, i: int) -> str:
+        names = self._lane_opp_names
+        return self.metamon_opponent_name if names is None else names[i]
+
+    def _player_team_set_for(self, i: int):
+        teams = self._lane_player_team_sets
+        if teams is None or teams[i] is None:
+            return self.player_team_set
+        return teams[i]
+
+    def _player_team_set_by_name(self, name: str):
+        from metamon.env import get_metamon_teams
+
+        name = str(name)
+        if name not in self._player_team_cache:
+            self._player_team_cache[name] = get_metamon_teams(self.battle_format, name)
+        return self._player_team_cache[name]
+
+    def configure_lane_groups(self, groups: Optional[List[dict]]) -> None:
+        """Split lanes into groups that each face their own opponent.
+
+        ``groups`` is a list of ``{"opponent": PolicySpec | dict, "lanes":
+        [lane indices], "player_team_set": optional team-set name}`` entries
+        whose lanes partition ``range(batched_envs)``. The assignment takes
+        effect at the next full ``reset()`` without an explicit
+        ``options["opponent"]`` and persists across later resets until cleared
+        with ``None``. All lanes of a group share one batched opponent driver,
+        so a single collector process covers several league rows per epoch
+        instead of one.
+        """
+        if groups is None:
+            self._lane_group_config = None
+            return
+        if not isinstance(self.opponent, ConfigBatchedOpponent):
+            raise TypeError("lane groups require a ConfigBatchedOpponent")
+        parsed = []
+        for group in groups:
+            unknown = set(group) - {"opponent", "lanes", "player_team_set"}
+            if unknown:
+                raise ValueError(f"unknown lane-group fields: {sorted(unknown)}")
+            spec = self._coerce_policy_spec(group["opponent"])
+            if spec is None:
+                raise ValueError("every lane group needs an opponent")
+            lanes = [int(i) for i in group["lanes"]]
+            parsed.append(
+                {
+                    "opponent": spec,
+                    "lanes": lanes,
+                    "player_team_set": group.get("player_team_set"),
+                }
+            )
+        flat = sorted(i for group in parsed for i in group["lanes"])
+        if flat != list(range(self.batched_envs)):
+            raise ValueError(
+                f"lane groups must partition all {self.batched_envs} lanes exactly once"
+            )
+        self._lane_group_config = parsed
+
+    def _apply_lane_groups(self) -> None:
+        from metamon.rl.pretrained import get_pretrained_model
+
+        groups = self._lane_group_config
+        active = self.opponent.configure_groups(
+            [group["opponent"] for group in groups],
+            [group["lanes"] for group in groups],
+        )
+        n = self.batched_envs
+        action_spaces: List[Any] = [None] * n
+        reward_functions: List[Any] = [None] * n
+        opp_teams: List[Any] = [None] * n
+        names: List[str] = [""] * n
+        player_teams: List[Any] = [None] * n
+        for index, (group, spec) in enumerate(zip(groups, active)):
+            model = get_pretrained_model(spec.model_name)
+            team = self.opponent.group_team(index)
+            player_team = (
+                None
+                if group["player_team_set"] is None
+                else self._player_team_set_by_name(group["player_team_set"])
+            )
+            for i in group["lanes"]:
+                self.opponent_obs_spaces[i] = copy.deepcopy(model.observation_space)
+                action_spaces[i] = model.action_space
+                reward_functions[i] = model.reward_function
+                opp_teams[i] = team
+                names[i] = spec.short_label
+                player_teams[i] = player_team
+        self._lane_opp_action_spaces = action_spaces
+        self._lane_opp_reward_functions = reward_functions
+        self._lane_opp_team_sets = opp_teams
+        self._lane_opp_names = names
+        self._lane_player_team_sets = player_teams
+        # Shared attributes describe the first group; per-lane lookups above
+        # are authoritative while groups are active.
+        first = get_pretrained_model(active[0].model_name)
+        self.opponent_obs_space = first.observation_space
+        self.opponent_action_space = first.action_space
+        self.opponent_reward_function = first.reward_function
+        self.opponent_team_set = self.opponent.current_team
+        self.metamon_opponent_name = f"league-{len(groups)}groups"
+
     def _configure_opponent_for_reset(self, spec: Optional[Any] = None) -> None:
         """Swap the shared in-the-loop opponent (full env reset only)."""
         if not isinstance(self.opponent, ConfigBatchedOpponent):
             return
+        if spec is None and self._lane_group_config is not None:
+            self._apply_lane_groups()
+            return
+        self._clear_lane_overrides()
         resolved = self._coerce_policy_spec(spec)
         active = self.opponent.configure(resolved)
         self.opponent_team_set = self.opponent.current_team
@@ -389,8 +522,8 @@ class VectorizedShowdownEnv(gym.Env):
         self._lane_steps[i] = 0
         self._last_opp_obs[i] = None
         self._cycle_prev_eval[i] = None
-        eval_team = self.player_team_set
-        opp_team = self.opponent_team_set
+        eval_team = self._player_team_set_for(i)
+        opp_team = self._opp_team_set_for(i)
         if self.eval_side == "p1":
             p1_team, p2_team = eval_team, opp_team
         else:
@@ -486,11 +619,10 @@ class VectorizedShowdownEnv(gym.Env):
         lane = self.lanes[i]
         state = lane.universal_state(self.opp_side)
         obs = self.opponent_obs_spaces[i].state_to_obs(state)
-        legal = lane.legal_action_indices(
-            self.opp_side, self.opponent_action_space, state
-        )
+        action_space = self._opp_action_space_for(i)
+        legal = lane.legal_action_indices(self.opp_side, action_space, state)
         obs["illegal_actions"] = self._illegal_mask(
-            legal, self.opponent_action_space.gym_space.n
+            legal, action_space.gym_space.n
         )
         self._last_opp_obs[i] = obs
         return obs
@@ -539,7 +671,7 @@ class VectorizedShowdownEnv(gym.Env):
                 raw = int(self._step_eval_actions[i])
             raw = int(raw) if raw is not None else 0
         else:
-            action_space = self.opponent_action_space
+            action_space = self._opp_action_space_for(i)
             raw = self._committed_side_actions.get((i, side))
             if raw is None and self._step_opp_actions is not None:
                 raw = int(self._step_opp_actions[i])
@@ -755,7 +887,7 @@ class VectorizedShowdownEnv(gym.Env):
                     used_idx, choice = self._resolve_action(
                         i,
                         self.opp_side,
-                        self.opponent_action_space,
+                        self._opp_action_space_for(i),
                         int(opp_actions[i]),
                     )
                     side_choices[self.opp_side] = choice
@@ -772,16 +904,16 @@ class VectorizedShowdownEnv(gym.Env):
     def _record_opp_rewards(
         self, opp_pending: List[Tuple[int, int, UniversalState]]
     ) -> None:
-        if self.opponent_reward_function is None:
-            for i, used_idx, _ in opp_pending:
+        for i, used_idx, prev_opp in opp_pending:
+            reward_function = self._opp_reward_function_for(i)
+            if reward_function is None:
                 final_idx = self._committed_side_actions.get(
                     (i, self.opp_side), int(used_idx)
                 )
                 self.opponent.observe(i, 0.0, final_idx)
-            return
-        for i, used_idx, prev_opp in opp_pending:
+                continue
             new_opp = self.lanes[i].universal_state(self.opp_side)
-            reward = float(self.opponent_reward_function(prev_opp, new_opp))
+            reward = float(reward_function(prev_opp, new_opp))
             final_idx = self._committed_side_actions.get(
                 (i, self.opp_side), int(used_idx)
             )
@@ -891,7 +1023,7 @@ class VectorizedShowdownEnv(gym.Env):
                     opp_used_idx, opp_choice = self._resolve_action(
                         i,
                         self.opp_side,
-                        self.opponent_action_space,
+                        self._opp_action_space_for(i),
                         int(opp_actions[i]),
                     )
                     side_choices[self.opp_side] = opp_choice
@@ -1014,7 +1146,7 @@ class VectorizedShowdownEnv(gym.Env):
             result = "UNRESOLVED"
         battle_id = "".join(str(random.randint(0, 9)) for _ in range(10))
         timestamp = datetime.now().strftime("%m-%d-%Y-%H:%M:%S")
-        opponent_name = self.metamon_opponent_name
+        opponent_name = self._opp_name_for(i)
 
         # Snorlax/Ataraxos uses terminal zero-sum outcomes for both GAE and the
         # fresh value head. A turn-limit boundary (or simulator tie) has no

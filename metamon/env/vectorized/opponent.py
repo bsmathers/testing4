@@ -13,6 +13,11 @@ across the batch. Two implementations are provided:
     ``reset()``, sample an opponent from an :class:`~metamon.rl.evaluate.opponent_pool.OpponentPoolConfig`.
     Pool entries may mix action dimensions: each cached policy bundle owns its own
     ``rl2`` buffer and hidden state; ``configure()`` swaps bundles and reinitializes.
+    ``configure_groups()`` instead partitions the lanes into groups that each
+    play a different opponent, so one collector process covers several league
+    rows at once. Each group owns a driver sized to its own lanes (exact
+    per-lane recurrent state); groups with the same model, checkpoint, and
+    temperature share one set of policy weights.
 """
 
 from __future__ import annotations
@@ -132,8 +137,12 @@ class ConfigBatchedOpponent(BatchedOpponent):
         self._active_key: Optional[str] = None
         self._bundle: Optional[AmagoBatchedOpponent] = None
         self._cache: "OrderedDict[str, AmagoBatchedOpponent]" = OrderedDict()
+        # Lane-group mode (see ``configure_groups``).
+        self._groups: Optional[List[dict]] = None
+        self._lane_group: Optional[np.ndarray] = None
+        self._lane_local: Optional[np.ndarray] = None
 
-    def _make_bundle(self, spec: "PolicySpec") -> AmagoBatchedOpponent:
+    def _load_policy(self, spec: "PolicySpec"):
         from metamon.rl.pretrained import get_pretrained_model
 
         model = get_pretrained_model(spec.model_name)
@@ -144,13 +153,104 @@ class ConfigBatchedOpponent(BatchedOpponent):
         )
         action_dim = model.action_space.gym_space.n
         policy = optimize_policy_for_collection(agent.policy, self.device)
+        return policy, action_dim
+
+    def _make_bundle(
+        self, spec: "PolicySpec", num_lanes: Optional[int] = None, loaded=None
+    ) -> AmagoBatchedOpponent:
+        policy, action_dim = loaded if loaded is not None else self._load_policy(spec)
         return AmagoBatchedOpponent(
             policy=policy,
             device=self.device,
-            num_lanes=self.num_lanes,
+            num_lanes=self.num_lanes if num_lanes is None else int(num_lanes),
             action_dim=action_dim,
             sample=self.sample,
         )
+
+    @staticmethod
+    def _weights_key(spec: "PolicySpec") -> str:
+        # Team set does not change the policy; share weights across it.
+        return (
+            f"{spec.model_name}_ckpt{spec.checkpoint}_t{spec.temperature}_"
+            f"{spec.battle_backend}"
+        )
+
+    def _clear_groups(self) -> None:
+        if self._groups is None:
+            return
+        for group in self._groups:
+            self._free_bundle(group["bundle"])
+        self._groups = None
+        self._lane_group = None
+        self._lane_local = None
+        gc.collect()
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    def _clear_cache(self) -> None:
+        while self._cache:
+            _, bundle = self._cache.popitem(last=False)
+            self._free_bundle(bundle)
+        self._bundle = None
+        self._active_key = None
+
+    @property
+    def grouped(self) -> bool:
+        return self._groups is not None
+
+    def configure_groups(
+        self, specs: List["PolicySpec"], lane_indices: List[List[int]]
+    ) -> List["PolicySpec"]:
+        """Give each disjoint lane group its own opponent until the next configure."""
+        if not specs or len(specs) != len(lane_indices):
+            raise ValueError("configure_groups needs one lane list per opponent spec")
+        flat = sorted(int(i) for lanes in lane_indices for i in lanes)
+        if flat != list(range(self.num_lanes)):
+            raise ValueError(
+                "opponent lane groups must partition all "
+                f"{self.num_lanes} lanes exactly once"
+            )
+        if any(len(lanes) == 0 for lanes in lane_indices):
+            raise ValueError("opponent lane groups must be non-empty")
+        self._clear_groups()
+        # Grouped mode replaces the single-opponent cache; free it first so
+        # old and new opponents never coexist on the GPU.
+        self._clear_cache()
+        gc.collect()
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        loaded: dict = {}
+        groups: List[dict] = []
+        lane_group = np.full((self.num_lanes,), -1, dtype=np.int64)
+        lane_local = np.full((self.num_lanes,), -1, dtype=np.int64)
+        for index, (spec, lanes) in enumerate(zip(specs, lane_indices)):
+            lanes_arr = np.asarray(sorted(int(i) for i in lanes), dtype=np.int64)
+            key = self._weights_key(spec)
+            if key not in loaded:
+                loaded[key] = self._load_policy(spec)
+            bundle = self._make_bundle(spec, num_lanes=len(lanes_arr), loaded=loaded[key])
+            groups.append(
+                {
+                    "spec": spec,
+                    "lanes": lanes_arr,
+                    "bundle": bundle,
+                    "team": self.config.team_set_for(spec.team_set),
+                }
+            )
+            lane_group[lanes_arr] = index
+            lane_local[lanes_arr] = np.arange(len(lanes_arr), dtype=np.int64)
+        self._groups = groups
+        self._lane_group = lane_group
+        self._lane_local = lane_local
+        self.current_spec = groups[0]["spec"]
+        self.current_team = groups[0]["team"]
+        return [group["spec"] for group in groups]
+
+    def group_team(self, index: int) -> "TeamSet":
+        if self._groups is None:
+            raise RuntimeError("opponent is not in lane-group mode")
+        return self._groups[index]["team"]
 
     def _free_bundle(self, bundle: AmagoBatchedOpponent) -> None:
         """Drop a bundle's GPU tensors (policy weights + per-lane KV caches)."""
@@ -162,6 +262,7 @@ class ConfigBatchedOpponent(BatchedOpponent):
 
     def configure(self, spec: Optional["PolicySpec"] = None) -> "PolicySpec":
         """Activate one sampled (or explicit) opponent for all lanes."""
+        self._clear_groups()
         if spec is None:
             spec = self.config.sample_opponent()
         self.current_spec = spec
@@ -213,15 +314,41 @@ class ConfigBatchedOpponent(BatchedOpponent):
         return self._bundle
 
     def act(self, active: np.ndarray, obs_list: List[dict]) -> np.ndarray:
-        return self._require_bundle().act(active, obs_list)
+        if self._groups is None:
+            return self._require_bundle().act(active, obs_list)
+        active = np.asarray(active, dtype=bool)
+        actions = np.zeros((self.num_lanes,), dtype=np.int64)
+        for group in self._groups:
+            lanes = group["lanes"]
+            sub_active = active[lanes]
+            if not sub_active.any():
+                continue
+            # Each group's driver only ever sees its own lanes, so mixed
+            # observation formats across groups never get stacked together.
+            sub_obs = [obs_list[int(i)] for i in lanes]
+            actions[lanes] = group["bundle"].act(sub_active, sub_obs)
+        return actions
 
     def observe(self, lane_idx: int, reward: float, action_idx: int) -> None:
-        self._require_bundle().observe(lane_idx, reward, action_idx)
+        if self._groups is None:
+            self._require_bundle().observe(lane_idx, reward, action_idx)
+            return
+        group = self._groups[int(self._lane_group[lane_idx])]
+        group["bundle"].observe(int(self._lane_local[lane_idx]), reward, action_idx)
 
     def reset_lanes(self, done_mask: np.ndarray) -> None:
+        if self._groups is not None:
+            done_mask = np.asarray(done_mask, dtype=bool)
+            for group in self._groups:
+                group["bundle"].reset_lanes(done_mask[group["lanes"]])
+            return
         if self._bundle is not None:
             self._bundle.reset_lanes(done_mask)
 
     def reset_all(self) -> None:
+        if self._groups is not None:
+            for group in self._groups:
+                group["bundle"].reset_all()
+            return
         if self._bundle is not None:
             self._bundle.reset_all()

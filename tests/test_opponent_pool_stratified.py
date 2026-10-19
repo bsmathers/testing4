@@ -113,3 +113,7 @@ def test_validation_style_schedule_covers_each_anchor_twice():
         "hl_05_26": 3,
         "snorlax_v1_expert": 3,
     }
+    for model_name in ("TaurosV0", "Kakuna", "Epoch475Frozen"):
+        assert {
+            spec.team_set for spec in specs if spec.model_name == model_name
+        } == {"hl_05_26", "snorlax_v1_expert"}
