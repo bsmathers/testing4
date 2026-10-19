@@ -45,6 +45,7 @@ VALIDATION_INTERVAL="${VALIDATION_INTERVAL:-0}"
 VALIDATION_TIMESTEPS="${VALIDATION_TIMESTEPS:-1000}"
 # SNORLAX_FIRST_RUN_SMOKE is intentionally disabled; the full smoke block
 # remains commented out near the launch section for manual debugging.
+SNORLAX_FIRST_RUN_SMOKE="${SNORLAX_FIRST_RUN_SMOKE:-0}"
 if [[ -z "${COLLECTOR_DTYPE}" ]]; then
   if [[ "${COLLECTOR_DEVICE}" == "gpu" ]]; then
     COLLECTOR_DTYPE=bf16
@@ -100,6 +101,19 @@ export WANDB_TAGS="${WANDB_TAGS:-smallg1onlinev1a,gen1ou,epoch475,807-teams,vast
 export WANDB_MODE="${WANDB_MODE:-online}"
 export PYTHONUNBUFFERED=1
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+if [[ "${TRAIN_VARIANT}" == "snorlax_v1" ]]; then
+  # Preserve the original known-good Hugging Face download path. Ignore stale
+  # ad-hoc Xet overrides from the parent shell and use the launcher's original
+  # high-performance setting.
+  unset HF_HUB_DISABLE_XET
+  unset HF_XET_FIXED_DOWNLOAD_CONCURRENCY
+  unset HF_XET_FIXED_UPLOAD_CONCURRENCY
+  unset HF_XET_CACHE
+  unset HF_XET_CLIENT_RETRY_MAX_ATTEMPTS
+  unset HF_XET_CLIENT_RETRY_MAX_DURATION
+  unset HF_XET_CLIENT_READ_TIMEOUT
+  unset HF_XET_CLIENT_ENABLE_ADAPTIVE_CONCURRENCY
+fi
 export HF_XET_HIGH_PERFORMANCE=1
 export METAMON_ACTOR_ONLY_COLLECTION="${METAMON_ACTOR_ONLY_COLLECTION:-1}"
 export METAMON_COLLECTOR_DTYPE="${COLLECTOR_DTYPE}"
