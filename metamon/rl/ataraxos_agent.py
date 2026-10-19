@@ -7,7 +7,9 @@ the Epoch475 checkpoint.
 
 from __future__ import annotations
 
+import copy
 import itertools
+import math
 import os
 import gin
 import torch
@@ -53,6 +55,9 @@ class AtaraxosAgent(MultiTaskAgent):
         magnet_ceil: float = 0.1,
         l2sp_coef: float = 1e-4,
         l2sp_decay_steps: int = 100_000,
+        bootstrap_kl_coef: float = 1.0,
+        bootstrap_damping_steps: int = 100_000,
+        offline_policy_start_coef: float = 0.1,
         value_backbone_warmup_steps: int = 100_000,
         **kwargs,
     ):
@@ -78,8 +83,15 @@ class AtaraxosAgent(MultiTaskAgent):
         self.magnet_ceil = float(magnet_ceil)
         self.l2sp_coef = float(l2sp_coef)
         self.l2sp_decay_steps = int(l2sp_decay_steps)
+        self.bootstrap_kl_coef = float(bootstrap_kl_coef)
+        self.bootstrap_damping_steps = int(bootstrap_damping_steps)
+        self.offline_policy_start_coef = float(offline_policy_start_coef)
         self.value_backbone_warmup_steps = int(value_backbone_warmup_steps)
         self._l2sp_anchor: dict[str, torch.Tensor] | None = None
+        # Stored in a plain tuple so PyTorch does not include a second complete
+        # policy in Snorlax checkpoints. These modules are reconstructed from
+        # the immutable bootstrap after every fresh load/resume.
+        self._bootstrap_policy_modules = None
         self.register_buffer("_ataraxos_step", torch.zeros((), dtype=torch.long))
         self.register_buffer(
             "_ataraxos_online_mass", torch.zeros((), dtype=torch.float32)
@@ -165,29 +177,60 @@ class AtaraxosAgent(MultiTaskAgent):
             )
         self._l2sp_anchor = anchor
 
+    def _capture_bootstrap_policy(self, state_dict) -> None:
+        modules = (
+            copy.deepcopy(self.tstep_encoder),
+            copy.deepcopy(self.traj_encoder),
+            copy.deepcopy(self.actor),
+        )
+        for prefix, module in zip(
+            ("tstep_encoder.", "traj_encoder.", "actor."), modules
+        ):
+            module_state = {
+                name[len(prefix) :]: tensor
+                for name, tensor in state_dict.items()
+                if name.startswith(prefix)
+            }
+            module.load_state_dict(module_state, strict=True)
+            module.requires_grad_(False)
+            module.eval()
+        self._bootstrap_policy_modules = modules
+
+    def _bootstrap_damping(self, step: int) -> float:
+        """Cosine protection schedule: one at bootstrap and exactly zero later."""
+        if self.bootstrap_damping_steps <= 0 or step >= self.bootstrap_damping_steps:
+            return 0.0
+        progress = max(float(step), 0.0) / float(self.bootstrap_damping_steps)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
     def on_checkpoint_loaded(self, is_resume: bool = False):
         self._ataraxos_host_step = int(self._ataraxos_step.item())
         # Collectors never evaluate the training loss and should not spend GPU
         # memory on a second frozen copy of the policy parameters.
-        if os.environ.get("METAMON_RUN_MODE") != "learn" or self.l2sp_coef <= 0.0:
+        if os.environ.get("METAMON_RUN_MODE") != "learn" or (
+            self.l2sp_coef <= 0.0 and self.bootstrap_kl_coef <= 0.0
+        ):
             self._l2sp_anchor = None
+            self._bootstrap_policy_modules = None
             return
         if not is_resume:
-            self._capture_l2sp_anchor()
-            return
-        anchor_path = os.environ.get("ATARAXOS_L2SP_ANCHOR_PATH")
-        if not anchor_path or not os.path.isfile(anchor_path):
-            raise RuntimeError(
-                "Full-state Ataraxos resume requires ATARAXOS_L2SP_ANCHOR_PATH"
-            )
-        try:
-            state = torch.load(anchor_path, map_location="cpu", weights_only=True)
-        except TypeError:
-            # ``weights_only`` predates some of the PyTorch builds used by the
-            # remote images.  This is a trusted checkpoint created locally by
-            # the setup script, so the legacy loader is an acceptable fallback.
-            state = torch.load(anchor_path, map_location="cpu")
-        self._capture_l2sp_anchor(state)
+            anchor_state = self.state_dict()
+        else:
+            anchor_path = os.environ.get("ATARAXOS_L2SP_ANCHOR_PATH")
+            if not anchor_path or not os.path.isfile(anchor_path):
+                raise RuntimeError(
+                    "Full-state Ataraxos resume requires ATARAXOS_L2SP_ANCHOR_PATH"
+                )
+            try:
+                anchor_state = torch.load(
+                    anchor_path, map_location="cpu", weights_only=True
+                )
+            except TypeError:
+                anchor_state = torch.load(anchor_path, map_location="cpu")
+        if self.l2sp_coef > 0.0:
+            self._capture_l2sp_anchor(anchor_state)
+        if self.bootstrap_kl_coef > 0.0:
+            self._capture_bootstrap_policy(anchor_state)
 
     def _current_l2sp_scale(self) -> float:
         step = getattr(self, "_ataraxos_host_step", None)
@@ -195,7 +238,9 @@ class AtaraxosAgent(MultiTaskAgent):
             step = int(self._ataraxos_step.item())
         if self.l2sp_decay_steps <= 0:
             return 0.0
-        return max(1.0 - step / float(self.l2sp_decay_steps), 0.0)
+        # All bootstrap protection follows the same smooth schedule and reaches
+        # exactly zero, leaving the mature policy unconstrained.
+        return self._bootstrap_damping(step)
 
     @torch.no_grad()
     def add_l2sp_gradients(self) -> None:
@@ -320,12 +365,11 @@ class AtaraxosAgent(MultiTaskAgent):
         step = getattr(self, "_ataraxos_host_step", None)
         if step is None:
             step = int(self._ataraxos_step.item())
+        damping = self._bootstrap_damping(step)
         if self.value_backbone_warmup_steps <= 0:
             value_backbone_scale = 1.0
         else:
-            value_backbone_scale = min(
-                max(step / float(self.value_backbone_warmup_steps), 0.0), 1.0
-            )
+            value_backbone_scale = 1.0 - damping
         value_features = (
             s.detach() + value_backbone_scale * (s - s.detach())
         )
@@ -406,6 +450,39 @@ class AtaraxosAgent(MultiTaskAgent):
             (values[:, :T] - outcome).square(), offline_states
         )
 
+        bootstrap_kl = torch.zeros((), device=probs.device)
+        bootstrap_kl_coefficient = self.bootstrap_kl_coef * damping
+        if bootstrap_kl_coefficient > 0.0:
+            if self._bootstrap_policy_modules is None:
+                raise RuntimeError("Ataraxos learner has no model-475 policy anchor")
+            bootstrap_tstep, bootstrap_traj, bootstrap_actor = (
+                self._bootstrap_policy_modules
+            )
+            with torch.no_grad():
+                bootstrap_o = bootstrap_tstep(obs=batch.obs, rl2s=batch.rl2s)
+                bootstrap_s, _ = bootstrap_traj(
+                    seq=bootstrap_o,
+                    time_idxs=batch.time_idxs,
+                    hidden_state=None,
+                )
+                bootstrap_dist = bootstrap_actor(
+                    bootstrap_s,
+                    straight_from_obs={
+                        key: batch.obs[key] for key in self.pass_obs_keys_to_actor
+                    },
+                )
+                bootstrap_probs = bootstrap_dist.probs[..., -1, :].float()
+                bootstrap_log_probs = torch.where(
+                    bootstrap_probs > 0,
+                    bootstrap_probs.clamp_min(1e-30).log(),
+                    torch.full_like(bootstrap_probs, -70.0),
+                )
+            bootstrap_kl_step = (
+                bootstrap_probs[:, :T]
+                * (bootstrap_log_probs[:, :T] - log_probs[:, :T])
+            ).sum(-1, keepdim=True)
+            bootstrap_kl = _masked_mean(bootstrap_kl_step, valid.bool())
+
         temperature = (
             self.magnet_coef
             / (self._ataraxos_online_mass.float() + 1.0).pow(self.magnet_decay)
@@ -414,8 +491,11 @@ class AtaraxosAgent(MultiTaskAgent):
             ppo + self.behavior_kl_coef * behavior_kl
             + temperature * magnet_kl + self.value_coef * online_value
         )
+        effective_offline_policy_coef = self.offline_policy_coef * (
+            1.0 - (1.0 - self.offline_policy_start_coef) * damping
+        )
         offline_loss = (
-            self.offline_policy_coef * offline_ce
+            effective_offline_policy_coef * offline_ce
             + self.offline_value_coef * offline_value
         )
         # Weight by the actual trajectory composition of this batch. Production
@@ -425,6 +505,7 @@ class AtaraxosAgent(MultiTaskAgent):
         loss = (
             batch_online_fraction * online_loss
             + (1.0 - batch_online_fraction) * offline_loss
+            + bootstrap_kl_coefficient * bootstrap_kl
         )
         l2sp_scale = self._current_l2sp_scale()
         self._pending_l2sp_scale = l2sp_scale
@@ -453,6 +534,12 @@ class AtaraxosAgent(MultiTaskAgent):
                 "Ataraxos/Value Loss": online_value.detach(),
                 "Ataraxos/Offline Value Loss": offline_value.detach(),
                 "Ataraxos/Offline CE": offline_ce.detach(),
+                "Ataraxos/Bootstrap KL": bootstrap_kl.detach(),
+                "Ataraxos/Bootstrap KL Coef": float(bootstrap_kl_coefficient),
+                "Ataraxos/Bootstrap Damping": float(damping),
+                "Ataraxos/Effective Offline Policy Coef": float(
+                    effective_offline_policy_coef
+                ),
                 "Ataraxos/Value Backbone Scale": float(value_backbone_scale),
                 "Ataraxos/Magnet Coef": temperature.detach(),
                 "Ataraxos/Online Mass": self._ataraxos_online_mass.detach(),

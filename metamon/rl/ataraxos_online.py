@@ -1373,7 +1373,31 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         metrics["Target Games"] = int(target_games)
         metrics["Validation Blocks"] = blocks
         metrics["Validation Seconds"] = time.time() - started
+        per_environment_win_rates = [
+            value
+            for name, value in metrics.items()
+            if name.startswith("Average Win Rate in ")
+        ]
+        if not per_environment_win_rates:
+            raise RuntimeError("validation produced no per-environment win rates")
+        # Each per-environment value above is already quota-weighted and divided
+        # by the total target, so their sum is the exact overall benchmark rate.
+        metrics["Average Validation Win Rate"] = sum(per_environment_win_rates)
         self.log(metrics, key="val")
+        report_path = os.environ.get("SNORLAX_VALIDATION_REPORT")
+        if report_path:
+            win_metrics = {
+                name: float(value)
+                for name, value in metrics.items()
+                if "Win Rate" in name or "Decisive Fraction" in name
+            }
+            temporary = report_path + ".tmp"
+            with open(temporary, "w", encoding="utf-8") as stream:
+                stream.write(f"Epoch: {self.epoch}\n")
+                stream.write(f"Completed Games: {actual_completed}\n")
+                for name, value in sorted(win_metrics.items()):
+                    stream.write(f"{name}: {value:.17g}\n")
+            os.replace(temporary, report_path)
         avg_return = metrics.get(
             "Average Total Return (Across All Env Names)", float("nan")
         )
@@ -1398,6 +1422,9 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         # initialize or resume the learner's W&B run ID.
         child_env["WANDB_MODE"] = "disabled"
         child_env.pop("WANDB_RUN_ID", None)
+        report_path = log_dir / f"validation-epoch-{epoch}-metrics.txt"
+        report_path.unlink(missing_ok=True)
+        child_env["SNORLAX_VALIDATION_REPORT"] = str(report_path)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         command = [
@@ -1451,6 +1478,24 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                 f"validation epoch={epoch} exited with status {result.returncode}; "
                 f"inspect {validation_log}"
             )
+        fields: dict[str, float] = {}
+        with report_path.open("r", encoding="utf-8") as stream:
+            for line in stream:
+                name, separator, value = line.rstrip("\n").partition(": ")
+                if separator and name not in {"Epoch", "Completed Games"}:
+                    fields[name] = float(value)
+        win_rates = {
+            name: value for name, value in fields.items() if "Win Rate" in name
+        }
+        if not win_rates:
+            raise RuntimeError(
+                f"validation epoch={epoch} produced no win-rate metrics"
+            )
+        self.log(fields, key="validation")
+        summary = " ".join(
+            f"{name}={value:.4f}" for name, value in sorted(win_rates.items())
+        )
+        print(f"[ValidationResult] epoch={epoch} {summary}", flush=True)
 
     def learn(self):
         if os.environ.get("SNORLAX_PERSISTENT_ALTERNATION") != "1":
@@ -1713,8 +1758,11 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             weight_decay=self.l2_coeff,
         )
 
-    def _lr_scale(self, step: int) -> float:
+    def _lr_scale(self, step: int, group_name: str) -> float:
         if step <= self._LR_HOLD_STEPS:
+            if group_name in {"backbone", "actor"}:
+                damping = self.policy._bootstrap_damping(step)
+                return 1.0 - 0.9 * damping
             return 1.0
         progress = min(
             (step - self._LR_HOLD_STEPS) / float(self._LR_DECAY_STEPS), 1.0
@@ -1934,8 +1982,8 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         # group counter is checkpointed and therefore remains authoritative
         # across the one-process-per-epoch alternating launcher.
         step = self._optimizer_update_step()
-        scale = self._lr_scale(step)
         for group in self.optimizer.param_groups:
+            scale = self._lr_scale(step, group["ataraxos_name"])
             group["lr"] = group["ataraxos_base_lr"] * scale
         profile = (
             torch.cuda.is_available()
