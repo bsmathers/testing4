@@ -772,7 +772,6 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             "1",
             "--mixed_precision",
             os.environ.get("MIXED_PRECISION", "bf16"),
-            "--log",
         ]
         print(f"[PersistentCycle] validation epoch={epoch}", flush=True)
         validation_log = log_dir / "validation.log"
