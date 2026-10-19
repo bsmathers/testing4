@@ -1146,8 +1146,23 @@ if [[ "${TRAIN_VARIANT}" == "snorlax_v1" && "${ALTERNATE_COLLECT_LEARN}" == "1" 
   export RUNNER_MODULE COLLECTOR_PROCESSES COLLECTOR_DTYPE LANES COLLECTOR_WORKERS
   export GAMES_PER_LEARNER_EPOCH METAMON_SAVE_DIR MIXED_PRECISION
   export VALIDATION_INTERVAL VALIDATION_TIMESTEPS VALIDATION_GAMES
+  # Overlap: collect round e+1 in the background while epoch e trains.
+  export SNORLAX_OVERLAP_COLLECTION="${SNORLAX_OVERLAP_COLLECTION:-1}"
+  learner_prefix=()
+  if [[ -n "${SNORLAX_LEARNER_CPUS:-}" ]]; then
+    # Pin the learner (and its replay-loader workers) to its own cores. The
+    # learner pins collector/validation children to SNORLAX_COLLECTOR_CPUS,
+    # or to every other CPU when that is unset.
+    command -v taskset >/dev/null \
+      || die "SNORLAX_LEARNER_CPUS requires taskset (util-linux)"
+    export SNORLAX_LEARNER_CPUS
+    [[ -n "${SNORLAX_COLLECTOR_CPUS:-}" ]] && export SNORLAX_COLLECTOR_CPUS
+    learner_prefix=(taskset -c "${SNORLAX_LEARNER_CPUS}")
+    log "Learner CPUs: ${SNORLAX_LEARNER_CPUS}; collector CPUs: ${SNORLAX_COLLECTOR_CPUS:-all others}"
+  fi
+  log "Overlapped collection: SNORLAX_OVERLAP_COLLECTION=${SNORLAX_OVERLAP_COLLECTION}"
   set +e
-  "${PYTHON_BIN}" -m "${RUNNER_MODULE}" \
+  "${learner_prefix[@]}" "${PYTHON_BIN}" -m "${RUNNER_MODULE}" \
     --run_config "${RUN_CONFIG}" --mode learn \
     --run_name "${RUN_NAME}" --lanes "${LANES}" --n_workers "${COLLECTOR_WORKERS}" \
     --save_dir "${SAVE_DIR}" --buffer_dir "${BUFFER_DIR}" --log \

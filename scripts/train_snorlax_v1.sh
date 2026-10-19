@@ -80,6 +80,9 @@ export GAMES_PER_LEARNER_EPOCH="${GAMES_PER_LEARNER_EPOCH:-2000}"
 export TOTAL_LEARNER_EPOCHS="${TOTAL_LEARNER_EPOCHS:-1000000000}"
 export ONLINE_FIFO_SIZE=5000
 export VALIDATION_INTERVAL=10
+# Collect round e+1 in the background while learner epoch e trains. Set to 0
+# for the strictly alternating collect -> learn loop.
+export SNORLAX_OVERLAP_COLLECTION="${SNORLAX_OVERLAP_COLLECTION:-1}"
 export VALIDATION_TIMESTEPS=1000
 export VALIDATION_GAMES=250
 export METAMON_ACTOR_ONLY_COLLECTION=1

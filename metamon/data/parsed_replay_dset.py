@@ -609,6 +609,9 @@ class MetamonDataset(Dataset):
             nested_obs[atx_keys.BEHAVIOR_LEGAL] = legal.tolist() + [
                 [False] * num_actions
             ]
+            nested_obs[atx_keys.BEHAVIOR_UPDATE] = [
+                [float(data.get("ataraxos_behavior_update", -1))]
+            ] * len(states)
 
         # A full-game outcome label is available to every offline/online state,
         # even when the sequence loader later selects a sub-window.

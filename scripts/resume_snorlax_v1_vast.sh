@@ -9,6 +9,17 @@ set -Eeuo pipefail
 die() { echo "ERROR: $*" >&2; exit 1; }
 log() { printf '\n[%s] %s\n' "$(date '+%F %T')" "$*"; }
 
+[[ $# -le 2 ]] || die "Usage: $0 [WANDB_API_KEY [HF_API_KEY]]"
+if (( $# >= 1 )); then
+  [[ -n "$1" ]] || die "WANDB_API_KEY must not be empty"
+  export WANDB_API_KEY="$1"
+fi
+if (( $# == 2 )); then
+  [[ -n "$2" ]] || die "HF_API_KEY must not be empty"
+  export HF_TOKEN="$2"
+  export HUGGING_FACE_HUB_TOKEN="$2"
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="${REPO_DIR:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 PERSIST_ROOT="${PERSIST_ROOT:-/workspace/snorlax-v1-v2}"
@@ -89,7 +100,24 @@ unset HF_XET_CLIENT_RETRY_MAX_ATTEMPTS HF_XET_CLIENT_RETRY_MAX_DURATION
 unset HF_XET_CLIENT_READ_TIMEOUT HF_XET_CLIENT_ENABLE_ADAPTIVE_CONCURRENCY
 
 export METAMON_WANDB_PROJECT="${METAMON_WANDB_PROJECT:-snorlax-v1}"
-export WANDB_RUN_ID="${WANDB_RUN_ID:-snorlax-v1-v2}"
+if [[ -z "${WANDB_RUN_ID:-}" ]]; then
+  wandb_root="${SAVE_DIR}/${RUN_NAME}/wandb_logs/wandb"
+  latest_wandb_run=""
+  if [[ -L "${wandb_root}/latest-run" ]]; then
+    latest_wandb_run="$(basename "$(readlink "${wandb_root}/latest-run")")"
+  elif [[ -d "${wandb_root}" ]]; then
+    latest_wandb_run="$({ find "${wandb_root}" -mindepth 1 -maxdepth 1 -type d \
+      -name 'run-????????_??????-*' -printf '%f\n' 2>/dev/null || true; } | sort | tail -1)"
+  fi
+  if [[ "${latest_wandb_run}" =~ ^run-[0-9]{8}_[0-9]{6}-(.+)$ ]]; then
+    WANDB_RUN_ID="${BASH_REMATCH[1]}"
+    log "Resuming existing W&B run ${WANDB_RUN_ID}"
+  else
+    WANDB_RUN_ID=snorlax-v1-v2
+    log "No prior W&B run directory found; using ${WANDB_RUN_ID}"
+  fi
+fi
+export WANDB_RUN_ID
 export WANDB_NAME="${WANDB_NAME:-SnorlaxV1-v2}"
 export WANDB_RUN_GROUP="${WANDB_RUN_GROUP:-snorlax-v1}"
 export WANDB_TAGS="${WANDB_TAGS:-snorlax-v1,epoch475,ataraxos,schedule-free,gen1ou,807-teams,league}"
@@ -106,7 +134,9 @@ export COLLECTOR_PROCESSES="${COLLECTOR_PROCESSES:-8}"
 export COLLECTOR_DEVICE="${COLLECTOR_DEVICE:-gpu}"
 export COLLECTOR_DTYPE="${COLLECTOR_DTYPE:-bf16}"
 export LANES="${LANES:-64}"
-export COLLECTOR_WORKERS="${COLLECTOR_WORKERS:-7}"
+# Match the current 48-vCPU/RTX 5090 profile (8 coordinators + 40 simulator
+# workers). The old fallback of seven workers silently overprovisioned it.
+export COLLECTOR_WORKERS="${COLLECTOR_WORKERS:-5}"
 export DLOADER_WORKERS="${DLOADER_WORKERS:-12}"
 export METAMON_PARTIAL_HIDDEN_CHUNK="${METAMON_PARTIAL_HIDDEN_CHUNK:-64}"
 export METAMON_FULL_BATCH_MAX_INACTIVE="${METAMON_FULL_BATCH_MAX_INACTIVE:-8}"
@@ -128,6 +158,9 @@ export GAMES_PER_LEARNER_EPOCH=2000
 export TOTAL_LEARNER_EPOCHS=1000000000
 export ONLINE_FIFO_SIZE=5000
 export VALIDATION_INTERVAL=10
+# Collect round e+1 in the background while learner epoch e trains. Set to 0
+# for the strictly alternating collect -> learn loop.
+export SNORLAX_OVERLAP_COLLECTION="${SNORLAX_OVERLAP_COLLECTION:-1}"
 export VALIDATION_TIMESTEPS=1000
 export VALIDATION_GAMES=250
 

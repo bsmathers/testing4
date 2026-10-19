@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Destructively discard all generated SnorlaxV1 training state, then provision
-# and launch the regularized Epoch475 continuation in the foreground. Downloaded
-# offline datasets are preserved, but generated compiler caches are discarded.
+# Resume an existing checkpointed SnorlaxV1 run when present. Only when no
+# complete training state exists, discard generated state and launch a fresh
+# regularized Epoch475 continuation. Downloaded offline datasets are preserved.
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 log() { printf '\n[%s] %s\n' "$(date '+%F %T')" "$*"; }
@@ -30,6 +30,15 @@ case "${PERSIST_ROOT}" in
 esac
 [[ -f "${REPO_DIR}/scripts/setup_and_launch_epoch475_omd_vast.sh" ]] \
   || die "Snorlax launcher not found in ${REPO_DIR}"
+
+state_root="${PERSIST_ROOT}/checkpoints/snorlax_v1/ckpts/training_states"
+if [[ -d "${state_root}" ]] \
+    && find "${state_root}" -mindepth 1 -maxdepth 1 -type d \
+      -name 'snorlax_v1_epoch_*' -print -quit | grep -q .; then
+  log "Existing completed SnorlaxV1 state found; resuming without deleting FIFO, weights, logs, or caches"
+  export REPO_DIR PERSIST_ROOT
+  exec bash "${REPO_DIR}/scripts/resume_snorlax_v1_vast.sh" "$1" "$2"
+fi
 
 export WANDB_API_KEY="$1"
 export HF_TOKEN="$2"

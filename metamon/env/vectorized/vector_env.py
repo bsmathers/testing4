@@ -1190,6 +1190,11 @@ class VectorizedShowdownEnv(gym.Env):
                 # Version 3 additionally guarantees that native-engine
                 # terminal outcomes come from the authoritative engine Result.
                 output_json["ataraxos_collector_version"] = 3
+                # Optimizer update count of the behavior policy (set by the
+                # Snorlax learner for each collector), for data-age logging.
+                behavior_update = os.environ.get("SNORLAX_BEHAVIOR_UPDATE")
+                if behavior_update is not None:
+                    output_json["ataraxos_behavior_update"] = int(behavior_update)
             path = os.path.join(self.save_trajectories_to, filename)
             temp_path = path + ".tmp"
             with lz4.frame.open(temp_path, "wb") as f:

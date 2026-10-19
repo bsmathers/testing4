@@ -314,6 +314,40 @@ class AtaraxosAgent(MultiTaskAgent):
             ):
                 gradient.add_(parameter - anchor, alpha=coefficient)
 
+    def _data_age_metrics(self, batch, T, step, ratio, behavior_kl_step, selected):
+        """Clip fraction / ratio / behavior KL by age of the collecting policy.
+
+        Age is measured in learner epochs between the behavior policy's
+        optimizer update count (recorded by the collector) and the current
+        update. With overlapped collection, fresh data is first used at an age
+        of about one epoch; the last FIFO use is about two epochs later.
+        """
+        updates_per_epoch = getattr(self, "_ataraxos_updates_per_epoch", None)
+        behavior_update = batch.obs.get(keys.BEHAVIOR_UPDATE)
+        if not updates_per_epoch or behavior_update is None:
+            return {}
+        behavior_update = behavior_update[:, :T].float()
+        known = selected & (behavior_update >= 0)
+        age = (float(step) - behavior_update) / float(updates_per_epoch)
+        clipped = ((ratio - 1).abs() > self.clip_range).float()
+        metrics = {}
+        total = known.float().sum().clamp(min=1)
+        for label, low, high in (
+            ("0-1", 0.0, 1.0),
+            ("1-2", 1.0, 2.0),
+            ("2-3", 2.0, 3.0),
+            ("3+", 3.0, float("inf")),
+        ):
+            mask = known & (age >= low) & (age < high)
+            prefix = f"Ataraxos Data Age/{label} epochs"
+            metrics[f"{prefix}/Share"] = (mask.float().sum() / total).detach()
+            metrics[f"{prefix}/Clip Fraction"] = _masked_mean(clipped, mask).detach()
+            metrics[f"{prefix}/Ratio Mean"] = _masked_mean(ratio, mask).detach()
+            metrics[f"{prefix}/Behavior KL"] = _masked_mean(
+                behavior_kl_step, mask
+            ).detach()
+        return metrics
+
     def get_actions_with_metadata(self, obs, rl2s, time_idxs, hidden_state=None, sample=True):
         """Sample actions and return the exact behavior distribution/value."""
         s, hidden_state = self.get_state_embedding(
@@ -597,4 +631,7 @@ class AtaraxosAgent(MultiTaskAgent):
                 "Ataraxos/Selected Fraction": selected.float().sum() / online.float().sum().clamp(min=1),
                 "Ataraxos/Ratio Mean": _masked_mean(ratio, selected).detach(),
             }
+            self.update_info.update(
+                self._data_age_metrics(batch, T, step, ratio, behavior_kl_step, selected)
+            )
         return loss

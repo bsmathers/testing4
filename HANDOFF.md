@@ -48,6 +48,14 @@ and learning behavior, not an arbitrary small epoch cap.
 
 The complete canonical recipe is in `docs/snorlax_v1_training.md`.
 
+## Overlapped collection
+
+The persistent learner now collects round e+1 in the background while it
+trains epoch e (`SNORLAX_OVERLAP_COLLECTION=1`, default). Training parameters
+are unchanged; data is one epoch older at first use. Restarts purge and
+recollect an interrupted round. Optional CPU split: `SNORLAX_LEARNER_CPUS` /
+`SNORLAX_COLLECTOR_CPUS`. See `docs/snorlax_v1_training.md`.
+
 ## Opponent league
 
 The static half consists of three TaurosV0 and three Kakuna rows. The lineage

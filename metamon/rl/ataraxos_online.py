@@ -23,6 +23,13 @@ from torch.utils.data import DataLoader, get_worker_info
 from metamon.rl import ataraxos_keys as keys
 from metamon.rl import taurosv1b_online as v1b
 from metamon.rl.recent_schedule_free import RecentScheduleFreeAdamW
+from metamon.rl.snorlax_pipeline import (
+    RoundLedger,
+    affinity_command_prefix,
+    collector_cpu_set,
+    container_cpus,
+    parse_cpu_list,
+)
 from metamon.env.vectorized.amago_policy import normalize_discrete_policy_actions
 
 
@@ -259,6 +266,8 @@ class TaggedDataset(RLDataset):
             )
             data.obs[keys.ADVANTAGE] = torch.zeros(T, 1)
             data.obs[keys.VALUE_TARGET] = torch.zeros(T, 1)
+        if keys.BEHAVIOR_UPDATE not in data.obs:
+            data.obs[keys.BEHAVIOR_UPDATE] = torch.full((T, 1), -1.0)
         threshold = 0.0 if self.owner is None else self.owner.adv_threshold
         data.obs[keys.ADV_THRESHOLD] = torch.full((T, 1), float(threshold))
         return data
@@ -761,7 +770,7 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             return configured
         return os.path.join(self.ckpt_dir, "latest", "behavior_policy.pt")
 
-    def _write_behavior_policy(self) -> str:
+    def _write_behavior_policy(self, path: str | None = None) -> str:
         """Publish the Schedule-Free y iterate used for PPO data collection.
 
         Schedule-Free evaluates gradients at y but validation/checkpoints at the
@@ -771,7 +780,7 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         policy change. This conversion is reversible and does not advance the
         optimizer.
         """
-        path = self._behavior_policy_path()
+        path = self._behavior_policy_path() if path is None else path
         temporary = path + ".tmp"
 
         # Persistent collection boundaries leave the optimizer in eval/x mode.
@@ -1097,6 +1106,9 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                         for group_spec, group_team, split in groups
                     ]
                 ).decode("utf-8")
+            # Lets each replay record how many optimizer updates old its
+            # behavior policy is (data-age diagnostics in the learner).
+            child_env["SNORLAX_BEHAVIOR_UPDATE"] = str(self._optimizer_update_step())
             if os.environ.get("METAMON_COLLECTOR_DISABLE_COMPILE", "0") == "1":
                 child_env["TORCHDYNAMO_DISABLE"] = "1"
             if gated:
@@ -1106,7 +1118,7 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                     SNORLAX_COLLECT_PARENT_PID=str(os.getpid()),
                     SNORLAX_RELOAD_BASE_ON_RELEASE="1",
                 )
-            command = [
+            command = self._child_cpu_prefix() + [
                 sys.executable, "-m", module,
                 "--run_config", run_config,
                 "--mode", "collect",
@@ -1675,7 +1687,7 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         child_env["SNORLAX_VALIDATION_REPORT"] = str(report_path)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        command = [
+        command = self._child_cpu_prefix() + [
             sys.executable,
             "-m",
             os.environ.get("RUNNER_MODULE", "metamon.rl.ataraxos_online"),
@@ -1745,11 +1757,413 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         )
         print(f"[ValidationResult] epoch={epoch} {summary}", flush=True)
 
+    def _train_one_epoch(self, epoch: int, progress_hook=None) -> None:
+        """Run one learner epoch of ``train_batches_per_epoch`` updates.
+
+        ``progress_hook`` (optional) is called at every profile report and
+        returns extra text for the ``[LearnerProfile]`` line; the overlapped
+        loop uses it to watch the background collection round.
+        """
+        from tqdm import tqdm
+
+        self.policy._ataraxos_updates_per_epoch = int(self.train_batches_per_epoch)
+        self.policy_aclr.train()
+        loader = iter(self.train_dloader)
+        self._resident_loader_warmup_iterator = None
+        progress = tqdm(
+            range(self.train_batches_per_epoch),
+            desc=f"{self.run_name} Epoch {epoch} Train",
+            colour="green",
+        ) if self.verbose else range(self.train_batches_per_epoch)
+        block_started = time.perf_counter()
+        data_seconds = 0.0
+        sequence_steps = 0
+        report_interval = max(
+            20, int(os.environ.get("METAMON_LEARN_REPORT_INTERVAL", "100"))
+        )
+        for train_step in progress:
+            data_started = time.perf_counter()
+            batch = next(loader)
+            data_seconds += time.perf_counter() - data_started
+            sequence_steps += int(batch.actions.shape[1])
+            total_step = epoch * self.train_batches_per_epoch + train_step
+            log_step = total_step % self.log_interval == 0
+            loss_dict = self.train_step(batch, log_step=log_step)
+            if log_step:
+                self.log(loss_dict, key="train-update")
+            if (train_step + 1) % report_interval == 0:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                elapsed = time.perf_counter() - block_started
+                component_profile = self._consume_learner_profile()
+                component_text = ""
+                if component_profile:
+                    component_text = " " + " ".join(
+                        f"{name}={milliseconds:.1f}ms"
+                        for name, milliseconds in component_profile.items()
+                    )
+                hook_text = progress_hook() if progress_hook is not None else ""
+                print(
+                    f"[LearnerProfile] epoch={epoch} step={train_step + 1} "
+                    f"rate={report_interval / elapsed:.2f}it/s "
+                    f"data_wait={100.0 * data_seconds / elapsed:.1f}% "
+                    f"seq_avg={sequence_steps / float(report_interval):.1f}"
+                    f"{component_text}{hook_text}",
+                    flush=True,
+                )
+                block_started = time.perf_counter()
+                data_seconds = 0.0
+                sequence_steps = 0
+        self.accelerator.wait_for_everyone()
+        del loader
+
+    def _start_resident_loader_workers(self) -> None:
+        # Creating the first iterator starts persistent loader processes and
+        # lets their immutable tar indexes open while collection is using the
+        # CPU. The iterator is reset before training, so no prefetched
+        # pre-ingest FIFO sample is ever used for an update.
+        if (
+            getattr(self, "train_dloader", None) is not None
+            and not getattr(self, "_resident_loader_workers_started", False)
+        ):
+            self._resident_loader_warmup_iterator = iter(self.train_dloader)
+            self._resident_loader_workers_started = True
+            print(
+                "[Learner] starting replay-loader workers during collection",
+                flush=True,
+            )
+
+    def _ingest_collection(self) -> None:
+        dset_log = self.dataset.on_end_of_collection(experiment=self)
+        self.log(dset_log, key="dataset")
+        if getattr(self, "train_dloader", None) is None:
+            self.init_dloaders()
+        elif not getattr(self, "_reported_resident_dloader", False):
+            print(
+                "[Learner] retaining replay-loader workers and offline tar "
+                "indexes across epochs",
+                flush=True,
+            )
+            self._reported_resident_dloader = True
+        if not self.dataset.ready_for_training:
+            raise RuntimeError("Snorlax FIFO became unavailable after collection")
+
+    # ----- CPU placement ---------------------------------------------------
+
+    @staticmethod
+    def _learner_cpus() -> set[int] | None:
+        return parse_cpu_list(os.environ.get("SNORLAX_LEARNER_CPUS"))
+
+    @classmethod
+    def _child_cpu_prefix(cls) -> list[str]:
+        """``taskset`` prefix for collector/validation children (or ``[]``)."""
+        cpus = collector_cpu_set(
+            cls._learner_cpus(),
+            parse_cpu_list(os.environ.get("SNORLAX_COLLECTOR_CPUS")),
+            container_cpus(),
+        )
+        return affinity_command_prefix(cpus)
+
+    def _apply_learner_cpu_affinity(self) -> None:
+        cpus = self._learner_cpus()
+        if cpus is None or not hasattr(os, "sched_setaffinity"):
+            return
+        # The launcher already wraps the learner in ``taskset`` when this is
+        # set; repeating it here covers manual launches. Loader workers forked
+        # later inherit the mask.
+        os.sched_setaffinity(0, sorted(cpus))
+        print(
+            f"[Learner] pinned to CPUs {os.environ['SNORLAX_LEARNER_CPUS']}; "
+            "collectors get "
+            + (" ".join(self._child_cpu_prefix()[2:]) or "all CPUs"),
+            flush=True,
+        )
+
+    # ----- overlapped collection rounds ------------------------------------
+    #
+    # Round r is the collection consumed by learner epoch r. With overlap on,
+    # round e + 1 runs in background collector processes while epoch e trains,
+    # using the Schedule-Free y iterate that epoch e starts from. Only one round
+    # is ever in flight; ingest (FIFO rescan/eviction, manifest publish,
+    # advantage threshold) happens only between learner epochs, so loader
+    # workers never see a file from an unfinished round.
+
+    def _round_ledger(self) -> RoundLedger:
+        return RoundLedger(
+            Path(os.environ["SNORLAX_LOG_DIR"]),
+            Path(os.environ["SNORLAX_BUFFER_DIR"]) / "gen1ou",
+        )
+
+    def _round_behavior_path(self, round_idx: int) -> str:
+        # Versioned per round: the learner republishes latest/behavior_policy.pt
+        # while a background round is still running.
+        return os.path.join(
+            self.ckpt_dir, "latest", f"behavior_policy_round_{int(round_idx)}.pt"
+        )
+
+    def _prune_round_behavior_files(self, keep_from: int) -> None:
+        root = os.path.join(self.ckpt_dir, "latest")
+        try:
+            names = os.listdir(root)
+        except FileNotFoundError:
+            return
+        for name in names:
+            match = re.fullmatch(r"behavior_policy_round_(\d+)\.pt", name)
+            if match and int(match.group(1)) < keep_from:
+                try:
+                    os.remove(os.path.join(root, name))
+                except OSError:
+                    pass
+
+    def _round_ready(self, round_idx: int) -> bool:
+        """A completed round whose data is still on disk."""
+        ledger = self._round_ledger()
+        complete = ledger.is_complete(round_idx)
+        if not complete:
+            # Accept the single-marker format written by the alternating loop
+            # so a run can switch to overlap mode at any epoch boundary.
+            try:
+                legacy = self._collection_ready_marker().read_text(
+                    encoding="utf-8"
+                ).strip()
+            except FileNotFoundError:
+                legacy = ""
+            complete = (
+                legacy == f"collection complete for learner epoch {round_idx}"
+                and not ledger.baseline_path(round_idx).exists()
+            )
+        if not complete:
+            return False
+        min_fifo = int(os.environ.get("ONLINE_FIFO_SIZE", "5000"))
+        return len(self._replay_names(ledger.replay_dir)) >= min_fifo
+
+    def _start_round(self, round_idx: int, behavior_path: str) -> dict:
+        buffer_dir = Path(os.environ["SNORLAX_BUFFER_DIR"])
+        replay_dir = buffer_dir / "gen1ou"
+        removed_unresolved = self._purge_unresolved_online_replays(replay_dir)
+        if removed_unresolved:
+            print(
+                f"[OverlapCycle] removed {removed_unresolved} unresolved "
+                "schema-v3 replay(s) from the FIFO",
+                flush=True,
+            )
+        target = self._collection_target(buffer_dir)
+        processes = int(os.environ.get("COLLECTOR_PROCESSES", "8"))
+        quotas = self._split_game_quotas(target, processes)
+        lanes = int(os.environ.get("LANES", "64"))
+        workers = int(os.environ.get("COLLECTOR_WORKERS", "8"))
+        dtype = os.environ.get("COLLECTOR_DTYPE", "bf16")
+        ledger = self._round_ledger()
+        baseline = ledger.begin(round_idx, self._replay_names(replay_dir))
+        print(
+            f"[OverlapCycle] launch round={round_idx} target={target} "
+            f"processes={processes} lanes={lanes} workers={workers} "
+            f"quotas={quotas} behavior={behavior_path} "
+            f"behavior_update={self._optimizer_update_step()}",
+            flush=True,
+        )
+        state = self._launch_collector_children(
+            epoch=round_idx,
+            processes=processes,
+            configured_processes=processes,
+            lanes=lanes,
+            workers=workers,
+            collector_mp="no" if dtype == "fp32" else dtype,
+            behavior_weights=behavior_path,
+            buffer_dir=buffer_dir,
+            log_dir=Path(os.environ["SNORLAX_LOG_DIR"]),
+            run_config=os.environ["SNORLAX_RUN_CONFIG"],
+            module=os.environ.get("RUNNER_MODULE", "metamon.rl.ataraxos_online"),
+            save_dir=os.environ["METAMON_SAVE_DIR"],
+            game_quotas=quotas,
+            gated=False,
+        )
+        state.update(round=int(round_idx), baseline=baseline)
+        return state
+
+    def _check_round(self, state: dict) -> tuple[int, int]:
+        """Raise if a collector failed; return (active children, fresh games)."""
+        statuses = [child.poll() for child, _ in state["children"]]
+        for idx, status in enumerate(statuses):
+            if status is not None and status != 0:
+                raise RuntimeError(
+                    f"collector {idx} of round {state['round']} exited with status "
+                    f"{status}; inspect {os.environ['SNORLAX_LOG_DIR']}/"
+                    f"collector-epoch-{state['round']}-{idx}.log"
+                )
+        fresh = len(self._round_ledger().fresh(state["round"], state["baseline"]))
+        return sum(status is None for status in statuses), fresh
+
+    def _round_progress_text(self, state: dict | None) -> str:
+        if state is None:
+            return ""
+        active, fresh = self._check_round(state)
+        return (
+            f" collect_round={state['round']} {fresh}/{state['target']} "
+            f"active={active}/{len(state['children'])}"
+        )
+
+    def _terminate_round(self, state: dict | None) -> None:
+        if not state:
+            return
+        for child, _stream in state["children"]:
+            if child.poll() is None:
+                child.terminate()
+        for child, stream in state["children"]:
+            try:
+                child.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=10)
+            stream.close()
+
+    def _terminate_pending_round(self) -> None:
+        state = getattr(self, "_pending_round", None)
+        self._pending_round = None
+        self._terminate_round(state)
+
+    def _finish_round(self, state: dict) -> dict[str, int | float]:
+        """Block until the round's collectors exit, then validate and record it."""
+        poll_seconds = max(
+            0.5, float(os.environ.get("SNORLAX_COLLECT_POLL_SECONDS", "2"))
+        )
+        progress_seconds = max(
+            poll_seconds,
+            float(os.environ.get("SNORLAX_COLLECT_PROGRESS_SECONDS", "10")),
+        )
+        round_idx = state["round"]
+        target = state["target"]
+        wait_started = time.monotonic()
+        last_progress = wait_started - progress_seconds
+        try:
+            while True:
+                active, fresh = self._check_round(state)
+                now = time.monotonic()
+                if active == 0 or now - last_progress >= progress_seconds:
+                    print(
+                        f"[OverlapCycle] waiting for round={round_idx} "
+                        f"{fresh}/{target} active={active}/{len(state['children'])} "
+                        f"waited={now - wait_started:.0f}s",
+                        flush=True,
+                    )
+                    last_progress = now
+                if active == 0:
+                    break
+                time.sleep(poll_seconds)
+        finally:
+            self._terminate_round(state)
+        ledger = self._round_ledger()
+        fresh_names = ledger.fresh(round_idx, state["baseline"])
+        if len(fresh_names) != target:
+            raise RuntimeError(
+                f"exact-quota round {round_idx} produced {len(fresh_names)} replays; "
+                f"expected exactly {target}. Refusing a biased collection round."
+            )
+        metrics = self._count_collection_outcomes(ledger.replay_dir, fresh_names)
+        if metrics["Unresolved"] != 0 or metrics["Games"] != target:
+            raise RuntimeError(f"round {round_idx} outcome mismatch: {metrics}")
+        waited = time.monotonic() - wait_started
+        elapsed = time.monotonic() - state["launched"]
+        metrics["Learner Wait Seconds"] = waited
+        metrics["Round Seconds"] = elapsed
+        self._write_collection_outcome_report(round_idx, {
+            name: metrics[name]
+            for name in ("Games", "Wins", "Losses", "Unresolved", "Win Rate", "Decisive Fraction")
+        })
+        ledger.mark_complete(round_idx, target)
+        print(
+            f"[OverlapCycle] round={round_idx} complete wins={metrics['Wins']} "
+            f"losses={metrics['Losses']} win_rate={metrics['Win Rate']:.4f} "
+            f"round={elapsed:.0f}s learner_wait={waited:.0f}s "
+            f"rate={target * 60.0 / max(elapsed, 1e-6):.0f} games/min",
+            flush=True,
+        )
+        return metrics
+
+    def _learn_overlapped(self) -> None:
+        """Learn epoch e while collection round e + 1 runs in the background."""
+        if not getattr(self, "_overlap_cleanup_registered", False):
+            atexit.register(self._terminate_pending_round)
+            self._overlap_cleanup_registered = True
+        self._apply_learner_cpu_affinity()
+        ledger = self._round_ledger()
+        purged = ledger.purge_incomplete()
+        for round_idx, count in purged.items():
+            print(
+                f"[OverlapCycle] removed {count} partial replay(s) of interrupted "
+                f"round {round_idx}",
+                flush=True,
+            )
+        self._pending_round = None
+        start_epoch = self.epoch
+        try:
+            for epoch in range(start_epoch, self.epochs):
+                self.epoch = epoch
+                self.policy_aclr.eval()
+                self._start_resident_loader_workers()
+
+                # 1. The round this epoch trains on must be complete.
+                pending = self._pending_round
+                if pending is not None and pending["round"] == epoch:
+                    collection_log = self._finish_round(pending)
+                    self._pending_round = None
+                elif self._round_ready(epoch):
+                    print(
+                        f"[OverlapCycle] round={epoch} already complete; resuming",
+                        flush=True,
+                    )
+                    collection_log = self._read_collection_outcome_report(epoch)
+                else:
+                    # First epoch of a fresh or resumed run: collect this round
+                    # synchronously from the current y, exactly as the
+                    # alternating loop does.
+                    self._terminate_pending_round()
+                    behavior = self._write_behavior_policy(self._round_behavior_path(epoch))
+                    self._pending_round = self._start_round(epoch, behavior)
+                    collection_log = self._finish_round(self._pending_round)
+                    self._pending_round = None
+                self.accelerator.wait_for_everyone()
+                if collection_log is not None:
+                    self.log(collection_log, key="collection")
+
+                # 2. Ingest between epochs only.
+                self._ingest_collection()
+
+                # 3. Launch the next round from the y this epoch starts from.
+                next_round = epoch + 1
+                if next_round < self.epochs and not self._round_ready(next_round):
+                    behavior = self._write_behavior_policy(
+                        self._round_behavior_path(next_round)
+                    )
+                    self._pending_round = self._start_round(next_round, behavior)
+
+                # 4. Train while it collects.
+                self._train_one_epoch(
+                    epoch,
+                    progress_hook=lambda: self._round_progress_text(self._pending_round),
+                )
+
+                # 5. Publish, validate, checkpoint. Validation runs alongside
+                # the background round (it never writes to the FIFO).
+                if self.always_save_latest:
+                    self.write_latest_policy()
+                else:
+                    self._write_behavior_policy()
+                self._external_validation_phase(epoch)
+                if self.ckpt_interval and epoch % self.ckpt_interval == 0:
+                    self.save_checkpoint()
+                # Resume from this checkpoint needs only rounds > epoch.
+                ledger.forget_through(epoch)
+                self._collection_ready_marker().unlink(missing_ok=True)
+                self._prune_round_behavior_files(keep_from=epoch + 1)
+        finally:
+            self._terminate_pending_round()
+
     def learn(self):
         if os.environ.get("SNORLAX_PERSISTENT_ALTERNATION") != "1":
             return super().learn()
-
-        from tqdm import tqdm
+        if os.environ.get("SNORLAX_OVERLAP_COLLECTION", "0") == "1":
+            return self._learn_overlapped()
 
         if not getattr(self, "_collector_cleanup_registered", False):
             atexit.register(self._cleanup_prewarmed_collectors)
@@ -1767,20 +2181,7 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                 f"[PersistentCycle] behavior policy epoch={epoch} {behavior_path}",
                 flush=True,
             )
-            # Creating the first iterator starts persistent loader processes and
-            # lets their immutable tar indexes open while collection is using
-            # the CPU. The iterator is reset after collection, so no prefetched
-            # pre-collection FIFO sample is ever used for an update.
-            if (
-                getattr(self, "train_dloader", None) is not None
-                and not getattr(self, "_resident_loader_workers_started", False)
-            ):
-                self._resident_loader_warmup_iterator = iter(self.train_dloader)
-                self._resident_loader_workers_started = True
-                print(
-                    "[Learner] starting replay-loader workers during collection",
-                    flush=True,
-                )
+            self._start_resident_loader_workers()
             collection_log = self._external_collect_phase(epoch)
             self.accelerator.wait_for_everyone()
 
@@ -1793,68 +2194,8 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                     flush=True,
                 )
 
-            dset_log = self.dataset.on_end_of_collection(experiment=self)
-            self.log(dset_log, key="dataset")
-            if getattr(self, "train_dloader", None) is None:
-                self.init_dloaders()
-            elif not getattr(self, "_reported_resident_dloader", False):
-                print(
-                    "[Learner] retaining replay-loader workers and offline tar "
-                    "indexes across epochs",
-                    flush=True,
-                )
-                self._reported_resident_dloader = True
-            if not self.dataset.ready_for_training:
-                raise RuntimeError("Snorlax FIFO became unavailable after collection")
-
-            self.policy_aclr.train()
-            loader = iter(self.train_dloader)
-            self._resident_loader_warmup_iterator = None
-            progress = tqdm(
-                range(self.train_batches_per_epoch),
-                desc=f"{self.run_name} Epoch {epoch} Train",
-                colour="green",
-            ) if self.verbose else range(self.train_batches_per_epoch)
-            block_started = time.perf_counter()
-            data_seconds = 0.0
-            sequence_steps = 0
-            report_interval = max(
-                20, int(os.environ.get("METAMON_LEARN_REPORT_INTERVAL", "100"))
-            )
-            for train_step in progress:
-                data_started = time.perf_counter()
-                batch = next(loader)
-                data_seconds += time.perf_counter() - data_started
-                sequence_steps += int(batch.actions.shape[1])
-                total_step = epoch * self.train_batches_per_epoch + train_step
-                log_step = total_step % self.log_interval == 0
-                loss_dict = self.train_step(batch, log_step=log_step)
-                if log_step:
-                    self.log(loss_dict, key="train-update")
-                if (train_step + 1) % report_interval == 0:
-                    if torch.cuda.is_available():
-                        torch.cuda.synchronize()
-                    elapsed = time.perf_counter() - block_started
-                    component_profile = self._consume_learner_profile()
-                    component_text = ""
-                    if component_profile:
-                        component_text = " " + " ".join(
-                            f"{name}={milliseconds:.1f}ms"
-                            for name, milliseconds in component_profile.items()
-                        )
-                    print(
-                        f"[LearnerProfile] epoch={epoch} step={train_step + 1} "
-                        f"rate={report_interval / elapsed:.2f}it/s "
-                        f"data_wait={100.0 * data_seconds / elapsed:.1f}% "
-                        f"seq_avg={sequence_steps / float(report_interval):.1f}"
-                        f"{component_text}",
-                        flush=True,
-                    )
-                    block_started = time.perf_counter()
-                    data_seconds = 0.0
-                    sequence_steps = 0
-            self.accelerator.wait_for_everyone()
-            del loader
+            self._ingest_collection()
+            self._train_one_epoch(epoch)
 
             # Publish the rolling x/y pair so validation can evaluate this
             # epoch, but do not commit the numbered/full optimizer checkpoint

@@ -105,3 +105,46 @@ block remains in the launcher source for manual debugging but is commented out
 and does not execute during production launch. Policy and optimizer-state checkpoints
 are published atomically; an orphan policy from an interrupted save is removed
 before resumed collection. Use a fresh `PERSIST_ROOT` for SnorlaxV1.
+
+## Overlapped collection and learning
+
+With `SNORLAX_OVERLAP_COLLECTION=1` (the default in `train_snorlax_v1.sh` and
+`resume_snorlax_v1_vast.sh`), the persistent learner collects round `e + 1` in
+background collector processes while it trains epoch `e`. Round `e + 1` uses
+the Schedule-Free y iterate that epoch `e` starts from, written to a versioned
+`latest/behavior_policy_round_<r>.pt` so later publishes cannot race it. Each
+epoch then costs about `max(collection, learning)` instead of their sum. Set
+`SNORLAX_OVERLAP_COLLECTION=0` for the strictly alternating loop.
+
+Training parameters are unchanged (batch 14, 1,000 updates, 5,000-game FIFO).
+The trade-off is one more epoch of data age: fresh games are first used about
+one epoch after their behavior policy, and the oldest FIFO data is about three
+epochs old instead of two. PPO ratios stay exact because behavior log
+probabilities are recorded. Each replay now records its behavior policy's
+optimizer update (`ataraxos_behavior_update`), and the learner logs Share,
+Clip Fraction, Ratio Mean, and Behavior KL by data age under
+`Ataraxos Data Age/*`. If old buckets clip heavily, shrink the FIFO
+(`dset_max_size`/`dset_min_size` in the run config together with
+`ONLINE_FIFO_SIZE` and `PREFILL_FILES`).
+
+Ingest (FIFO rescan and eviction, manifest publish, advantage threshold) still
+happens only between epochs, so replay-loader workers never see a file from an
+unfinished round. Only one round is ever in flight. A per-round ledger in the
+log directory (`.collection-round-<r>-baseline.txt` and `-complete`) makes
+restarts safe: on resume, the replays of any round without a completion marker
+are deleted and that round is recollected, while completed rounds are reused.
+The first epoch of a fresh or resumed run collects its round synchronously.
+Validation runs alongside the background round (it never writes to the FIFO).
+
+`[LearnerProfile]` lines show the background round's progress, a failed
+collector stops training immediately, and each round logs
+`collection/Learner Wait Seconds`. Near-zero wait means learning is now the
+bottleneck; a large wait means collection still is.
+
+CPU placement is opt-in. `SNORLAX_LEARNER_CPUS` (for example `0-7`) runs the
+learner and its replay-loader workers under `taskset`; collector and
+validation children are pinned to `SNORLAX_COLLECTOR_CPUS`, or to every other
+CPU when that is unset. Size the learner set so `[LearnerProfile] data_wait`
+stays below about 5% and give the rest to the simulators. Collector and learner
+kernels share the GPU; if the collection rate drops sharply while the learner
+runs, CUDA MPS (if the host allows it) lets their kernels run concurrently.
