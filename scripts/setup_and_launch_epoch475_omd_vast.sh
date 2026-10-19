@@ -141,28 +141,32 @@ if [[ "${cpu_model}" == *"EPYC 7742"* && "${gpu_name}" == *"5090"* ]]; then
 elif (( vram_mib >= 30000 && cpu_count >= 56 )); then
   if (( ram_mib < 56000 )); then
     # EPYC 7742 / 40-48 GiB / RTX 5090 class host:
-    # 512 battles, 32 Node workers total.
+    # 512 battles, 56 Node workers total. This is the previously optimized
+    # Snorlax collection topology for a 64-core EPYC host.
     COLLECTOR_PROCESSES=8
     LANES=64
-    COLLECTOR_WORKERS=4
+    COLLECTOR_WORKERS=7
     METAMON_PARTIAL_HIDDEN_CHUNK=64
+    METAMON_FULL_BATCH_MAX_INACTIVE=8
     DLOADER_WORKERS=12
-    collector_preset="epyc-40gb-8x64x4"
+    collector_preset="epyc-40gb-8x64x7"
   else
     # Large-memory 64+ CPU host:
     # 512 battles, 64 Node workers total.
     COLLECTOR_PROCESSES=8
     LANES=64
-    COLLECTOR_WORKERS=8
+    COLLECTOR_WORKERS=7
     METAMON_PARTIAL_HIDDEN_CHUNK=64
+    METAMON_FULL_BATCH_MAX_INACTIVE=8
     DLOADER_WORKERS=32
-    collector_preset="high-ram-8x64x8"
+    collector_preset="high-ram-8x64x7"
   fi
 elif (( vram_mib >= 30000 && cpu_count >= 32 )); then
   COLLECTOR_PROCESSES=4
   LANES=64
   COLLECTOR_WORKERS=4
   METAMON_PARTIAL_HIDDEN_CHUNK=32
+  METAMON_FULL_BATCH_MAX_INACTIVE=8
   DLOADER_WORKERS=8
   collector_preset="mid-cpu-4x64x4"
 else
@@ -170,6 +174,7 @@ else
   LANES=96
   COLLECTOR_WORKERS=8
   METAMON_PARTIAL_HIDDEN_CHUNK=8
+  METAMON_FULL_BATCH_MAX_INACTIVE=8
   DLOADER_WORKERS=8
   collector_preset="fallback-1x96x8"
 fi
@@ -177,7 +182,7 @@ COLLECTOR_DEVICE=gpu
 COLLECTOR_DTYPE=bf16
 
 export COLLECTOR_PROCESSES COLLECTOR_DEVICE COLLECTOR_DTYPE LANES
-export COLLECTOR_WORKERS METAMON_PARTIAL_HIDDEN_CHUNK DLOADER_WORKERS
+export COLLECTOR_WORKERS METAMON_PARTIAL_HIDDEN_CHUNK METAMON_FULL_BATCH_MAX_INACTIVE DLOADER_WORKERS
 log "Collector preset ${collector_preset}: ${COLLECTOR_PROCESSES} processes x ${LANES} lanes x ${COLLECTOR_WORKERS} Showdown workers; DLOADER_WORKERS=${DLOADER_WORKERS}"
 
 MIXED_PRECISION=bf16
