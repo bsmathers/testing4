@@ -103,21 +103,48 @@ log "Launching commit ${commit}; progress will also be written to ${run_log}"
 
 export REPO_DIR PERSIST_ROOT GOOD_REPLAYS_DIR PYTHON_BIN
 if (( cpu_count >= 64 && vram_mib >= 30000 )); then
-  # Parsing two battle POVs and building observations are Python-bound. Use
-  # several independent coordinators on large hosts instead of making two
-  # coordinators manage ever-larger lane batches. The 5090 has ample memory for
-  # these actor-only bf16 policies and their compact 33-step KV caches.
-  # Eight coordinators are the validated memory-safe default. They are fully
-  # reaped before each learner phase so collector state cannot OOM the learner.
-  default_collector_processes=8
-  default_lanes=64
-  default_collector_workers=8
-  default_partial_hidden_chunk=64
+  # The vectorized simulator shards each collector across COLLECTOR_WORKERS
+  # independent Node/Showdown processes.  On a 64-core EPYC, 8 collectors x
+  # 8 workers creates 64 Node processes before counting the 8 Python
+  # coordinators, IPC relay threads, and the resident learner.  That topology
+  # is fast only when the host also has enough RAM and CPU headroom.
+  if (( ram_mib >= 60000 )); then
+    # High-RAM 64+ core host.
+    default_collector_processes=8
+    default_lanes=64
+    default_collector_workers=8
+    default_partial_hidden_chunk=64
+    default_dloader_workers=32
+    collector_preset="high-ram-8x64x8"
+  elif (( ram_mib >= 36000 )); then
+    # 40-48 GiB class hosts (for example EPYC 7742 + RTX 5090). Preserve the
+    # full 512 concurrent battles and eight Python batching coordinators, but
+    # halve simulator sharding: 32 Node workers total, 16 lanes per worker.
+    # This leaves physical-core headroom for Python observation construction,
+    # opponent batching, IPC, and the resident learner while greatly reducing
+    # duplicated Node/V8 state.
+    default_collector_processes=8
+    default_lanes=64
+    default_collector_workers=4
+    default_partial_hidden_chunk=64
+    default_dloader_workers=12
+    collector_preset="low-ram-epyc-8x64x4"
+  else
+    # Very memory-constrained large-CPU host.
+    default_collector_processes=4
+    default_lanes=64
+    default_collector_workers=4
+    default_partial_hidden_chunk=32
+    default_dloader_workers=8
+    collector_preset="very-low-ram-4x64x4"
+  fi
 else
   default_collector_processes=1
   default_lanes=96
   default_collector_workers=8
   default_partial_hidden_chunk=8
+  default_dloader_workers=8
+  collector_preset="fallback-1x96x8"
 fi
 export COLLECTOR_PROCESSES="${COLLECTOR_PROCESSES:-${default_collector_processes}}"
 export COLLECTOR_DEVICE="${COLLECTOR_DEVICE:-gpu}"
@@ -132,7 +159,8 @@ export COLLECTOR_DTYPE
 export LANES="${LANES:-${default_lanes}}"
 export COLLECTOR_WORKERS="${COLLECTOR_WORKERS:-${default_collector_workers}}"
 export METAMON_PARTIAL_HIDDEN_CHUNK="${METAMON_PARTIAL_HIDDEN_CHUNK:-${default_partial_hidden_chunk}}"
-export DLOADER_WORKERS="${DLOADER_WORKERS:-32}"
+export DLOADER_WORKERS="${DLOADER_WORKERS:-${default_dloader_workers}}"
+log "Collector preset ${collector_preset}: ${COLLECTOR_PROCESSES} processes x ${LANES} lanes x ${COLLECTOR_WORKERS} Showdown workers; DLOADER_WORKERS=${DLOADER_WORKERS}"
 export MIXED_PRECISION="${MIXED_PRECISION:-bf16}"
 export METAMON_LOG_INTERVAL="${METAMON_LOG_INTERVAL:-50}"
 export BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-14}"
