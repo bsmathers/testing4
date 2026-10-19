@@ -1234,6 +1234,7 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         return metrics
+
     def evaluate_val_games(self, target_games: int) -> None:
         """Run a fixed stratified validation benchmark.
 
@@ -1383,6 +1384,7 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             f"seconds={metrics['Validation Seconds']:.1f}",
             flush=True,
         )
+
     def _external_validation_phase(self, epoch: int) -> None:
         interval = int(os.environ.get("VALIDATION_INTERVAL", "0"))
         if interval <= 0 or epoch % interval:
