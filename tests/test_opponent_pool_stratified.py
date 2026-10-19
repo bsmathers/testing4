@@ -85,6 +85,7 @@ def test_stratified_choices_balance_equal_weight_team_sets():
             "hl_05_26": 4,
             "snorlax_v1_expert": 4,
         }
+        assert all(chosen[i] != chosen[i + 1] for i in range(len(chosen) - 1))
 
 
 def test_stratified_choices_cycle_plain_lists():
