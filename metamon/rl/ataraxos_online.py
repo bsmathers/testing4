@@ -1235,46 +1235,154 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             torch.cuda.empty_cache()
         return metrics
     def evaluate_val_games(self, target_games: int) -> None:
-        """Evaluate until at least target_games battles have completed."""
+        """Run a fixed stratified validation benchmark.
+
+        The old validator reset one 64-lane env once, so all ~250 games could
+        share a single randomly drawn opponent. Use six deterministic blocks
+        instead: the three frozen anchors each appear twice, opponent team-set
+        categories are balanced by ``stratified_opponents``, and the trainee
+        team-set categories are balanced independently.
+        """
         if target_games <= 0:
             raise ValueError("target_games must be positive")
+        from metamon.rl.evaluate.common import (
+            parse_team_set_config,
+            stratified_choices,
+        )
+        from metamon.rl.evaluate.opponent_pool import load_opponent_pool
+
+        run_config = os.environ["SNORLAX_RUN_CONFIG"]
+        config = v1b.legacy._load_run_config(run_config)
+        val_pool_value = config.get("val_pool")
+        val_team_value = config.get("val_team_set")
+        if not val_pool_value or not val_team_value:
+            raise RuntimeError(
+                "Snorlax validation requires val_pool and val_team_set"
+            )
+        val_pool_path = self._resolve_run_config_reference(
+            run_config, val_pool_value
+        )
+        if not val_pool_path.is_file():
+            raise FileNotFoundError(f"validation pool not found: {val_pool_path}")
+        battle_format = str(config.get("battle_format", "gen1ou"))
+        pool = load_opponent_pool(
+            str(val_pool_path), battle_format=battle_format
+        )
+        blocks = min(6, int(target_games))
+        # phase=0 is intentional: this is a benchmark, not a training mixture.
+        # Keep exactly the same schedule at every validation epoch.
+        opponent_specs = pool.stratified_opponents(
+            blocks, phase=0, seed=91_337
+        )
+        val_team_path = self._resolve_run_config_reference(
+            run_config, val_team_value
+        )
+        parsed_player_teams = parse_team_set_config(
+            str(val_team_path) if val_team_path.is_file() else str(val_team_value)
+        )
+        player_teams = [
+            str(x)
+            for x in stratified_choices(
+                parsed_player_teams, blocks, phase=0
+            )
+        ]
+        quotas = self._split_game_quotas(target_games, blocks)
+
+        print(
+            "[Validation] stratified schedule: "
+            + " | ".join(
+                f"{idx}:{spec.model_name}@{spec.checkpoint} "
+                f"opp_team={spec.team_set} player_team={player_teams[idx]} "
+                f"quota={quotas[idx]}"
+                for idx, spec in enumerate(opponent_specs)
+            ),
+            flush=True,
+        )
+
         amago.utils.call_async_env(self.val_envs, "resume_from_break")
+        started = time.time()
+        weighted_metrics: dict[str, float] = {}
+        actual_completed = 0
         try:
-            self.val_envs.reset()
-            started = time.time()
-            # The episode target normally ends this loop after a few hundred
-            # vector steps. The large step cap only guards against a broken
-            # environment that never terminates battles.
-            _, (returns, specials) = self.interact(
-                self.val_envs,
-                100_000,
-                hidden_state=None,
-                sample=self.sample_actions_val,
-                episodes=target_games,
-            )
-            completed = sum(
-                len(scores)
-                for history in returns
-                for scores in history.data.values()
-            )
-            if completed < target_games:
-                raise RuntimeError(
-                    f"validation stopped after only {completed}/{target_games} games"
+            for block_idx, (spec, player_team, quota) in enumerate(
+                zip(opponent_specs, player_teams, quotas)
+            ):
+                self.val_envs.reset(
+                    options={
+                        "opponent": spec,
+                        "player_team_set": player_team,
+                    }
                 )
-            metrics = self.policy_metrics(returns, specials=specials)
-            metrics["Completed Games"] = completed
-            metrics["Validation Seconds"] = time.time() - started
-            self.log(metrics, key="val")
-            avg_return = metrics["Average Total Return (Across All Env Names)"]
-            print(
-                f"[Validation] completed_games={completed} "
-                f"target_games={target_games} average_return={avg_return:.6f} "
-                f"seconds={metrics['Validation Seconds']:.1f}",
-                flush=True,
-            )
+                _, (returns, specials) = self.interact(
+                    self.val_envs,
+                    100_000,
+                    hidden_state=None,
+                    sample=self.sample_actions_val,
+                    episodes=quota,
+                )
+                completed = sum(
+                    len(scores)
+                    for history in returns
+                    for scores in history.data.values()
+                )
+                if completed < quota:
+                    raise RuntimeError(
+                        f"validation block {block_idx} stopped after "
+                        f"{completed}/{quota} games"
+                    )
+                actual_completed += completed
+                block_metrics = self.policy_metrics(
+                    returns, specials=specials
+                )
+                for name, value in block_metrics.items():
+                    try:
+                        if torch.is_tensor(value):
+                            scalar = float(value.detach().cpu().item())
+                        else:
+                            scalar = float(value)
+                    except (TypeError, ValueError, RuntimeError):
+                        continue
+                    weighted_metrics[name] = (
+                        weighted_metrics.get(name, 0.0) + quota * scalar
+                    )
+                avg_return = block_metrics.get(
+                    "Average Total Return (Across All Env Names)"
+                )
+                avg_text = ""
+                if avg_return is not None:
+                    try:
+                        avg_text = f" average_return={float(avg_return):.6f}"
+                    except (TypeError, ValueError):
+                        pass
+                print(
+                    f"[Validation] block={block_idx + 1}/{blocks} "
+                    f"opponent={spec.model_name}@{spec.checkpoint} "
+                    f"opp_team={spec.team_set} player_team={player_team} "
+                    f"completed={completed} target={quota}{avg_text}",
+                    flush=True,
+                )
         finally:
             amago.utils.call_async_env(self.val_envs, "take_long_break")
 
+        metrics = {
+            name: total / float(target_games)
+            for name, total in weighted_metrics.items()
+        }
+        metrics["Completed Games"] = actual_completed
+        metrics["Target Games"] = int(target_games)
+        metrics["Validation Blocks"] = blocks
+        metrics["Validation Seconds"] = time.time() - started
+        self.log(metrics, key="val")
+        avg_return = metrics.get(
+            "Average Total Return (Across All Env Names)", float("nan")
+        )
+        print(
+            f"[Validation] completed_games={actual_completed} "
+            f"target_games={target_games} blocks={blocks} "
+            f"average_return={avg_return:.6f} "
+            f"seconds={metrics['Validation Seconds']:.1f}",
+            flush=True,
+        )
     def _external_validation_phase(self, epoch: int) -> None:
         interval = int(os.environ.get("VALIDATION_INTERVAL", "0"))
         if interval <= 0 or epoch % interval:
