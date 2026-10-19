@@ -23,6 +23,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="${REPO_DIR:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 PERSIST_ROOT="${PERSIST_ROOT:-/workspace/snorlax-v1-v2}"
+GOOD_REPLAYS_DIR="${GOOD_REPLAYS_DIR:-/workspace/good_replays}"
 export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-${PERSIST_ROOT}/cache/torchinductor}"
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${PERSIST_ROOT}/cache/triton}"
 export TORCHINDUCTOR_FX_GRAPH_CACHE="${TORCHINDUCTOR_FX_GRAPH_CACHE:-1}"
@@ -83,6 +84,7 @@ cp -f "${RESUME_POLICY}" "${LATEST}"
 # Runtime variables required by the learner/collector subprocesses. Hardware
 # topology is supplied authoritatively by setup_and_launch_epoch475_omd_vast.sh.
 export TRAIN_VARIANT=snorlax_v1
+export GOOD_REPLAYS_DIR
 export METAMON_CACHE_DIR="${CACHE_DIR}"
 export METAMON_SAVE_DIR="${SAVE_DIR}"
 export METAMON_BATTLE_HOST="${REPO_DIR}/metamon/env/vectorized/battle_host_engine.js"
