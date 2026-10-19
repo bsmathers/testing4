@@ -157,6 +157,7 @@ class ConfigBatchedOpponent(BatchedOpponent):
         driver = getattr(bundle, "_driver", None)
         if driver is not None:
             driver.hidden_state = None
+            driver._scratch_hidden.clear()
             driver.policy = None
 
     def configure(self, spec: Optional["PolicySpec"] = None) -> "PolicySpec":

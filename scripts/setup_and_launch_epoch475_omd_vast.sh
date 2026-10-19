@@ -156,21 +156,26 @@ if [[ "${cpu_model}" == *"EPYC 7642"* && "${gpu_name}" == *"5090"* ]] \
   # Vast EPYC 7642 profile with 48 allocated CPUs and about 64 GiB RAM.
   # Vast currently encodes the advertised 48-vCPU allocation as a 46.08-CPU
   # CFS quota (4608000/100000), so allow the small provider-side quota haircut.
-  # Each collector has one Python coordinator plus seven single-threaded Node
-  # simulator workers: 6 * (1 + 7) = 48 CPU-bound processes. Six actor-only
-  # BF16 policies and 384 lanes fit comfortably on a 32 GiB RTX 5090, while
-  # retaining fewer copies than the proven 64-core 8x64x7 profile.
-  COLLECTOR_PROCESSES=6
+  # Eight collectors preserve the measured 512-lane inference width. Five
+  # simulator workers per collector keeps the total process budget at exactly
+  # 8 * (1 coordinator + 5 workers) = 48 without reverting to the 64-process
+  # topology used on the larger EPYC 7742 host.
+  COLLECTOR_PROCESSES=8
   LANES=64
-  COLLECTOR_WORKERS=7
+  COLLECTOR_WORKERS=5
   METAMON_PARTIAL_HIDDEN_CHUNK=64
-  METAMON_FULL_BATCH_MAX_INACTIVE=8
+  # With 64 lanes, use full inference while the inactive side is the cheaper KV
+  # subset to preserve. Below half occupancy, compact inference wins instead.
+  METAMON_FULL_BATCH_MAX_INACTIVE=32
   DLOADER_WORKERS=12
+  METAMON_COLLECT_PROFILE=1
+  METAMON_COLLECT_PROFILE_INTERVAL=200
+  METAMON_VEC_PROFILE=1
   SNORLAX_RESOURCE_GUARD=1
   SNORLAX_MIN_COLLECTOR_PROCESSES=4
   SNORLAX_CPU_PSI_LIMIT=25
   SNORLAX_MEMORY_USAGE_LIMIT=0.90
-  collector_preset="epyc-7642-48cpu-64gb-5090-6x64x7"
+  collector_preset="epyc-7642-48cpu-5090-8x64x5"
 elif [[ "${cpu_model}" == *"EPYC 7742"* && "${gpu_name}" == *"5090"* ]]; then
   # Exact production host requested for this run. Do not trust virtualized
   # MemTotal/cgroup reporting to choose a different topology.
@@ -230,6 +235,7 @@ SNORLAX_MEMORY_USAGE_LIMIT="${SNORLAX_MEMORY_USAGE_LIMIT:-0.90}"
 
 export COLLECTOR_PROCESSES COLLECTOR_DEVICE COLLECTOR_DTYPE LANES
 export COLLECTOR_WORKERS METAMON_PARTIAL_HIDDEN_CHUNK METAMON_FULL_BATCH_MAX_INACTIVE DLOADER_WORKERS
+export METAMON_COLLECT_PROFILE METAMON_COLLECT_PROFILE_INTERVAL METAMON_VEC_PROFILE
 export SNORLAX_RESOURCE_GUARD SNORLAX_MIN_COLLECTOR_PROCESSES
 export SNORLAX_CPU_PSI_LIMIT SNORLAX_MEMORY_USAGE_LIMIT
 log "Collector preset ${collector_preset}: ${COLLECTOR_PROCESSES} processes x ${LANES} lanes x ${COLLECTOR_WORKERS} Showdown workers; DLOADER_WORKERS=${DLOADER_WORKERS}"

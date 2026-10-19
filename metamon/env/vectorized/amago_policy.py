@@ -178,6 +178,10 @@ class AmagoLadderPolicyDriver:
                 self.num_lanes, self.device
             )
         self.hidden_state = hidden_state
+        # Compact partial-lane inference revisits only a few power-of-two batch
+        # sizes. Reuse their KV storage instead of allocating and freeing a full
+        # transformer cache on every opponent decision.
+        self._scratch_hidden: Dict[int, Any] = {}
 
     # Keep compact inference chunks large enough for GPU efficiency, but do
     # not use that chunk size as the threshold for wasting a full-lane forward.
@@ -284,11 +288,13 @@ class AmagoLadderPolicyDriver:
 
         inactive_idxs = np.flatnonzero(~active)
 
-        # If only a handful of lanes are inactive, a single full-batch forward is
-        # faster than compacting the active side. Keep this cutoff independent of
-        # the compact-path chunk size: a 64-lane chunk must not turn a nearly
-        # empty tail into a wasteful 64-lane transformer forward.
-        if len(inactive_idxs) <= self._FULL_BATCH_MAX_INACTIVE:
+        # Preserve the smaller inactive side when compact inference would round
+        # the active side back to a full batch anyway. At half occupancy or
+        # below, compact inference performs less model compute and wins instead.
+        if (
+            len(inactive_idxs) <= self._FULL_BATCH_MAX_INACTIVE
+            and len(inactive_idxs) < len(active_idxs)
+        ):
             saved = self._snapshot_hidden(inactive_idxs)
             all_idxs = np.arange(self.num_lanes, dtype=np.int64)
             out, self.hidden_state = self._policy_act(
@@ -315,14 +321,16 @@ class AmagoLadderPolicyDriver:
                 )
             else:
                 padded_chunk = chunk
-            scratch = self.policy.traj_encoder.init_hidden_state(
-                batch_size, self.device
-            )
+            scratch = self._scratch_hidden.get(batch_size)
+            if scratch is None:
+                scratch = self.policy.traj_encoder.init_hidden_state(
+                    batch_size, self.device
+                )
             self._copy_hidden_lanes(self.hidden_state, scratch, padded_chunk)
             out, scratch = self._policy_act(obs_list, padded_chunk, scratch)
+            self._scratch_hidden[batch_size] = scratch
             self._copy_hidden_lanes_back(scratch, self.hidden_state, chunk)
             actions[chunk] = out[: len(chunk)]
-            del scratch
 
         return actions
 
