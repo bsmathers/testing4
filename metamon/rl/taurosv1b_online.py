@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import collections
 import os
+import time
 from argparse import ArgumentParser
 from typing import Any, Optional
 
@@ -707,6 +708,14 @@ def main() -> None:
         # checkpoint that cannot exist yet in a fresh smoke-test directory.
         if args.mode == "collect" and args.epochs == 1:
             experiment.always_load_latest = False
+        if args.mode == "collect" and os.environ.get(
+            "SNORLAX_FIXED_BASE_WEIGHTS"
+        ) == "1":
+            # External Snorlax rollouts must stay on the freshly published
+            # Schedule-Free y checkpoint passed through --base_weights. The
+            # generic collect loop otherwise reloads latest/policy.pt (x) before
+            # its first interaction and silently defeats on-policy collection.
+            experiment.always_load_latest = False
     elif args.from_scratch:
         print("From scratch: leaving random initialization in place.")
     else:
@@ -731,6 +740,48 @@ def main() -> None:
             f"removed={','.join(removed) or 'none'}",
             flush=True,
         )
+
+    collect_start_marker = os.environ.get("SNORLAX_COLLECT_START_MARKER")
+    if args.mode == "collect" and collect_start_marker:
+        ready_marker = os.environ.get("SNORLAX_COLLECT_READY_MARKER")
+        if not ready_marker:
+            raise RuntimeError(
+                "SNORLAX_COLLECT_READY_MARKER is required for a gated collector"
+            )
+        temporary = ready_marker + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as stream:
+            stream.write("collector initialized and waiting\n")
+        os.replace(temporary, ready_marker)
+        parent_pid = int(os.environ.get("SNORLAX_COLLECT_PARENT_PID", "0"))
+        while not os.path.exists(collect_start_marker):
+            if parent_pid > 0:
+                try:
+                    os.kill(parent_pid, 0)
+                except ProcessLookupError:
+                    return
+            time.sleep(0.05)
+        print("Collector prewarm gate released.", flush=True)
+        if os.environ.get("SNORLAX_RELOAD_BASE_ON_RELEASE") == "1":
+            if not args.base_weights:
+                raise RuntimeError(
+                    "gated collector release requires --base_weights"
+                )
+            from metamon.env.vectorized.amago_policy import (
+                load_collection_policy_state,
+            )
+
+            try:
+                released_state = torch.load(
+                    args.base_weights,
+                    map_location=experiment.DEVICE,
+                    weights_only=True,
+                )
+            except TypeError:
+                released_state = torch.load(
+                    args.base_weights, map_location=experiment.DEVICE
+                )
+            load_collection_policy_state(experiment.policy, released_state)
+            print("Collector loaded released behavior policy.", flush=True)
 
     if args.validation_once:
         if args.validation_epoch is not None:

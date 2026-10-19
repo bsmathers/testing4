@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import os
 import re
 import shutil
@@ -26,9 +27,9 @@ from metamon.env.vectorized.amago_policy import normalize_discrete_policy_action
 
 
 def _bucketed_length_collate(
-    samples, *, max_seq_len: int, bucket_size: int = 32
+    samples, *, max_seq_len: int, bucket_size: int = 128
 ):
-    """Pad to one of a few compile-stable lengths without wasting 128 steps."""
+    """Pad to a compile-stable length without altering any sampled timestep."""
     batch = RLData_pad_collate(samples)
     observed_steps = int(batch.actions.shape[1])
     target_steps = min(
@@ -449,16 +450,19 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
     _CHECKPOINT_RECENT_COUNT = 65
 
     def init_dloaders(self):
-        # Arbitrary sequence shapes cause repeated torch.compile work, while
-        # always padding to 128 wastes most compute on ordinary ~65-step games.
-        # Four stable buckets preserve every real timestep and mask exactly the
-        # same padding while limiting compilation to 32/64/96/128-step graphs.
+        # A random batch of 14 nearly always contains a long replay (observed
+        # batch averages are about 120/128), so 32-step buckets save little
+        # compute while causing up to four expensive compiled training graphs.
+        # Use one 128-step graph. Padding remains masked exactly as before and
+        # no sampled timestep or objective term changes.
         train_dloader = DataLoader(
             self.dataset,
             batch_size=self.batch_size,
             num_workers=self.dloader_workers,
             collate_fn=partial(
-                _bucketed_length_collate, max_seq_len=int(self.max_seq_len)
+                _bucketed_length_collate,
+                max_seq_len=int(self.max_seq_len),
+                bucket_size=int(self.max_seq_len),
             ),
             pin_memory=True,
             persistent_workers=self.dloader_workers > 0,
@@ -774,6 +778,143 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         )
         return cpu_bottleneck, memory_bottleneck, summary
 
+    def _launch_collector_children(
+        self,
+        *,
+        epoch: int,
+        processes: int,
+        configured_processes: int,
+        lanes: int,
+        workers: int,
+        collector_mp: str,
+        behavior_weights: str,
+        buffer_dir: Path,
+        log_dir: Path,
+        run_config: str,
+        module: str,
+        save_dir: str,
+        gated: bool,
+    ) -> dict:
+        """Launch collectors, optionally stopping after full initialization."""
+        start_marker = log_dir / f".collector-start-{epoch}"
+        ready_markers = [
+            log_dir / f".collector-ready-{epoch}-{idx}" for idx in range(processes)
+        ]
+        start_marker.unlink(missing_ok=True)
+        for marker in ready_markers:
+            marker.unlink(missing_ok=True)
+        children: list[tuple[subprocess.Popen, object]] = []
+        for idx in range(processes):
+            log_path = log_dir / f"collector-epoch-{epoch}-{idx}.log"
+            stream = log_path.open("a", encoding="utf-8", buffering=1)
+            child_env = dict(os.environ)
+            child_env.pop("SNORLAX_PERSISTENT_ALTERNATION", None)
+            child_env.update(
+                METAMON_RUN_MODE="collect",
+                SNORLAX_FIXED_BASE_WEIGHTS="1",
+                OMP_NUM_THREADS="1",
+                MKL_NUM_THREADS="1",
+                OPENBLAS_NUM_THREADS="1",
+                NUMEXPR_NUM_THREADS="1",
+            )
+            if os.environ.get("METAMON_COLLECTOR_DISABLE_COMPILE", "0") == "1":
+                child_env["TORCHDYNAMO_DISABLE"] = "1"
+            if gated:
+                child_env.update(
+                    SNORLAX_COLLECT_START_MARKER=str(start_marker),
+                    SNORLAX_COLLECT_READY_MARKER=str(ready_markers[idx]),
+                    SNORLAX_COLLECT_PARENT_PID=str(os.getpid()),
+                    SNORLAX_RELOAD_BASE_ON_RELEASE="1",
+                )
+            command = [
+                sys.executable, "-m", module,
+                "--run_config", run_config,
+                "--mode", "collect",
+                "--run_name", self.run_name,
+                "--lanes", str(lanes),
+                "--n_workers", str(workers),
+                "--save_dir", save_dir,
+                "--buffer_dir", str(buffer_dir),
+                "--base_weights", behavior_weights,
+                "--epochs", "1000000",
+                "--seed", str(1000 + epoch * configured_processes + idx),
+                "--mixed_precision", collector_mp,
+            ]
+            children.append(
+                (
+                    subprocess.Popen(
+                        command,
+                        env=child_env,
+                        stdout=stream,
+                        stderr=subprocess.STDOUT,
+                    ),
+                    stream,
+                )
+            )
+        return {
+            "epoch": epoch,
+            "processes": processes,
+            "children": children,
+            "start_marker": start_marker if gated else None,
+            "ready_markers": ready_markers if gated else [],
+            "launched": time.monotonic(),
+        }
+
+    def _cleanup_prewarmed_collectors(self) -> None:
+        state = getattr(self, "_prewarmed_collectors", None)
+        if not state:
+            return
+        for child, _stream in state["children"]:
+            if child.poll() is None:
+                child.terminate()
+        for child, stream in state["children"]:
+            try:
+                child.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=5)
+            stream.close()
+        marker = state.get("start_marker")
+        if marker is not None:
+            marker.unlink(missing_ok=True)
+        for ready in state.get("ready_markers", []):
+            ready.unlink(missing_ok=True)
+        self._prewarmed_collectors = None
+
+    def _prewarm_external_collectors(self, epoch: int, behavior_weights: str) -> None:
+        """Initialize the next rollout pool while the checkpoint is written."""
+        existing = getattr(self, "_prewarmed_collectors", None)
+        if existing is not None and existing["epoch"] == epoch:
+            return
+        self._cleanup_prewarmed_collectors()
+        configured = int(os.environ.get("COLLECTOR_PROCESSES", "8"))
+        processes = min(
+            configured,
+            int(getattr(self, "_collector_process_limit", configured)),
+        )
+        dtype = os.environ.get("COLLECTOR_DTYPE", "bf16")
+        state = self._launch_collector_children(
+            epoch=epoch,
+            processes=processes,
+            configured_processes=configured,
+            lanes=int(os.environ.get("LANES", "64")),
+            workers=int(os.environ.get("COLLECTOR_WORKERS", "8")),
+            collector_mp="no" if dtype == "fp32" else dtype,
+            behavior_weights=behavior_weights,
+            buffer_dir=Path(os.environ["SNORLAX_BUFFER_DIR"]),
+            log_dir=Path(os.environ["SNORLAX_LOG_DIR"]),
+            run_config=os.environ["SNORLAX_RUN_CONFIG"],
+            module=os.environ.get("RUNNER_MODULE", "metamon.rl.ataraxos_online"),
+            save_dir=os.environ["METAMON_SAVE_DIR"],
+            gated=True,
+        )
+        self._prewarmed_collectors = state
+        print(
+            f"[PersistentCycle] prewarming collection epoch={epoch} "
+            f"processes={processes}",
+            flush=True,
+        )
+
     def _external_collect_phase(self, epoch: int) -> dict[str, int | float] | None:
         """Run direct collector subprocesses, matching the fast pre-warm design."""
         buffer_dir = Path(os.environ["SNORLAX_BUFFER_DIR"])
@@ -828,6 +969,7 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             else "compiled"
         )
         if self._collection_is_ready(epoch):
+            self._cleanup_prewarmed_collectors()
             print(
                 f"[PersistentCycle] collect epoch={epoch} already complete; "
                 "resuming learner",
@@ -845,56 +987,57 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             f"inference={compile_mode}",
             flush=True,
         )
+        launch_state = getattr(self, "_prewarmed_collectors", None)
+        if (
+            launch_state is not None
+            and launch_state["epoch"] == epoch
+            and any(child.poll() is not None for child, _ in launch_state["children"])
+        ):
+            print(
+                f"[PersistentCycle] prewarm epoch={epoch} exited early; "
+                "falling back to a fresh collector pool",
+                flush=True,
+            )
+            self._cleanup_prewarmed_collectors()
+            launch_state = None
+        if launch_state is not None and launch_state["epoch"] == epoch:
+            children = launch_state["children"]
+            ready_markers = launch_state["ready_markers"]
+            start_marker = launch_state["start_marker"]
+            ready = sum(marker.exists() for marker in ready_markers)
+            age = time.monotonic() - launch_state["launched"]
+            print(
+                f"[PersistentCycle] releasing prewarmed collectors epoch={epoch} "
+                f"ready={ready}/{len(ready_markers)} age={age:.1f}s",
+                flush=True,
+            )
+            self._prewarmed_collectors = None
+        else:
+            if launch_state is not None:
+                self._cleanup_prewarmed_collectors()
+            launch_state = self._launch_collector_children(
+                epoch=epoch,
+                processes=processes,
+                configured_processes=configured_processes,
+                lanes=lanes,
+                workers=workers,
+                collector_mp=collector_mp,
+                behavior_weights=behavior_weights,
+                buffer_dir=buffer_dir,
+                log_dir=log_dir,
+                run_config=run_config,
+                module=module,
+                save_dir=save_dir,
+                gated=False,
+            )
+            children = launch_state["children"]
+            ready_markers = []
+            start_marker = None
         try:
-            for idx in range(processes):
-                log_path = log_dir / f"collector-epoch-{epoch}-{idx}.log"
-                stream = log_path.open("a", encoding="utf-8", buffering=1)
-                child_env = dict(os.environ)
-                child_env.pop("SNORLAX_PERSISTENT_ALTERNATION", None)
-                child_env.update(
-                    METAMON_RUN_MODE="collect",
-                    OMP_NUM_THREADS="1",
-                    MKL_NUM_THREADS="1",
-                    OPENBLAS_NUM_THREADS="1",
-                    NUMEXPR_NUM_THREADS="1",
-                )
-                # The one-step collector calls into fused CUDA/FlashAttention
-                # kernels already. Compiling the surrounding Python graph in
-                # every short-lived subprocess costs tens of seconds per phase
-                # and is not amortized by a 2,000-game rollout. Keep learner
-                # compilation unchanged; this applies only to collector
-                # subprocesses and can be disabled for long calibration runs.
-                if os.environ.get(
-                    "METAMON_COLLECTOR_DISABLE_COMPILE", "0"
-                ) == "1":
-                    child_env["TORCHDYNAMO_DISABLE"] = "1"
-                command = [
-                    sys.executable, "-m", module,
-                    "--run_config", run_config,
-                    "--mode", "collect",
-                    "--run_name", self.run_name,
-                    "--lanes", str(lanes),
-                    "--n_workers", str(workers),
-                    "--save_dir", save_dir,
-                    "--buffer_dir", str(buffer_dir),
-                    "--base_weights", behavior_weights,
-                    "--epochs", "1000000",
-                    "--seed", str(1000 + epoch * configured_processes + idx),
-                    "--mixed_precision", collector_mp,
-                ]
-                children.append(
-                    (
-                        subprocess.Popen(
-                            command,
-                            env=child_env,
-                            stdout=stream,
-                            stderr=subprocess.STDOUT,
-                        ),
-                        stream,
-                    )
-                )
             fresh = 0
             collection_started = time.monotonic()
+            if start_marker is not None:
+                start_marker.touch()
             previous_fresh = 0
             previous_poll = collection_started
             last_progress = collection_started - progress_seconds
@@ -1002,6 +1145,10 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                     child.kill()
                     child.wait(timeout=10)
                 stream.close()
+            if start_marker is not None:
+                start_marker.unlink(missing_ok=True)
+            for ready_marker in ready_markers:
+                ready_marker.unlink(missing_ok=True)
         fresh_names = self._replay_names(replay_dir) - baseline
         metrics = self._count_collection_outcomes(replay_dir, fresh_names)
         self._write_collection_outcome_report(epoch, metrics)
@@ -1138,15 +1285,36 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
 
         from tqdm import tqdm
 
+        if not getattr(self, "_collector_cleanup_registered", False):
+            atexit.register(self._cleanup_prewarmed_collectors)
+            self._collector_cleanup_registered = True
         start_epoch = self.epoch
         for epoch in range(start_epoch, self.epochs):
             self.epoch = epoch
             self.policy_aclr.eval()
-            behavior_path = self._write_behavior_policy()
+            prewarmed = getattr(self, "_prewarmed_collectors", None)
+            if prewarmed is not None and prewarmed["epoch"] == epoch:
+                behavior_path = self._behavior_policy_path()
+            else:
+                behavior_path = self._write_behavior_policy()
             print(
                 f"[PersistentCycle] behavior policy epoch={epoch} {behavior_path}",
                 flush=True,
             )
+            # Creating the first iterator starts persistent loader processes and
+            # lets their immutable tar indexes open while collection is using
+            # the CPU. The iterator is reset after collection, so no prefetched
+            # pre-collection FIFO sample is ever used for an update.
+            if (
+                getattr(self, "train_dloader", None) is not None
+                and not getattr(self, "_resident_loader_workers_started", False)
+            ):
+                self._resident_loader_warmup_iterator = iter(self.train_dloader)
+                self._resident_loader_workers_started = True
+                print(
+                    "[Learner] starting replay-loader workers during collection",
+                    flush=True,
+                )
             collection_log = self._external_collect_phase(epoch)
             self.accelerator.wait_for_everyone()
 
@@ -1175,6 +1343,7 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
 
             self.policy_aclr.train()
             loader = iter(self.train_dloader)
+            self._resident_loader_warmup_iterator = None
             progress = tqdm(
                 range(self.train_batches_per_epoch),
                 desc=f"{self.run_name} Epoch {epoch} Train",
@@ -1225,11 +1394,31 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             # epoch, but do not commit the numbered/full optimizer checkpoint
             # until validation passes. Otherwise a failed validation could be
             # bypassed simply by restarting at the next epoch.
+            validation_interval = int(os.environ.get("VALIDATION_INTERVAL", "0"))
+            validation_due = (
+                validation_interval > 0 and epoch % validation_interval == 0
+            )
+            prewarm_enabled = (
+                os.environ.get("SNORLAX_PREWARM_COLLECTORS", "1") == "1"
+            )
             if self.always_save_latest:
                 self.write_latest_policy()
+            else:
+                self._write_behavior_policy()
+            # On ordinary epochs, overlap next-phase initialization with the
+            # much larger full-state checkpoint write. Avoid overlapping it
+            # with the GPU-heavy validation subprocess on validation epochs.
+            if prewarm_enabled and not validation_due:
+                self._prewarm_external_collectors(
+                    epoch + 1, self._behavior_policy_path()
+                )
             self._external_validation_phase(epoch)
             if self.ckpt_interval and epoch % self.ckpt_interval == 0:
                 self.save_checkpoint()
+            if prewarm_enabled and validation_due:
+                self._prewarm_external_collectors(
+                    epoch + 1, self._behavior_policy_path()
+                )
             self._collection_ready_marker().unlink(missing_ok=True)
 
     @classmethod
