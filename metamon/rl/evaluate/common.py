@@ -289,19 +289,21 @@ def stratified_choices(value, count: int, *, phase: int = 0) -> list:
         total = sum(weights)
         if total <= 0.0:
             raise ValueError("weighted choice requires positive total weight")
-        cumulative = []
-        running = 0.0
-        for weight in weights:
-            running += weight / total
-            cumulative.append(running)
-        offset = (int(phase) % count) / float(count)
+        # Smooth weighted round-robin has the same low-discrepancy goal as CDF
+        # systematic sampling but spreads duplicate categories across adjacent
+        # collector slots. That avoids coupling one half of the collector pool
+        # to one team-set category when weights are 1:1.
+        rotate = int(phase) % len(population)
+        population = population[rotate:] + population[:rotate]
+        weights = weights[rotate:] + weights[:rotate]
+        current = [0.0] * len(population)
         chosen = []
-        for slot in range(count):
-            u = (offset + (slot + 0.5) / float(count)) % 1.0
-            index = 0
-            while index < len(cumulative) - 1 and u >= cumulative[index]:
-                index += 1
-            chosen.append(population[index])
+        for _ in range(count):
+            for idx, weight in enumerate(weights):
+                current[idx] += weight
+            best = max(range(len(population)), key=lambda idx: current[idx])
+            chosen.append(population[best])
+            current[best] -= total
         return chosen
 
     options = expand_value_list(value)
