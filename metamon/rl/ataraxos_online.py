@@ -653,7 +653,7 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         children: list[tuple[subprocess.Popen, object]] = []
         print(
             f"[PersistentCycle] collect epoch={epoch} target={target} "
-            f"processes={processes} lanes={lanes}",
+            f"processes={processes} lanes={lanes} workers={workers}",
             flush=True,
         )
         try:
@@ -695,6 +695,7 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                     )
                 )
             fresh = 0
+            collection_started = time.monotonic()
             while fresh < target:
                 time.sleep(10)
                 for child, _stream in children:
@@ -705,7 +706,19 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                             f"{log_dir}/collector-epoch-{epoch}-*.log"
                         )
                 fresh = len(self._replay_names(replay_dir) - baseline)
-                print(f"[PersistentCycle] collect epoch={epoch} {fresh}/{target}", flush=True)
+                elapsed = max(time.monotonic() - collection_started, 1e-6)
+                games_per_minute = fresh * 60.0 / elapsed
+                eta_minutes = (
+                    (target - fresh) / games_per_minute
+                    if games_per_minute > 0.0
+                    else float("inf")
+                )
+                eta_text = f"{eta_minutes:.1f}m" if np.isfinite(eta_minutes) else "--"
+                print(
+                    f"[PersistentCycle] collect epoch={epoch} {fresh}/{target} "
+                    f"rate={games_per_minute:.0f} games/min eta={eta_text}",
+                    flush=True,
+                )
         finally:
             for child, _stream in children:
                 if child.poll() is None:
