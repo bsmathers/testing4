@@ -25,9 +25,20 @@ from metamon.rl.recent_schedule_free import RecentScheduleFreeAdamW
 from metamon.env.vectorized.amago_policy import normalize_discrete_policy_actions
 
 
-def _fixed_length_collate(samples, *, max_seq_len: int):
-    """Right-pad every batch to one compile-stable sequence shape."""
+def _bucketed_length_collate(
+    samples, *, max_seq_len: int, bucket_size: int = 32
+):
+    """Pad to one of a few compile-stable lengths without wasting 128 steps."""
     batch = RLData_pad_collate(samples)
+    observed_steps = int(batch.actions.shape[1])
+    target_steps = min(
+        int(max_seq_len),
+        max(
+            int(bucket_size),
+            ((observed_steps + int(bucket_size) - 1) // int(bucket_size))
+            * int(bucket_size),
+        ),
+    )
 
     def pad_time(tensor: torch.Tensor, target: int) -> torch.Tensor:
         missing = target - tensor.shape[1]
@@ -42,13 +53,13 @@ def _fixed_length_collate(samples, *, max_seq_len: int):
         padding = tensor.new_full(shape, MAGIC_PAD_VAL)
         return torch.cat((tensor, padding), dim=1)
 
-    state_len = max_seq_len + 1
+    state_len = target_steps + 1
     batch.obs = {key: pad_time(value, state_len) for key, value in batch.obs.items()}
     batch.rl2s = pad_time(batch.rl2s, state_len)
     batch.time_idxs = pad_time(batch.time_idxs, state_len)
-    batch.rews = pad_time(batch.rews, max_seq_len)
-    batch.dones = pad_time(batch.dones, max_seq_len)
-    batch.actions = pad_time(batch.actions, max_seq_len)
+    batch.rews = pad_time(batch.rews, target_steps)
+    batch.dones = pad_time(batch.dones, target_steps)
+    batch.actions = pad_time(batch.actions, target_steps)
     return batch
 
 
@@ -369,17 +380,16 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
     _CHECKPOINT_RECENT_COUNT = 65
 
     def init_dloaders(self):
-        # AMAGO normally pads only to the longest item in each batch. That makes
-        # the sequence dimension vary as the FIFO changes and causes torch.compile
-        # to spend about a minute compiling a new forward/backward graph at the
-        # start of learner phases. A fixed right-padded shape is loss-equivalent:
-        # Ataraxos already masks every MAGIC_PAD_VAL timestep.
+        # Arbitrary sequence shapes cause repeated torch.compile work, while
+        # always padding to 128 wastes most compute on ordinary ~65-step games.
+        # Four stable buckets preserve every real timestep and mask exactly the
+        # same padding while limiting compilation to 32/64/96/128-step graphs.
         train_dloader = DataLoader(
             self.dataset,
             batch_size=self.batch_size,
             num_workers=self.dloader_workers,
             collate_fn=partial(
-                _fixed_length_collate, max_seq_len=int(self.max_seq_len)
+                _bucketed_length_collate, max_seq_len=int(self.max_seq_len)
             ),
             pin_memory=True,
         )
@@ -1053,10 +1063,12 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             ) if self.verbose else range(self.train_batches_per_epoch)
             block_started = time.perf_counter()
             data_seconds = 0.0
+            sequence_steps = 0
             for train_step in progress:
                 data_started = time.perf_counter()
                 batch = next(loader)
                 data_seconds += time.perf_counter() - data_started
+                sequence_steps += int(batch.actions.shape[1])
                 total_step = epoch * self.train_batches_per_epoch + train_step
                 log_step = total_step % self.log_interval == 0
                 loss_dict = self.train_step(batch, log_step=log_step)
@@ -1076,12 +1088,14 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                     print(
                         f"[LearnerProfile] epoch={epoch} step={train_step + 1} "
                         f"rate={20.0 / elapsed:.2f}it/s "
-                        f"data_wait={100.0 * data_seconds / elapsed:.1f}%"
+                        f"data_wait={100.0 * data_seconds / elapsed:.1f}% "
+                        f"seq_avg={sequence_steps / 20.0:.1f}"
                         f"{component_text}",
                         flush=True,
                     )
                     block_started = time.perf_counter()
                     data_seconds = 0.0
+                    sequence_steps = 0
             self.accelerator.wait_for_everyone()
             del loader
             del self.train_dloader
