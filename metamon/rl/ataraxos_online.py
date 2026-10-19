@@ -696,6 +696,8 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                 )
             fresh = 0
             collection_started = time.monotonic()
+            previous_fresh = 0
+            previous_poll = collection_started
             while fresh < target:
                 time.sleep(10)
                 for child, _stream in children:
@@ -706,19 +708,26 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                             f"{log_dir}/collector-epoch-{epoch}-*.log"
                         )
                 fresh = len(self._replay_names(replay_dir) - baseline)
-                elapsed = max(time.monotonic() - collection_started, 1e-6)
-                games_per_minute = fresh * 60.0 / elapsed
+                now = time.monotonic()
+                poll_elapsed = max(now - previous_poll, 1e-6)
+                recent_rate = max(fresh - previous_fresh, 0) * 60.0 / poll_elapsed
+                run_elapsed = max(now - collection_started, 1e-6)
+                average_rate = fresh * 60.0 / run_elapsed
+                eta_rate = recent_rate if recent_rate > 0.0 else average_rate
                 eta_minutes = (
-                    (target - fresh) / games_per_minute
-                    if games_per_minute > 0.0
+                    (target - fresh) / eta_rate
+                    if eta_rate > 0.0
                     else float("inf")
                 )
                 eta_text = f"{eta_minutes:.1f}m" if np.isfinite(eta_minutes) else "--"
                 print(
                     f"[PersistentCycle] collect epoch={epoch} {fresh}/{target} "
-                    f"rate={games_per_minute:.0f} games/min eta={eta_text}",
+                    f"recent={recent_rate:.0f} games/min "
+                    f"avg={average_rate:.0f} eta={eta_text}",
                     flush=True,
                 )
+                previous_fresh = fresh
+                previous_poll = now
         finally:
             for child, _stream in children:
                 if child.poll() is None:
