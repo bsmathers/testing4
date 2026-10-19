@@ -741,6 +741,10 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         child_env = dict(os.environ)
         child_env.pop("SNORLAX_PERSISTENT_ALTERNATION", None)
         child_env["METAMON_RUN_MODE"] = "validate"
+        # Validation is a child of the live learner process. It must never
+        # initialize or resume the learner's W&B run ID.
+        child_env["WANDB_MODE"] = "disabled"
+        child_env.pop("WANDB_RUN_ID", None)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         command = [
