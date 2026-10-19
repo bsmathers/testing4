@@ -31,11 +31,15 @@ INSTALL_FLASH_ATTN="${INSTALL_FLASH_ATTN:-1}"
 FLASH_ATTN_SPEC="${FLASH_ATTN_SPEC:-flash-attn}"
 MIN_VRAM_MIB="${MIN_VRAM_MIB:-30000}"
 ALLOW_LOW_VRAM="${ALLOW_LOW_VRAM:-0}"
+SNORLAX_HARDWARE_PROFILE="${SNORLAX_HARDWARE_PROFILE:-auto}"
 
 [[ "${UPDATE_REPO}" =~ ^[01]$ ]] || die "UPDATE_REPO must be 0 or 1"
 [[ "${INSTALL_FLASH_ATTN}" =~ ^[01]$ ]] || die "INSTALL_FLASH_ATTN must be 0 or 1"
 [[ "${ALLOW_LOW_VRAM}" =~ ^[01]$ ]] || die "ALLOW_LOW_VRAM must be 0 or 1"
 [[ "${MIN_VRAM_MIB}" =~ ^[1-9][0-9]*$ ]] || die "MIN_VRAM_MIB must be a positive integer"
+[[ "${SNORLAX_HARDWARE_PROFILE}" == "auto" \
+   || "${SNORLAX_HARDWARE_PROFILE}" == "48cpu-5090" ]] \
+  || die "SNORLAX_HARDWARE_PROFILE must be auto or 48cpu-5090"
 [[ -d /workspace && -w /workspace ]] || die "/workspace must exist and be writable"
 
 missing_bootstrap=()
@@ -151,8 +155,17 @@ export REPO_DIR PERSIST_ROOT GOOD_REPLAYS_DIR PYTHON_BIN
 
 # Collector topology is selected here and is authoritative. Inherited shell
 # values cannot silently override the machine-specific preset.
-if [[ "${gpu_name}" == *"5090"* ]] \
-    && (( cpu_count >= 44 && cpu_count < 56 && ram_mib >= 60000 )); then
+if [[ "${SNORLAX_HARDWARE_PROFILE}" == "48cpu-5090" ]] \
+    || { [[ "${gpu_name}" == *"5090"* ]] \
+      && (( cpu_count >= 44 && cpu_count < 56 && ram_mib >= 60000 )); }; then
+  if [[ "${SNORLAX_HARDWARE_PROFILE}" == "48cpu-5090" ]]; then
+    [[ "${gpu_name}" == *"5090"* ]] \
+      || die "Requested 48cpu-5090 profile but detected GPU: ${gpu_name}"
+    (( cpu_count >= 32 )) \
+      || die "Requested 48cpu-5090 profile but only ${cpu_count} usable CPUs were detected"
+    (( ram_mib >= 56000 )) \
+      || die "Requested 48cpu-5090 profile but only ${ram_mib} MiB effective RAM was detected"
+  fi
   # Vast RTX 5090 profile with an advertised 48 allocated CPUs. Do not match
   # the CPU marketing string: Vast guests can expose a host/virtual CPU name
   # that differs from the listing even when quota and affinity are identical.
@@ -240,6 +253,7 @@ export COLLECTOR_WORKERS METAMON_PARTIAL_HIDDEN_CHUNK METAMON_FULL_BATCH_MAX_INA
 export METAMON_COLLECT_PROFILE METAMON_COLLECT_PROFILE_INTERVAL METAMON_VEC_PROFILE
 export SNORLAX_RESOURCE_GUARD SNORLAX_MIN_COLLECTOR_PROCESSES
 export SNORLAX_CPU_PSI_LIMIT SNORLAX_MEMORY_USAGE_LIMIT
+export SNORLAX_HARDWARE_PROFILE
 log "Collector preset ${collector_preset}: ${COLLECTOR_PROCESSES} processes x ${LANES} lanes x ${COLLECTOR_WORKERS} Showdown workers; DLOADER_WORKERS=${DLOADER_WORKERS}"
 if [[ "${collector_preset}" == "48cpu-5090-8x64x5" ]]; then
   [[ "${COLLECTOR_PROCESSES}:${LANES}:${COLLECTOR_WORKERS}:${METAMON_FULL_BATCH_MAX_INACTIVE}" == "8:64:5:32" ]] \
