@@ -98,13 +98,14 @@ fi
 # These are fixed by the Snorlax recipe. Collector topology values are already
 # selected by the canonical hardware launcher and intentionally are not
 # user-overridable here.
-export COLLECTOR_PROCESSES="${COLLECTOR_PROCESSES:-8}"
+export COLLECTOR_PROCESSES=8
 export COLLECTOR_DEVICE=gpu
 export COLLECTOR_DTYPE=bf16
-export LANES="${LANES:-64}"
-export COLLECTOR_WORKERS="${COLLECTOR_WORKERS:-4}"
-export DLOADER_WORKERS="${DLOADER_WORKERS:-12}"
-export METAMON_PARTIAL_HIDDEN_CHUNK="${METAMON_PARTIAL_HIDDEN_CHUNK:-64}"
+export LANES=64
+export COLLECTOR_WORKERS=7
+export DLOADER_WORKERS=12
+export METAMON_PARTIAL_HIDDEN_CHUNK=64
+export METAMON_FULL_BATCH_MAX_INACTIVE=8
 export MIXED_PRECISION=bf16
 export METAMON_LOG_INTERVAL=50
 export BATCH_SIZE_PER_GPU=14
