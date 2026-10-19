@@ -461,6 +461,15 @@ class VectorizedMetamonAMAGOWrapper(amago.envs.AMAGOEnv):
             behavior_log_probs, behavior_values, behavior_legal
         )
 
+    def set_collection_game_target(self, target: int):
+        self._metamon_env.set_collection_game_target(target)
+
+    def collection_game_target_reached(self) -> bool:
+        return self._metamon_env.collection_game_target_reached()
+
+    def collection_game_count(self) -> int:
+        return self._metamon_env.collection_game_count()
+
     def take_long_break(self):
         if hasattr(self._metamon_env, "take_long_break"):
             self._metamon_env.take_long_break()
