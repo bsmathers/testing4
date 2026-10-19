@@ -738,6 +738,13 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             ),
         )
         resource_guard = os.environ.get("SNORLAX_RESOURCE_GUARD", "0") == "1"
+        poll_seconds = max(
+            0.5, float(os.environ.get("SNORLAX_COLLECT_POLL_SECONDS", "2"))
+        )
+        progress_seconds = max(
+            poll_seconds,
+            float(os.environ.get("SNORLAX_COLLECT_PROGRESS_SECONDS", "10")),
+        )
         lanes = int(os.environ.get("LANES", "64"))
         workers = int(os.environ.get("COLLECTOR_WORKERS", "8"))
         dtype = os.environ.get("COLLECTOR_DTYPE", "bf16")
@@ -745,6 +752,11 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         run_config = os.environ["SNORLAX_RUN_CONFIG"]
         module = os.environ.get("RUNNER_MODULE", "metamon.rl.ataraxos_online")
         save_dir = os.environ["METAMON_SAVE_DIR"]
+        compile_mode = (
+            "eager"
+            if os.environ.get("METAMON_COLLECTOR_DISABLE_COMPILE", "0") == "1"
+            else "compiled"
+        )
         if self._collection_is_ready(epoch):
             print(
                 f"[PersistentCycle] collect epoch={epoch} already complete; "
@@ -759,7 +771,8 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         children: list[tuple[subprocess.Popen, object]] = []
         print(
             f"[PersistentCycle] collect epoch={epoch} target={target} "
-            f"processes={processes} lanes={lanes} workers={workers}",
+            f"processes={processes} lanes={lanes} workers={workers} "
+            f"inference={compile_mode}",
             flush=True,
         )
         try:
@@ -775,6 +788,16 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                     OPENBLAS_NUM_THREADS="1",
                     NUMEXPR_NUM_THREADS="1",
                 )
+                # The one-step collector calls into fused CUDA/FlashAttention
+                # kernels already. Compiling the surrounding Python graph in
+                # every short-lived subprocess costs tens of seconds per phase
+                # and is not amortized by a 2,000-game rollout. Keep learner
+                # compilation unchanged; this applies only to collector
+                # subprocesses and can be disabled for long calibration runs.
+                if os.environ.get(
+                    "METAMON_COLLECTOR_DISABLE_COMPILE", "0"
+                ) == "1":
+                    child_env["TORCHDYNAMO_DISABLE"] = "1"
                 command = [
                     sys.executable, "-m", module,
                     "--run_config", run_config,
@@ -804,10 +827,12 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             collection_started = time.monotonic()
             previous_fresh = 0
             previous_poll = collection_started
+            last_progress = collection_started - progress_seconds
+            first_replay_reported = False
             pressure_streak = 0
             last_reduction = collection_started
             while fresh < target:
-                time.sleep(10)
+                time.sleep(poll_seconds)
                 for child, _stream in children:
                     status = child.poll()
                     if status is not None:
@@ -820,6 +845,13 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                 poll_elapsed = max(now - previous_poll, 1e-6)
                 recent_rate = max(fresh - previous_fresh, 0) * 60.0 / poll_elapsed
                 run_elapsed = max(now - collection_started, 1e-6)
+                if fresh > 0 and not first_replay_reported:
+                    print(
+                        f"[PersistentCycle] first replay epoch={epoch} "
+                        f"startup={run_elapsed:.1f}s",
+                        flush=True,
+                    )
+                    first_replay_reported = True
                 average_rate = fresh * 60.0 / run_elapsed
                 eta_rate = recent_rate if recent_rate > 0.0 else average_rate
                 eta_minutes = (
@@ -828,12 +860,14 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                     else float("inf")
                 )
                 eta_text = f"{eta_minutes:.1f}m" if np.isfinite(eta_minutes) else "--"
-                print(
-                    f"[PersistentCycle] collect epoch={epoch} {fresh}/{target} "
-                    f"recent={recent_rate:.0f} games/min "
-                    f"avg={average_rate:.0f} eta={eta_text}",
-                    flush=True,
-                )
+                if now - last_progress >= progress_seconds or fresh >= target:
+                    print(
+                        f"[PersistentCycle] collect epoch={epoch} {fresh}/{target} "
+                        f"recent={recent_rate:.0f} games/min "
+                        f"avg={average_rate:.0f} eta={eta_text}",
+                        flush=True,
+                    )
+                    last_progress = now
                 previous_fresh = fresh
                 previous_poll = now
                 if (
@@ -906,6 +940,13 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             f"wins={metrics['Wins']} losses={metrics['Losses']} "
             f"unresolved={metrics['Unresolved']} "
             f"win_rate={metrics['Win Rate']:.4f}",
+            flush=True,
+        )
+        elapsed = max(time.monotonic() - collection_started, 1e-6)
+        print(
+            f"[PersistentCycle] collection timing epoch={epoch} "
+            f"elapsed={elapsed:.1f}s rate={len(fresh_names) * 60.0 / elapsed:.0f} "
+            "games/min",
             flush=True,
         )
         self._mark_collection_ready(epoch)
