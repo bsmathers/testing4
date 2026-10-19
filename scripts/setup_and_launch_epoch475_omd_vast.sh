@@ -77,6 +77,7 @@ except AttributeError:
 PY
 )"
 host_ram_mib="$(awk '/MemTotal:/ {print int($2 / 1024)}' /proc/meminfo 2>/dev/null || echo 0)"
+cpu_model="$(awk -F: '/model name/ {gsub(/^[ \t]+/, "", $2); print $2; exit}' /proc/cpuinfo 2>/dev/null || true)"
 cgroup_ram_mib=0
 if [[ -r /sys/fs/cgroup/memory.max ]]; then
   cgroup_limit="$(cat /sys/fs/cgroup/memory.max)"
@@ -94,7 +95,7 @@ if (( cgroup_ram_mib > 0 && (ram_mib == 0 || cgroup_ram_mib < ram_mib) )); then
   ram_mib="${cgroup_ram_mib}"
 fi
 disk_free_gib="$(df -Pk /workspace | awk 'NR==2 {print int($4 / 1024 / 1024)}')"
-log "Host: ${cpu_count} logical CPUs; effective RAM ${ram_mib} MiB (host=${host_ram_mib}, cgroup=${cgroup_ram_mib:-0}); ${disk_free_gib} GiB free in /workspace"
+log "Host: ${cpu_model:-unknown}; ${cpu_count} usable CPUs; effective RAM ${ram_mib} MiB (host=${host_ram_mib}, cgroup=${cgroup_ram_mib:-0}); ${disk_free_gib} GiB free in /workspace"
 (( cpu_count >= 16 )) || warn "Fewer than 16 CPU cores may bottleneck the 96-lane collector"
 (( ram_mib >= 60000 )) || warn "Less than 64 GiB effective RAM may constrain replay loading and compilation"
 (( disk_free_gib >= 250 )) || warn "Less than 250 GiB free; verify replay and retained-checkpoint growth during training"
@@ -128,7 +129,16 @@ export REPO_DIR PERSIST_ROOT GOOD_REPLAYS_DIR PYTHON_BIN
 
 # Collector topology is selected here and is authoritative. Inherited shell
 # values cannot silently override the machine-specific preset.
-if (( vram_mib >= 30000 && cpu_count >= 56 )); then
+if [[ "${cpu_model}" == *"EPYC 7742"* && "${gpu_name}" == *"5090"* ]]; then
+  # Exact production host requested for this run. Do not trust virtualized
+  # MemTotal/cgroup reporting to choose a different topology.
+  COLLECTOR_PROCESSES=8
+  LANES=64
+  COLLECTOR_WORKERS=4
+  METAMON_PARTIAL_HIDDEN_CHUNK=64
+  DLOADER_WORKERS=12
+  collector_preset="epyc-7742-5090-8x64x4"
+elif (( vram_mib >= 30000 && cpu_count >= 56 )); then
   if (( ram_mib < 56000 )); then
     # EPYC 7742 / 40-48 GiB / RTX 5090 class host:
     # 512 battles, 32 Node workers total.
