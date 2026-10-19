@@ -18,6 +18,11 @@ PERSIST_ROOT="${PERSIST_ROOT:-/workspace/snorlax-v1-v2}"
 [[ "${REPO_DIR}" == /* ]] || die "REPO_DIR must be absolute"
 [[ "${PERSIST_ROOT}" == /workspace/* ]] \
   || die "PERSIST_ROOT must be a child of /workspace"
+# Normalize dot segments before comparing or deleting. Without this,
+# /workspace/run/.. would pass the textual prefix check but name /workspace.
+command -v python3 >/dev/null || die "python3 is required"
+REPO_DIR="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "${REPO_DIR}")"
+PERSIST_ROOT="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "${PERSIST_ROOT}")"
 case "${PERSIST_ROOT}" in
   /|/workspace|/workspace/|"${REPO_DIR}")
     die "Refusing unsafe PERSIST_ROOT: ${PERSIST_ROOT}"
@@ -30,9 +35,12 @@ export WANDB_API_KEY="$1"
 export HF_TOKEN="$2"
 export HUGGING_FACE_HUB_TOKEN="$2"
 export REPO_DIR PERSIST_ROOT
-export WANDB_RUN_ID="${WANDB_RUN_ID:-snorlax-v1-regularized-v1}"
+run_timestamp="$(date -u '+%Y%m%dT%H%M%SZ')"
+export WANDB_RUN_ID="${WANDB_RUN_ID:-snorlax-v1-regularized-${run_timestamp}}"
 export WANDB_NAME="${WANDB_NAME:-SnorlaxV1-regularized-v1}"
-export WANDB_RESUME=allow
+# This entry point always deletes the local training state, so allowing it to
+# resume an older remote W&B run would splice two independent runs together.
+export WANDB_RESUME=never
 
 log "RESET: deleting FIFO buffers, generated model weights, logs, and provision state from ${PERSIST_ROOT}"
 rm -rf -- \

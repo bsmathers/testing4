@@ -499,7 +499,7 @@ class AtaraxosAgent(MultiTaskAgent):
             + self.offline_value_coef * offline_value
         )
         # Weight by the actual trajectory composition of this batch. Production
-        # Snorlax ramps from offline-only to a 50/50 source mixture, while
+        # Snorlax ramps from 25/75 to a 50/50 online/offline source mixture, while
         # ablations may use other source ratios.
         batch_online_fraction = source[:, 0, 0].float().mean()
         loss = (
