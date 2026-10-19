@@ -1653,6 +1653,14 @@ class MetamonFIFODataset(MetamonAMAGODataset):
         )
         self.dset_max_size = dset_max_size
         self.dset_min_size = dset_min_size
+        # DataLoader workers remain alive across learner epochs. Publish the
+        # mutable FIFO list separately so those workers do not retain the first
+        # epoch's filenames after collection and eviction.
+        if os.environ.get("METAMON_RUN_MODE") != "collect":
+            manifest = os.path.join(
+                parsed_replay_dset.dset_root, ".metamon-live-filenames.txt"
+            )
+            parsed_replay_dset.enable_live_manifest(manifest)
 
     @property
     def ready_for_training(self) -> bool:
@@ -1724,6 +1732,7 @@ class MetamonFIFODataset(MetamonAMAGODataset):
         experiment.accelerator.wait_for_everyone()
         self.parsed_replay_dset.refresh_files()
         new_size = len(self.parsed_replay_dset)
+        self.parsed_replay_dset.publish_live_manifest()
         return {
             "FIFO Buffer Size": new_size,
             "FIFO Files Deleted": old_size - new_size,

@@ -128,15 +128,77 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
     _ADV_FLOOR_END = 0.0
     _ADV_RAMP_END_EPOCH = 100
 
+    @property
+    def adv_threshold(self) -> float:
+        return self._adv_threshold
+
+    @adv_threshold.setter
+    def adv_threshold(self, value: float) -> None:
+        self._adv_threshold = float(value)
+
+    @property
+    def current_online_weight(self) -> float:
+        return self._current_online_weight
+
+    @current_online_weight.setter
+    def current_online_weight(self, value: float) -> None:
+        self._current_online_weight = float(value)
+
     def __init__(self, *, fifo, offline, **kwargs):
+        # Persistent DataLoader workers need the two epoch-varying sampling
+        # scalars from the learner process. Publish them atomically beside the
+        # FIFO; each worker keeps an in-memory copy until the timestamp changes.
+        self._adv_threshold = 0.0
+        self._current_online_weight = 0.0
         self.adv_threshold = 0.0
         self.adv_quantile = self._ADV_QUANTILE_START
         self.adv_floor = self._ADV_FLOOR_START
         self.current_online_weight = 0.0
         self._sample_idx = 0
+        self._seen_sampler_generation = -1
         tagged_fifo = TaggedDataset(fifo, online=True, owner=self)
         tagged_offline = TaggedDataset(offline, online=False, owner=self)
         super().__init__(fifo=tagged_fifo, offline=tagged_offline, **kwargs)
+        parsed_fifo = tagged_fifo.dataset.parsed_replay_dset
+        self._sampler_state_path = os.path.join(
+            parsed_fifo.dset_root, ".ataraxos-sampler-state.txt"
+        )
+        self._sampler_state_mtime_ns: int | None = None
+        self._sampler_generation = 0
+        self._publish_sampler_state()
+
+    def _publish_sampler_state(self) -> None:
+        path = self._sampler_state_path
+        temporary = f"{path}.{os.getpid()}.tmp"
+        with open(temporary, "w", encoding="utf-8") as stream:
+            stream.write(f"generation: {self._sampler_generation}\n")
+            stream.write(f"online weight: {self.current_online_weight:.17g}\n")
+            stream.write(f"advantage threshold: {self.adv_threshold:.17g}\n")
+        os.replace(temporary, path)
+        self._sampler_state_mtime_ns = os.stat(path).st_mtime_ns
+
+    def _refresh_sampler_state_if_changed(self) -> None:
+        try:
+            mtime_ns = os.stat(self._sampler_state_path).st_mtime_ns
+        except FileNotFoundError:
+            return
+        if mtime_ns == self._sampler_state_mtime_ns:
+            return
+        fields = {}
+        with open(self._sampler_state_path, "r", encoding="utf-8") as stream:
+            for line in stream:
+                name, separator, value = line.partition(": ")
+                if separator:
+                    fields[name] = value.strip()
+        required = {"generation", "online weight", "advantage threshold"}
+        if set(fields) != required:
+            raise RuntimeError(
+                f"invalid Ataraxos sampler state: {self._sampler_state_path}"
+            )
+        self._sampler_generation = int(fields["generation"])
+        self.current_online_weight = float(fields["online weight"])
+        self.adv_threshold = float(fields["advantage threshold"])
+        self._sampler_state_mtime_ns = mtime_ns
 
     def __getitem__(self, i):
         """Keep online PPO windows aligned with collector history.
@@ -182,6 +244,11 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
         # noise. At the configured 0.5 weight this alternates sources and yields
         # exactly 7/7 in every batch of 14.
         worker = get_worker_info()
+        self._refresh_sampler_state_if_changed()
+        generation = self._sampler_generation
+        if generation != self._seen_sampler_generation:
+            self._sample_idx = 0
+            self._seen_sampler_generation = generation
         # Each loader worker owns a private counter. Stagger their phases so
         # arbitrary configured weights remain well distributed across workers.
         # The 50% setting remains exactly 7/7 in every 14-sample batch.
@@ -227,6 +294,8 @@ class BalancedAtaraxosMixture(v1b.ReadyAwareOnlineMixture):
                 quantile=self.adv_quantile,
                 floor=self.adv_floor,
             )
+        self._sampler_generation += 1
+        self._publish_sampler_state()
         print(
             f"  [Ataraxos] epoch={epoch} "
             f"online={self.current_online_weight:.4f} "
@@ -392,6 +461,7 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                 _bucketed_length_collate, max_seq_len=int(self.max_seq_len)
             ),
             pin_memory=True,
+            persistent_workers=self.dloader_workers > 0,
         )
         self.train_dloader = self.accelerator.prepare(train_dloader)
         return self.train_dloader
@@ -1091,7 +1161,15 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
 
             dset_log = self.dataset.on_end_of_collection(experiment=self)
             self.log(dset_log, key="dataset")
-            self.init_dloaders()
+            if getattr(self, "train_dloader", None) is None:
+                self.init_dloaders()
+            elif not getattr(self, "_reported_resident_dloader", False):
+                print(
+                    "[Learner] retaining replay-loader workers and offline tar "
+                    "indexes across epochs",
+                    flush=True,
+                )
+                self._reported_resident_dloader = True
             if not self.dataset.ready_for_training:
                 raise RuntimeError("Snorlax FIFO became unavailable after collection")
 
@@ -1105,6 +1183,9 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             block_started = time.perf_counter()
             data_seconds = 0.0
             sequence_steps = 0
+            report_interval = max(
+                20, int(os.environ.get("METAMON_LEARN_REPORT_INTERVAL", "100"))
+            )
             for train_step in progress:
                 data_started = time.perf_counter()
                 batch = next(loader)
@@ -1115,7 +1196,7 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                 loss_dict = self.train_step(batch, log_step=log_step)
                 if log_step:
                     self.log(loss_dict, key="train-update")
-                if (train_step + 1) % 20 == 0:
+                if (train_step + 1) % report_interval == 0:
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
                     elapsed = time.perf_counter() - block_started
@@ -1128,9 +1209,9 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                         )
                     print(
                         f"[LearnerProfile] epoch={epoch} step={train_step + 1} "
-                        f"rate={20.0 / elapsed:.2f}it/s "
+                        f"rate={report_interval / elapsed:.2f}it/s "
                         f"data_wait={100.0 * data_seconds / elapsed:.1f}% "
-                        f"seq_avg={sequence_steps / 20.0:.1f}"
+                        f"seq_avg={sequence_steps / float(report_interval):.1f}"
                         f"{component_text}",
                         flush=True,
                     )
@@ -1139,7 +1220,6 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
                     sequence_steps = 0
             self.accelerator.wait_for_everyone()
             del loader
-            del self.train_dloader
 
             # Publish the rolling x/y pair so validation can evaluate this
             # epoch, but do not commit the numbered/full optimizer checkpoint

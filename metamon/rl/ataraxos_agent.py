@@ -224,8 +224,12 @@ class AtaraxosAgent(MultiTaskAgent):
             return
         coefficient = self.l2sp_coef * scale
         if parameters[0].is_cuda:
-            deltas = torch._foreach_sub(parameters, anchors)
-            torch._foreach_add_(gradients, deltas, alpha=coefficient)
+            # Avoid allocating a full model-sized temporary ``parameter-anchor``
+            # list on every update. Two fused multi-tensor additions implement
+            # the same analytic gradient while keeping allocator and memory-
+            # bandwidth pressure out of the hot path.
+            torch._foreach_add_(gradients, parameters, alpha=coefficient)
+            torch._foreach_add_(gradients, anchors, alpha=-coefficient)
         else:
             for gradient, parameter, anchor in zip(
                 gradients, parameters, anchors

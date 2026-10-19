@@ -12,6 +12,9 @@ log() { printf '\n[%s] %s\n' "$(date '+%F %T')" "$*"; }
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="${REPO_DIR:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 PERSIST_ROOT="${PERSIST_ROOT:-/workspace/snorlax-v1-v2}"
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-${PERSIST_ROOT}/cache/torchinductor}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${PERSIST_ROOT}/cache/triton}"
+export TORCHINDUCTOR_FX_GRAPH_CACHE="${TORCHINDUCTOR_FX_GRAPH_CACHE:-1}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 RUN_NAME="${RUN_NAME:-snorlax_v1}"
 RUNNER_MODULE="${RUNNER_MODULE:-metamon.rl.ataraxos_online}"
@@ -41,7 +44,8 @@ RESUME_POLICY="${POLICY_ROOT}/policy_epoch_${RESUME_EPOCH}.pt"
 [[ -s "${ONLINE_WEIGHTS}" ]] || die "Missing immutable Epoch475 anchor: ${ONLINE_WEIGHTS}"
 [[ -f "${RUN_CONFIG}" ]] || die "Missing Snorlax run config: ${RUN_CONFIG}"
 [[ -f "${PERSIST_ROOT}/provision/snorlax-rollout-schema-v3.done" ]]   || die "Resume state is missing the rollout-schema-v3 marker"
-mkdir -p "$(dirname "${LATEST}")" "${LOG_DIR}" "${BUFFER_DIR}/gen1ou"
+mkdir -p "$(dirname "${LATEST}")" "${LOG_DIR}" "${BUFFER_DIR}/gen1ou" \
+  "${TORCHINDUCTOR_CACHE_DIR}" "${TRITON_CACHE_DIR}"
 
 # This immutable league checkpoint is tiny to repair and avoids re-entering the
 # full provisioner merely because an auxiliary copy disappeared.
@@ -115,7 +119,8 @@ export SNORLAX_COLLECT_POLL_SECONDS="${SNORLAX_COLLECT_POLL_SECONDS:-2}"
 export SNORLAX_COLLECT_PROGRESS_SECONDS="${SNORLAX_COLLECT_PROGRESS_SECONDS:-10}"
 export MIXED_PRECISION=bf16
 export METAMON_LOG_INTERVAL=50
-export METAMON_LEARN_PROFILE_STEPS="${METAMON_LEARN_PROFILE_STEPS:-1000}"
+export METAMON_LEARN_PROFILE_STEPS="${METAMON_LEARN_PROFILE_STEPS:-100}"
+export METAMON_LEARN_REPORT_INTERVAL="${METAMON_LEARN_REPORT_INTERVAL:-100}"
 export BATCH_SIZE_PER_GPU=14
 export GRAD_ACCUM=1
 export GAMES_PER_LEARNER_EPOCH=2000

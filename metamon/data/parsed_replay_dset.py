@@ -147,9 +147,49 @@ class MetamonDataset(Dataset):
         self._tar_paths: Dict[str, str] = {}
         self._format_is_tar: Dict[str, bool] = {}
         self._owner_pid: int = os.getpid()  # Track PID for fork-safety
+        # Optional atomically published filename manifest for long-lived loader
+        # workers. The online FIFO enables this; immutable datasets leave it off.
+        self._live_manifest_path: Optional[str] = None
+        self._live_manifest_mtime_ns: Optional[int] = None
 
         self._detect_formats()
         self.refresh_files()
+
+    def enable_live_manifest(self, path: str) -> None:
+        """Keep forked loader workers synchronized with a mutable file list."""
+        self._live_manifest_path = os.path.abspath(path)
+        self.publish_live_manifest()
+
+    def publish_live_manifest(self) -> None:
+        """Atomically publish the current filenames for persistent workers."""
+        path = self._live_manifest_path
+        if path is None:
+            return
+        temporary = f"{path}.{os.getpid()}.tmp"
+        with open(temporary, "w", encoding="utf-8") as stream:
+            for filename in self.filenames:
+                stream.write(filename)
+                stream.write("\n")
+        os.replace(temporary, path)
+        self._live_manifest_mtime_ns = os.stat(path).st_mtime_ns
+
+    def _refresh_live_manifest_if_changed(self) -> None:
+        """Refresh a worker-local list only when the learner publishes one."""
+        path = self._live_manifest_path
+        if path is None:
+            return
+        try:
+            mtime_ns = os.stat(path).st_mtime_ns
+        except FileNotFoundError:
+            return
+        if mtime_ns == self._live_manifest_mtime_ns:
+            return
+        with open(path, "r", encoding="utf-8") as stream:
+            filenames = [line.rstrip("\n") for line in stream if line.strip()]
+        if not filenames:
+            raise RuntimeError(f"live replay manifest is empty: {path}")
+        self.filenames = filenames
+        self._live_manifest_mtime_ns = mtime_ns
 
     ######################
     ## Format Detection ##
@@ -666,6 +706,7 @@ class MetamonDataset(Dataset):
         return self.load_filename(self.filenames[i])
 
     def random_sample(self):
+        self._refresh_live_manifest_if_changed()
         return self.load_filename(random.choice(self.filenames))
 
 
