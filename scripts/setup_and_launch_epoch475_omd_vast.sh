@@ -69,11 +69,27 @@ if (( vram_mib < MIN_VRAM_MIB )); then
 fi
 
 cpu_count="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 0)"
-ram_mib="$(awk '/MemTotal:/ {print int($2 / 1024)}' /proc/meminfo 2>/dev/null || echo 0)"
+host_ram_mib="$(awk '/MemTotal:/ {print int($2 / 1024)}' /proc/meminfo 2>/dev/null || echo 0)"
+cgroup_ram_mib=0
+if [[ -r /sys/fs/cgroup/memory.max ]]; then
+  cgroup_limit="$(cat /sys/fs/cgroup/memory.max)"
+  if [[ "${cgroup_limit}" =~ ^[0-9]+$ ]]; then
+    cgroup_ram_mib=$(( cgroup_limit / 1024 / 1024 ))
+  fi
+elif [[ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]]; then
+  cgroup_limit="$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes)"
+  if [[ "${cgroup_limit}" =~ ^[0-9]+$ ]]; then
+    cgroup_ram_mib=$(( cgroup_limit / 1024 / 1024 ))
+  fi
+fi
+ram_mib="${host_ram_mib}"
+if (( cgroup_ram_mib > 0 && (ram_mib == 0 || cgroup_ram_mib < ram_mib) )); then
+  ram_mib="${cgroup_ram_mib}"
+fi
 disk_free_gib="$(df -Pk /workspace | awk 'NR==2 {print int($4 / 1024 / 1024)}')"
-log "Host: ${cpu_count} logical CPUs; ${ram_mib} MiB RAM; ${disk_free_gib} GiB free in /workspace"
+log "Host: ${cpu_count} logical CPUs; effective RAM ${ram_mib} MiB (host=${host_ram_mib}, cgroup=${cgroup_ram_mib:-0}); ${disk_free_gib} GiB free in /workspace"
 (( cpu_count >= 16 )) || warn "Fewer than 16 CPU cores may bottleneck the 96-lane collector"
-(( ram_mib >= 60000 )) || warn "Less than 64 GiB RAM may constrain replay loading and compilation"
+(( ram_mib >= 60000 )) || warn "Less than 64 GiB effective RAM may constrain replay loading and compilation"
 (( disk_free_gib >= 250 )) || warn "Less than 250 GiB free; verify replay and retained-checkpoint growth during training"
 
 if [[ ! -e "${REPO_DIR}" ]]; then
