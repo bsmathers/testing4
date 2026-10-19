@@ -186,7 +186,7 @@ if [[ "${SNORLAX_HARDWARE_PROFILE}" == "48cpu-5090" ]] \
   # Collector phases are too short to amortize eight independent Dynamo graph
   # compilations. The fused CUDA and FlashAttention kernels still run in eager
   # mode; only the repeated outer graph compilation is disabled.
-  METAMON_COLLECTOR_DISABLE_COMPILE=1
+  METAMON_COLLECTOR_DISABLE_COMPILE="${METAMON_COLLECTOR_DISABLE_COMPILE:-1}"
   METAMON_COLLECT_PROFILE=0
   METAMON_COLLECT_PROFILE_INTERVAL=200
   METAMON_VEC_PROFILE=0
