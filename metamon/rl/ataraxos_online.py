@@ -809,6 +809,7 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
         return pool.stratified_opponents(
             processes, phase=epoch, seed=73_001
         )
+
     def _launch_collector_children(
         self,
         *,
