@@ -732,6 +732,47 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             torch.cuda.empty_cache()
         return metrics
 
+    def evaluate_val_games(self, target_games: int) -> None:
+        """Evaluate until at least target_games battles have completed."""
+        if target_games <= 0:
+            raise ValueError("target_games must be positive")
+        amago.utils.call_async_env(self.val_envs, "resume_from_break")
+        try:
+            self.val_envs.reset()
+            started = time.time()
+            # The episode target normally ends this loop after a few hundred
+            # vector steps. The large step cap only guards against a broken
+            # environment that never terminates battles.
+            _, (returns, specials) = self.interact(
+                self.val_envs,
+                100_000,
+                hidden_state=None,
+                sample=self.sample_actions_val,
+                episodes=target_games,
+            )
+            completed = sum(
+                len(scores)
+                for history in returns
+                for scores in history.data.values()
+            )
+            if completed < target_games:
+                raise RuntimeError(
+                    f"validation stopped after only {completed}/{target_games} games"
+                )
+            metrics = self.policy_metrics(returns, specials=specials)
+            metrics["Completed Games"] = completed
+            metrics["Validation Seconds"] = time.time() - started
+            self.log(metrics, key="val")
+            avg_return = metrics["Average Total Return (Across All Env Names)"]
+            print(
+                f"[Validation] completed_games={completed} "
+                f"target_games={target_games} average_return={avg_return:.6f} "
+                f"seconds={metrics['Validation Seconds']:.1f}",
+                flush=True,
+            )
+        finally:
+            amago.utils.call_async_env(self.val_envs, "take_long_break")
+
     def _external_validation_phase(self, epoch: int) -> None:
         interval = int(os.environ.get("VALIDATION_INTERVAL", "0"))
         if interval <= 0 or epoch % interval:
@@ -772,12 +813,18 @@ class AtaraxosExperiment(v1b.TaurosV1BOnlineExperiment):
             latest,
             "--val_timesteps",
             os.environ.get("VALIDATION_TIMESTEPS", "1000"),
+            "--validation_games",
+            os.environ.get("VALIDATION_GAMES", "250"),
             "--val_interval",
             "1",
             "--mixed_precision",
             os.environ.get("MIXED_PRECISION", "bf16"),
         ]
-        print(f"[PersistentCycle] validation epoch={epoch}", flush=True)
+        print(
+            f"[PersistentCycle] validation epoch={epoch} "
+            f"target_games={os.environ.get('VALIDATION_GAMES', '250')}",
+            flush=True,
+        )
         validation_log = log_dir / "validation.log"
         with validation_log.open("a", encoding="utf-8") as stream:
             result = subprocess.run(
