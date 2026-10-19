@@ -43,6 +43,7 @@ COLLECTOR_DTYPE="${COLLECTOR_DTYPE:-}"
 ONLINE_FIFO_SIZE="${ONLINE_FIFO_SIZE:-300000}"
 VALIDATION_INTERVAL="${VALIDATION_INTERVAL:-0}"
 VALIDATION_TIMESTEPS="${VALIDATION_TIMESTEPS:-1000}"
+VALIDATION_GAMES="${VALIDATION_GAMES:-250}"
 # SNORLAX_FIRST_RUN_SMOKE is intentionally disabled; the full smoke block
 # remains commented out near the launch section for manual debugging.
 SNORLAX_FIRST_RUN_SMOKE="${SNORLAX_FIRST_RUN_SMOKE:-0}"
@@ -137,6 +138,7 @@ cd "${REPO_DIR}"
 [[ "${ONLINE_FIFO_SIZE}" =~ ^[1-9][0-9]*$ ]] || die "ONLINE_FIFO_SIZE must be positive"
 [[ "${VALIDATION_INTERVAL}" =~ ^[0-9]+$ ]] || die "VALIDATION_INTERVAL must be non-negative"
 [[ "${VALIDATION_TIMESTEPS}" =~ ^[1-9][0-9]*$ ]] || die "VALIDATION_TIMESTEPS must be positive"
+[[ "${VALIDATION_GAMES}" =~ ^[1-9][0-9]*$ ]] || die "VALIDATION_GAMES must be positive"
 [[ "${SNORLAX_FIRST_RUN_SMOKE}" =~ ^[01]$ ]] || die "SNORLAX_FIRST_RUN_SMOKE must be 0 or 1"
 if [[ "${COLLECTOR_DEVICE}" == "cpu" && "${COLLECTOR_DTYPE}" != "fp32" ]]; then
   die "CPU collection requires COLLECTOR_DTYPE=fp32"
@@ -1105,7 +1107,7 @@ if [[ "${TRAIN_VARIANT}" == "snorlax_v1" && "${ALTERNATE_COLLECT_LEARN}" == "1" 
   export SNORLAX_RUN_CONFIG="${RUN_CONFIG}"
   export RUNNER_MODULE COLLECTOR_PROCESSES COLLECTOR_DTYPE LANES COLLECTOR_WORKERS
   export GAMES_PER_LEARNER_EPOCH METAMON_SAVE_DIR MIXED_PRECISION
-  export VALIDATION_INTERVAL VALIDATION_TIMESTEPS
+  export VALIDATION_INTERVAL VALIDATION_TIMESTEPS VALIDATION_GAMES
   set +e
   "${PYTHON_BIN}" -m "${RUNNER_MODULE}" \
     --run_config "${RUN_CONFIG}" --mode learn \
